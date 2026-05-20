@@ -2,10 +2,10 @@
 """
 网球轨迹追踪与击球点预测模块 (curve4) — drag-aware 版本。
 
-与 curve3 完全相同的公开接口（BallObservation / PredictHitPos /
-TrackerState / TrackerResult / Curve4Tracker）。唯一区别：球轨迹
-物理模型由 "线性 xy + 抛物线 z" 改为 "6-DOF 带二次型空气阻力的
-ODE"。
+与 curve3 相同的追踪入口（BallObservation / TrackerState /
+TrackerResult / Curve4Tracker）。PredictHitPos 额外输出击球时刻球速
+(vx, vy, vz)。球轨迹物理模型由 "线性 xy + 抛物线 z" 改为
+"6-DOF 带二次型空气阻力的 ODE"。
 
 物理模型：
   a_x = -k · |v| · v_x
@@ -76,6 +76,9 @@ class PredictHitPos:
     x: float
     y: float
     z: float
+    vx: float
+    vy: float
+    vz: float
     stage: int
     ct: float
     ht: float
@@ -646,8 +649,10 @@ class Curve4Tracker:
             return None
 
         x_hit, y_hit, _ = post_fit.predict(t_hit)
+        vx_hit, vy_hit, vz_hit = post_fit.velocity_at(t_hit)
         return PredictHitPos(
             x=x_hit, y=y_hit, z=self.ideal_hit_z,
+            vx=vx_hit, vy=vy_hit, vz=vz_hit,
             stage=0, ct=ct, ht=t_hit,
         )
 
@@ -672,7 +677,9 @@ class Curve4Tracker:
             return None
 
         x_hit, _, z_hit = curve.predict(t_hit)
+        vx_hit, vy_hit, vz_hit = curve.velocity_at(t_hit)
         return PredictHitPos(
             x=x_hit, y=target_y, z=z_hit,
+            vx=vx_hit, vy=vy_hit, vz=vz_hit,
             stage=1, ct=ct, ht=t_hit,
         )

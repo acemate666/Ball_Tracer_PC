@@ -587,6 +587,7 @@ class DirectRos2Sink:
             f"#{self._predict_count}: "
             f"stage={payload.get('stage')} "
             f"x={payload.get('x')} y={payload.get('y')} z={payload.get('z')} "
+            f"vx={payload.get('vx')} vy={payload.get('vy')} vz={payload.get('vz')} "
             f"ct={payload.get('ct')} ht={payload.get('ht')} "
             f"duration={payload.get('duration')}"
         )
@@ -1479,12 +1480,16 @@ class ArchiveThread:
                 "x": round(pred.x, 4),
                 "y": round(pred.y, 4),
                 "z": round(pred.z, 4),
+                "vx": round(pred.vx, 4),
+                "vy": round(pred.vy, 4),
+                "vz": round(pred.vz, 4),
                 "stage": pred.stage,
                 "lead_ms": round((pred.ht - pred.ct) * 1000),
                 "compute_latency_ms": compute_latency_ms,
             }
             log_pred = {
                 "x": pred.x, "y": pred.y, "z": pred.z,
+                "vx": pred.vx, "vy": pred.vy, "vz": pred.vz,
                 "stage": pred.stage, "ct": pred.ct, "ht": pred.ht,
             }
             if compute_t is not None:
@@ -2229,6 +2234,9 @@ def main() -> int:
                         "x": round(p.x, 4),
                         "y": round(p.y, 4),
                         "z": round(p.z, 4),
+                        "vx": round(p.vx, 4),
+                        "vy": round(p.vy, 4),
+                        "vz": round(p.vz, 4),
                         "stage": p.stage,
                         "ct": round(p.ct, 6),
                         "ht": round(p.ht, 6),
