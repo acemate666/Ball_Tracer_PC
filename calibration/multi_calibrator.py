@@ -36,6 +36,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _MIN_VALID_IMAGES = 5
 _PAIRWISE_TRANSLATION_TOL_MM = 100.0
 _PAIRWISE_ROTATION_TOL_DEG = 2.0
+_EPIPOLAR_FILTER_MAX_FRAME_RMS_PX = 0.75
+_EPIPOLAR_FILTER_MAX_FRAME_P95_PX = 1.50
 
 
 # ================================================================
@@ -72,6 +74,8 @@ class MultiCalibResult:
     board_config: Optional[BoardConfig] = None
     total_rms: float = 0.0
     per_camera_rms: dict[str, float] = field(default_factory=dict)
+    epipolar_pairs: dict[str, dict] = field(default_factory=dict)
+    epipolar_filter: dict[str, object] = field(default_factory=dict)
     num_images: int = 0
     num_observations: int = 0
 
@@ -107,6 +111,8 @@ class MultiCalibResult:
             "diagnostics": {
                 "total_rms": self.total_rms,
                 "per_camera_rms": self.per_camera_rms,
+                "epipolar_pairs": self.epipolar_pairs,
+                "epipolar_filter": self.epipolar_filter,
                 "num_images": self.num_images,
                 "num_observations": self.num_observations,
             },
@@ -152,6 +158,8 @@ class MultiCalibResult:
             board_config=board,
             total_rms=diag.get("total_rms", 0.0),
             per_camera_rms=diag.get("per_camera_rms", {}),
+            epipolar_pairs=diag.get("epipolar_pairs", {}),
+            epipolar_filter=diag.get("epipolar_filter", {}),
             num_images=diag.get("num_images", 0),
             num_observations=diag.get("num_observations", 0),
         )
@@ -257,6 +265,66 @@ def _transform_error(T: np.ndarray, T_ref: np.ndarray) -> tuple[float, float]:
     return trans_err, rot_err
 
 
+def _relative_rt(cameras: dict[str, CameraCalib], from_sn: str,
+                 to_sn: str) -> tuple[np.ndarray, np.ndarray]:
+    """Return R/T mapping points from from_sn camera coordinates into to_sn."""
+    from_cam = cameras[from_sn]
+    to_cam = cameras[to_sn]
+    R_from_ref = np.asarray(from_cam.R_to_ref, dtype=np.float64).reshape(3, 3)
+    t_from_ref = np.asarray(from_cam.t_to_ref, dtype=np.float64).reshape(3, 1)
+    R_to_ref = np.asarray(to_cam.R_to_ref, dtype=np.float64).reshape(3, 3)
+    t_to_ref = np.asarray(to_cam.t_to_ref, dtype=np.float64).reshape(3, 1)
+    R_to_from = R_to_ref @ R_from_ref.T
+    t_to_from = t_to_ref - R_to_from @ t_from_ref
+    return R_to_from, t_to_from
+
+
+def _stats_from_values(values: np.ndarray) -> dict[str, float]:
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    abs_values = np.abs(values)
+    return {
+        "mean": float(np.mean(values)),
+        "mean_abs": float(np.mean(abs_values)),
+        "rms": float(np.sqrt(np.mean(values * values))),
+        "median_abs": float(np.median(abs_values)),
+        "p90_abs": float(np.percentile(abs_values, 90)),
+        "p95_abs": float(np.percentile(abs_values, 95)),
+        "p99_abs": float(np.percentile(abs_values, 99)),
+        "max_abs": float(np.max(abs_values)),
+    }
+
+
+def _rectified_y_values(left_pts: np.ndarray, right_pts: np.ndarray,
+                        left_cam: CameraCalib, right_cam: CameraCalib,
+                        R: np.ndarray, T: np.ndarray) -> np.ndarray:
+    R1, R2, P1, P2, _, _, _ = cv2.stereoRectify(
+        left_cam.K,
+        left_cam.D,
+        right_cam.K,
+        right_cam.D,
+        left_cam.image_size,
+        R,
+        T,
+        flags=cv2.CALIB_ZERO_DISPARITY,
+        alpha=0,
+    )
+    left_rect = cv2.undistortPoints(
+        left_pts.reshape(-1, 1, 2).astype(np.float64),
+        left_cam.K,
+        left_cam.D,
+        R=R1,
+        P=P1,
+    ).reshape(-1, 2)
+    right_rect = cv2.undistortPoints(
+        right_pts.reshape(-1, 1, 2).astype(np.float64),
+        right_cam.K,
+        right_cam.D,
+        R=R2,
+        P=P2,
+    ).reshape(-1, 2)
+    return (left_rect[:, 1] - right_rect[:, 1]).astype(np.float64)
+
+
 # ================================================================
 #  MultiCalibrator
 # ================================================================
@@ -285,6 +353,9 @@ class MultiCalibrator:
         min_cameras_per_board: int = 2,
         detection_score_threshold: float = 0.8,
         provided_intrinsics: Optional[dict[str, dict[str, np.ndarray | tuple[int, int]]]] = None,
+        epipolar_filter: bool = True,
+        epipolar_max_frame_rms: float = _EPIPOLAR_FILTER_MAX_FRAME_RMS_PX,
+        epipolar_max_frame_p95: float = _EPIPOLAR_FILTER_MAX_FRAME_P95_PX,
     ):
         self._serials = serials
         self._image_dir = Path(image_dir)
@@ -296,6 +367,9 @@ class MultiCalibrator:
         self._max_images = max_images
         self._detection_score_threshold = float(detection_score_threshold)
         self._provided_intrinsics = provided_intrinsics or {}
+        self._epipolar_filter = bool(epipolar_filter)
+        self._epipolar_max_frame_rms = float(epipolar_max_frame_rms)
+        self._epipolar_max_frame_p95 = float(epipolar_max_frame_p95)
         if min_cameras_per_board < 2:
             raise ValueError("min_cameras_per_board must be >= 2")
         self._min_cameras_per_board = min_cameras_per_board
@@ -347,6 +421,36 @@ class MultiCalibrator:
             detections, valid_images, image_sizes,
             init_K, init_D, init_cam_poses, init_board_poses,
             board, obj_pts)
+
+        result.epipolar_pairs = self._compute_epipolar_pair_stats(
+            detections, valid_images, result.cameras)
+        result.epipolar_filter = {
+            "enabled": False,
+            "reason": "diagnostics_only",
+            "max_frame_rms_px": self._epipolar_max_frame_rms,
+            "max_frame_p95_px": self._epipolar_max_frame_p95,
+            "input_images": len(valid_images),
+            "output_images": len(valid_images),
+            "removed_images": [],
+        }
+
+        if self._epipolar_filter:
+            filtered_images, epipolar_filter = self._filter_images_by_epipolar(
+                detections, valid_images, result.cameras)
+            result.epipolar_filter = epipolar_filter
+            if 0 < len(filtered_images) < len(valid_images):
+                print(
+                    f"\n[4b] Epipolar filter: {len(valid_images)} -> "
+                    f"{len(filtered_images)} frames, rerun BA..."
+                )
+                result = self._bundle_adjust(
+                    detections, filtered_images, image_sizes,
+                    init_K, init_D, init_cam_poses, init_board_poses,
+                    board, obj_pts)
+                result.epipolar_pairs = self._compute_epipolar_pair_stats(
+                    detections, filtered_images, result.cameras)
+                epipolar_filter["reran_ba"] = True
+                result.epipolar_filter = epipolar_filter
 
         return result
 
@@ -840,6 +944,132 @@ class MultiCalibrator:
                      sn, T[0, 3], T[1, 3], T[2, 3])
 
         return cam_poses, board_poses, sorted(valid_images)
+
+    # ────────────────────────────────────────────────────────────
+    #  Epipolar diagnostics/filter
+    # ────────────────────────────────────────────────────────────
+
+    def _compute_epipolar_pair_stats(self, detections, valid_images,
+                                     cameras: dict[str, CameraCalib]) -> dict[str, dict]:
+        pair_stats = {}
+        for i, left_sn in enumerate(self._serials):
+            for right_sn in self._serials[i + 1:]:
+                R, T = _relative_rt(cameras, left_sn, right_sn)
+                values = []
+                frame_count = 0
+                for idx in valid_images:
+                    cam_dets = detections.get(idx, {})
+                    if left_sn not in cam_dets or right_sn not in cam_dets:
+                        continue
+                    dy = _rectified_y_values(
+                        cam_dets[left_sn].reshape(-1, 2),
+                        cam_dets[right_sn].reshape(-1, 2),
+                        cameras[left_sn],
+                        cameras[right_sn],
+                        R,
+                        T,
+                    )
+                    values.append(dy)
+                    frame_count += 1
+                key = f"{left_sn}__{right_sn}"
+                if not values:
+                    pair_stats[key] = {
+                        "left": left_sn,
+                        "right": right_sn,
+                        "frame_count": 0,
+                    }
+                    continue
+                stats = _stats_from_values(np.concatenate(values))
+                stats.update({
+                    "left": left_sn,
+                    "right": right_sn,
+                    "frame_count": frame_count,
+                    "point_count": int(sum(len(v) for v in values)),
+                })
+                pair_stats[key] = stats
+        return pair_stats
+
+    def _frame_epipolar_scores(self, detections, valid_images,
+                               cameras: dict[str, CameraCalib]) -> list[dict]:
+        scores = []
+        pair_rt = {}
+        for i, left_sn in enumerate(self._serials):
+            for right_sn in self._serials[i + 1:]:
+                pair_rt[(left_sn, right_sn)] = _relative_rt(
+                    cameras, left_sn, right_sn)
+
+        for idx in valid_images:
+            cam_dets = detections.get(idx, {})
+            pair_scores = []
+            for (left_sn, right_sn), (R, T) in pair_rt.items():
+                if left_sn not in cam_dets or right_sn not in cam_dets:
+                    continue
+                dy = _rectified_y_values(
+                    cam_dets[left_sn].reshape(-1, 2),
+                    cam_dets[right_sn].reshape(-1, 2),
+                    cameras[left_sn],
+                    cameras[right_sn],
+                    R,
+                    T,
+                )
+                abs_dy = np.abs(dy)
+                pair_scores.append({
+                    "left": left_sn,
+                    "right": right_sn,
+                    "rms": float(np.sqrt(np.mean(dy * dy))),
+                    "p95_abs": float(np.percentile(abs_dy, 95)),
+                    "max_abs": float(np.max(abs_dy)),
+                })
+
+            if not pair_scores:
+                continue
+            scores.append({
+                "frame": int(idx),
+                "num_pairs": len(pair_scores),
+                "worst_rms": max(item["rms"] for item in pair_scores),
+                "worst_p95_abs": max(item["p95_abs"] for item in pair_scores),
+                "worst_max_abs": max(item["max_abs"] for item in pair_scores),
+                "pairs": pair_scores,
+            })
+        return scores
+
+    def _filter_images_by_epipolar(self, detections, valid_images,
+                                   cameras: dict[str, CameraCalib]) -> tuple[list[int], dict]:
+        frame_scores = self._frame_epipolar_scores(detections, valid_images, cameras)
+        bad_frames = {
+            item["frame"] for item in frame_scores
+            if (item["worst_rms"] > self._epipolar_max_frame_rms
+                or item["worst_p95_abs"] > self._epipolar_max_frame_p95)
+        }
+        filtered = [idx for idx in valid_images if idx not in bad_frames]
+        can_apply = len(filtered) >= _MIN_VALID_IMAGES
+        status = "applied" if can_apply and bad_frames else "not_needed"
+        if bad_frames and not can_apply:
+            status = "skipped_too_few_frames"
+            filtered = list(valid_images)
+
+        if frame_scores:
+            worst = sorted(
+                frame_scores,
+                key=lambda item: (item["worst_rms"], item["worst_p95_abs"]),
+                reverse=True,
+            )[:10]
+        else:
+            worst = []
+
+        applied = can_apply and bool(bad_frames)
+        return filtered, {
+            "enabled": True,
+            "status": status,
+            "reran_ba": False,
+            "max_frame_rms_px": self._epipolar_max_frame_rms,
+            "max_frame_p95_px": self._epipolar_max_frame_p95,
+            "input_images": len(valid_images),
+            "output_images": len(filtered),
+            "removed_images": sorted(int(v) for v in bad_frames) if applied else [],
+            "removed_count": len(bad_frames) if applied else 0,
+            "worst_frames": worst,
+        }
 
     # ────────────────────────────────────────────────────────────
     #  Bundle Adjustment

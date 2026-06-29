@@ -48,6 +48,27 @@ def _print_results(result: MultiCalibResult) -> None:
         dist = np.linalg.norm(t)
         print(f"    {sn}: t=[{t[0]:.1f}, {t[1]:.1f}, {t[2]:.1f}] mm  dist={dist:.1f} mm")
 
+    if result.epipolar_pairs:
+        print("\n  Epipolar rectified y residuals (pixels):")
+        for key, stats in sorted(result.epipolar_pairs.items()):
+            if stats.get("frame_count", 0) == 0:
+                print(f"    {key}: no shared frames")
+                continue
+            print(
+                f"    {key}: frames={stats['frame_count']} "
+                f"rms={stats['rms']:.4f} "
+                f"p95={stats['p95_abs']:.4f} "
+                f"max={stats['max_abs']:.4f}"
+            )
+
+    if result.epipolar_filter:
+        filt = result.epipolar_filter
+        print(
+            "\n  Epipolar filter: "
+            f"{filt.get('status', 'unknown')} "
+            f"{filt.get('input_images', 0)} -> {filt.get('output_images', 0)} frames"
+        )
+
 
 def _load_intrinsics(path: Path) -> dict[str, dict[str, np.ndarray | tuple[int, int]]]:
     with open(path, encoding="utf-8") as inp:
@@ -126,6 +147,25 @@ def main() -> None:
         default=0.8,
         help="Ignore cached corner detections whose score is below this threshold.",
     )
+    parser.add_argument(
+        "--no-epipolar-filter",
+        dest="epipolar_filter",
+        action="store_false",
+        help="Disable the post-BA epipolar outlier filter.",
+    )
+    parser.set_defaults(epipolar_filter=True)
+    parser.add_argument(
+        "--epipolar-max-frame-rms",
+        type=float,
+        default=0.75,
+        help="Reject a BA frame if its worst camera-pair rectified-y RMS exceeds this value.",
+    )
+    parser.add_argument(
+        "--epipolar-max-frame-p95",
+        type=float,
+        default=1.50,
+        help="Reject a BA frame if its worst camera-pair rectified-y p95 exceeds this value.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -192,6 +232,11 @@ def main() -> None:
     print(f"  Max images: {args.max_images if args.max_images > 0 else 'unlimited'}")
     print(f"  Min cameras: {args.min_cameras}")
     print(f"  Score threshold: {args.score_threshold:.3f}")
+    print(
+        f"  Epipolar filter: {args.epipolar_filter} "
+        f"(frame_rms<={args.epipolar_max_frame_rms:.3f}, "
+        f"frame_p95<={args.epipolar_max_frame_p95:.3f})"
+    )
     print(f"  Output: {output_path}")
 
     board = BoardConfig(
@@ -212,6 +257,9 @@ def main() -> None:
         min_cameras_per_board=args.min_cameras,
         detection_score_threshold=args.score_threshold,
         provided_intrinsics=provided_intrinsics,
+        epipolar_filter=args.epipolar_filter,
+        epipolar_max_frame_rms=args.epipolar_max_frame_rms,
+        epipolar_max_frame_p95=args.epipolar_max_frame_p95,
     )
 
     result = calibrator.run()
