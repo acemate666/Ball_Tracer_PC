@@ -431,7 +431,7 @@ class MultiCalibrator:
             "max_frame_p95_px": self._epipolar_max_frame_p95,
             "input_images": len(valid_images),
             "output_images": len(valid_images),
-            "removed_images": [],
+            "removed_count": 0,
         }
 
         if self._epipolar_filter:
@@ -1048,15 +1048,6 @@ class MultiCalibrator:
             status = "skipped_too_few_frames"
             filtered = list(valid_images)
 
-        if frame_scores:
-            worst = sorted(
-                frame_scores,
-                key=lambda item: (item["worst_rms"], item["worst_p95_abs"]),
-                reverse=True,
-            )[:10]
-        else:
-            worst = []
-
         applied = can_apply and bool(bad_frames)
         return filtered, {
             "enabled": True,
@@ -1066,9 +1057,7 @@ class MultiCalibrator:
             "max_frame_p95_px": self._epipolar_max_frame_p95,
             "input_images": len(valid_images),
             "output_images": len(filtered),
-            "removed_images": sorted(int(v) for v in bad_frames) if applied else [],
             "removed_count": len(bad_frames) if applied else 0,
-            "worst_frames": worst,
         }
 
     # ────────────────────────────────────────────────────────────

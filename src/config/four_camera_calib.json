@@ -1,19 +1,17 @@
 {
-    "config_role": "four_camera_full_calibration",
-    "config_written_at": "2026-03-19T12:26:12",
     "reference_serial": "DA7403103",
     "cameras": {
         "DA7403103": {
             "K": [
                 [
-                    2350.058013024033,
+                    2325.1101788915425,
                     0.0,
-                    1033.5762556747222
+                    1032.1716324353115
                 ],
                 [
                     0.0,
-                    2351.3734312609245,
-                    732.715786440456
+                    2323.5119009596547,
+                    748.1029995118524
                 ],
                 [
                     0.0,
@@ -22,11 +20,11 @@
                 ]
             ],
             "D": [
-                -0.11547935746978659,
-                0.14861048436476648,
-                -0.0006701498053508905,
-                0.0018704533881678045,
-                -0.0777946287859176
+                -0.1085830719715425,
+                0.13168846655986421,
+                0.00021867297290428214,
+                -0.00036005412365767867,
+                -0.002981017100470589
             ],
             "image_size": [
                 2048,
@@ -60,177 +58,60 @@
                     0.0
                 ]
             ],
-            "diagnostics": {
-                "relative_extrinsics_rms_px": 0.16415800154209137,
-                "intrinsics_rms_px": 0.07306369361418884,
-                "intrinsics_frames_used": 120,
-                "intrinsics_frames_detected": 158
-            },
-            "sources": {
-                "intrinsics_config": "src/config/four_camera_intrinsics.json",
-                "intrinsics_session": "data/four_camera_calibration/retake_mono8_g10_e5000_retry_03181523",
-                "ground_image": "data/four_camera_ground_registration/ground_reg_20260319_121635/DA7403103/ground_001.png",
-                "ground_annotation": "data/four_camera_ground_registration/ground_reg_20260319_121635/DA7403103/ground_001_annotations.json"
-            },
             "R_world": [
                 [
-                    0.9662700818191345,
-                    0.25404857827321964,
-                    -0.04220721334793756
+                    0.9658393703034135,
+                    0.04621477312478055,
+                    0.2549872654014918
                 ],
                 [
-                    0.04175592511054978,
-                    -0.3162753569027632,
-                    -0.9477480368400621
+                    0.040040197180918724,
+                    0.9455390052864556,
+                    -0.32303679680744324
                 ],
                 [
-                    -0.25412314278594283,
-                    0.9140181718616898,
-                    -0.31621544840062726
+                    -0.2560294775638518,
+                    0.32221139679863164,
+                    0.9113883488345986
                 ]
             ],
             "t_world": [
                 [
-                    539.7950464300297
+                    536.4194734743872
                 ],
                 [
-                    2108.8933388112127
+                    2106.8525152417083
                 ],
                 [
-                    2169.8519068374458
+                    2048.1734933476196
                 ]
             ],
             "pos_world": [
                 [
-                    -58.2370100554441
+                    -78.061047158463
                 ],
                 [
-                    -1453.427243800263
+                    -2676.8465779907146
                 ],
                 [
-                    2707.623460135802
-                ]
-            ]
-        },
-        "DA8571029": {
-            "K": [
-                [
-                    2325.9850420481157,
-                    0.0,
-                    1017.9355498844174
-                ],
-                [
-                    0.0,
-                    2326.012664199984,
-                    721.6700341734936
-                ],
-                [
-                    0.0,
-                    0.0,
-                    1.0
+                    -1322.8707050088344
                 ]
             ],
-            "D": [
-                -0.10337788614593328,
-                0.09725696354358956,
-                -0.0020398475807376333,
-                -0.00032762454573333764,
-                0.022416515378245898
-            ],
-            "image_size": [
-                2048,
-                1536
-            ],
-            "R_to_ref": [
-                [
-                    -0.9894545811782064,
-                    0.07119722478220816,
-                    -0.12613717520529755
-                ],
-                [
-                    -0.04167722459602083,
-                    0.6940763349537826,
-                    0.7186939892660142
-                ],
-                [
-                    0.13871784577131036,
-                    0.7163721075254372,
-                    -0.6837897065795377
-                ]
-            ],
-            "t_to_ref": [
-                [
-                    248.38887828921634
-                ],
-                [
-                    -3381.6331194030295
-                ],
-                [
-                    6484.31058080861
-                ]
-            ],
-            "diagnostics": {
-                "relative_extrinsics_rms_px": 0.10488665103912354,
-                "intrinsics_rms_px": 0.06616593500027024,
-                "intrinsics_frames_used": 84,
-                "intrinsics_frames_detected": 84
-            },
             "sources": {
-                "intrinsics_config": "src/config/four_camera_intrinsics.json",
-                "intrinsics_session": "data/four_camera_calibration/retake_mono8_g10_e5000_retry_03181523",
-                "ground_image": "data/four_camera_ground_registration/ground_reg_20260319_121635/DA8571029/ground_001.png"
-            },
-            "R_world": [
-                [
-                    -0.9210530777399868,
-                    -0.38917912757767015,
-                    0.014171614007615997
-                ],
-                [
-                    -0.1939264310107027,
-                    0.4267920859866451,
-                    -0.883312546437907
-                ],
-                [
-                    0.33771847349700684,
-                    -0.8163259900291375,
-                    -0.4685702835880651
-                ]
-            ],
-            "t_world": [
-                [
-                    -409.2654403555397
-                ],
-                [
-                    -380.9377963369093
-                ],
-                [
-                    6586.219753780525
-                ]
-            ],
-            "pos_world": [
-                [
-                    -2675.1171820953705
-                ],
-                [
-                    5379.806030758875
-                ],
-                [
-                    2755.4196747328324
-                ]
-            ]
+                "ground_annotation": "calibration/images/ground_reg_0629_3cams_epipolar150/DA7403103/ground_001_annotations.json"
+            }
         },
         "DA7403087": {
             "K": [
                 [
-                    2336.593746234942,
+                    2313.846053352962,
                     0.0,
-                    1053.4070521777064
+                    1038.6906514439556
                 ],
                 [
                     0.0,
-                    2334.765038047966,
-                    742.4043996654592
+                    2312.7715199999893,
+                    743.7691539452344
                 ],
                 [
                     0.0,
@@ -239,11 +120,11 @@
                 ]
             ],
             "D": [
-                -0.11708747538054855,
-                0.21009341802345796,
-                -0.000805397848721204,
-                0.0017573560655000785,
-                -0.2892097376080056
+                -0.10938903936129919,
+                0.10353755524902768,
+                -0.00073719356121575,
+                8.413020374897151e-05,
+                0.03585225107674441
             ],
             "image_size": [
                 2048,
@@ -251,95 +132,86 @@
             ],
             "R_to_ref": [
                 [
-                    0.9459772284855704,
-                    -0.12075607755600318,
-                    0.300907050299669
+                    0.9421943498082266,
+                    -0.12430100232267433,
+                    0.3111576256674928
                 ],
                 [
-                    0.11562041593988323,
-                    0.9926805994182982,
-                    0.03488763328769266
+                    0.11690080425396199,
+                    0.9922381204428066,
+                    0.04239946113930352
                 ],
                 [
-                    -0.30291748481170144,
-                    0.0017880916689786558,
-                    0.9530151101234103
+                    -0.3140127531713161,
+                    -0.0035739560300820997,
+                    0.9494120378866412
                 ]
             ],
             "t_to_ref": [
                 [
-                    -2434.5890617358205
+                    -2426.4894680927155
                 ],
                 [
-                    -410.56604094701606
+                    -412.3627409637769
                 ],
                 [
-                    1524.7935363777542
+                    1537.1796977671843
                 ]
             ],
-            "diagnostics": {
-                "relative_extrinsics_rms_px": 0.15859177708625793,
-                "intrinsics_rms_px": 0.09430860737522985,
-                "intrinsics_frames_used": 120,
-                "intrinsics_frames_detected": 185
-            },
-            "sources": {
-                "intrinsics_config": "src/config/four_camera_intrinsics.json",
-                "intrinsics_session": "data/four_camera_calibration/retake_mono8_g10_e5000_retry_03181523",
-                "ground_image": "data/four_camera_ground_registration/ground_reg_20260319_121635/DA7403087/ground_001.png",
-                "ground_annotation": "data/four_camera_ground_registration/ground_reg_20260319_121635/DA7403087/ground_001_annotations.json"
-            },
             "R_world": [
                 [
-                    0.8325597669281184,
-                    0.5535508535179995,
-                    -0.020632185102192793
+                    0.8253658365397691,
+                    0.02627038521441502,
+                    0.5639867930489979
                 ],
                 [
-                    0.14430509052276752,
-                    -0.2526992777843877,
-                    -0.9567231134745645
+                    0.1417812972770787,
+                    0.9572639791546993,
+                    -0.25207883281890286
                 ],
                 [
-                    -0.534808634318681,
-                    0.793551843030273,
-                    -0.2902674578409438
+                    -0.5465064497473342,
+                    0.28802003588916864,
+                    0.7863683356487382
                 ]
             ],
             "t_world": [
                 [
-                    -1525.6931904689584
+                    -1545.657149303496
                 ],
                 [
-                    1821.0037881382286
+                    1827.6859591142415
                 ],
                 [
-                    3432.952727155427
+                    3305.7679140600067
                 ]
             ],
             "pos_world": [
                 [
-                    2843.423410261649
+                    2823.2244061418205
                 ],
                 [
-                    -1419.510853774135
+                    -2661.1003183940797
                 ],
                 [
-                    2707.1924905212127
+                    -1267.1000504984186
                 ]
-            ]
+            ],
+            "sources": {
+                "ground_annotation": "calibration/images/ground_reg_0629_3cams_epipolar150/DA7403087/ground_001_annotations.json"
+            }
         },
         "DA8474746": {
             "K": [
                 [
-                    2352.7041554735224,
+                    2328.3467840729936,
                     0.0,
-                    1030.9601117947952
+                    1017.2439260927804
                 ],
                 [
                     0.0,
-                    2350.49861561156,
-                    731.7939599000376
+                    2325.891874652966,
+                    758.813543840248
                 ],
                 [
                     0.0,
@@ -348,11 +220,11 @@
                 ]
             ],
             "D": [
-                -0.11283511080393412,
-                0.09266192092944718,
-                -0.0004926969542486408,
-                0.0002803392113538839,
-                0.07321306793155717
+                -0.11318264428054177,
+                0.11589113305337986,
+                0.0012437783941276815,
+                -0.001408522444791709,
+                -0.026260013999940077
             ],
             "image_size": [
                 2048,
@@ -360,157 +232,154 @@
             ],
             "R_to_ref": [
                 [
-                    0.82895717538001,
-                    0.1716426129315998,
-                    -0.5323239754247485
+                    0.8277494599077919,
+                    0.16737274028181248,
+                    -0.5355531695666786
                 ],
                 [
-                    -0.1476639895830351,
-                    0.9851415859133325,
-                    0.08770063788015144
+                    -0.14675933657441714,
+                    0.9858285644021832,
+                    0.0812633911239703
                 ],
                 [
-                    0.5394676520111438,
-                    0.005905008905764439,
-                    0.8419856194160362
+                    0.5415648887719695,
+                    0.011331699752790032,
+                    0.840582574069982
                 ]
             ],
             "t_to_ref": [
                 [
-                    2807.483969083368
+                    2816.7129632766173
                 ],
                 [
-                    -358.82956867791967
+                    -348.13628137119946
                 ],
                 [
-                    916.8661133209898
+                    899.7627796963448
                 ]
             ],
-            "diagnostics": {
-                "relative_extrinsics_rms_px": 0.1710696965456009,
-                "intrinsics_rms_px": 0.06627313354193172,
-                "intrinsics_frames_used": 120,
-                "intrinsics_frames_detected": 126
-            },
-            "sources": {
-                "intrinsics_config": "src/config/four_camera_intrinsics.json",
-                "intrinsics_session": "data/four_camera_calibration/retake_mono8_g10_e5000_retry_03181523",
-                "ground_image": "data/four_camera_ground_registration/ground_reg_20260319_121635/DA8474746/ground_001.png",
-                "ground_annotation": "data/four_camera_ground_registration/ground_reg_20260319_121635/DA8474746/ground_001_annotations.json"
-            },
             "R_world": [
                 [
-                    0.9434394553855959,
-                    -0.3302447236658647,
-                    -0.029332857218248798
+                    0.9432920528617484,
+                    0.023950373025917543,
+                    -0.33109890159858224
                 ],
                 [
-                    -0.1238345587338898,
-                    -0.26892985659389484,
-                    -0.9551658150790205
+                    -0.1230789986924734,
+                    0.951540901486733,
+                    -0.28181815569383384
                 ],
                 [
-                    0.3075499895706587,
-                    0.9047735378111162,
-                    -0.2946147470712284
+                    0.3083044973540387,
+                    0.3065881478950796,
+                    0.9005287582756802
                 ]
             ],
             "t_world": [
                 [
-                    2461.8627159930484
+                    2516.457765389923
                 ],
                 [
-                    1829.3180658627102
+                    1816.57606676362
                 ],
                 [
-                    3047.5052153524257
+                    2935.8018994897984
                 ]
             ],
             "pos_world": [
                 [
-                    -3033.3458217387106
+                    -3055.293177061805
                 ],
                 [
-                    -1452.3266577287427
+                    -2688.898597323968
                 ],
                 [
-                    2717.3555271769915
+                    -1298.6335202382231
                 ]
-            ]
+            ],
+            "sources": {
+                "ground_annotation": "calibration/images/ground_reg_0629_3cams_epipolar150/DA8474746/ground_001_annotations.json"
+            }
         }
     },
     "diagnostics": {
-        "total_rms": 0.11538621783256531,
+        "total_rms": 0.12034757435321808,
         "per_camera_rms": {
-            "DA7403103": 0.16415800154209137,
-            "DA8571029": 0.10488665103912354,
-            "DA7403087": 0.15859177708625793,
-            "DA8474746": 0.1710696965456009
+            "DA7403103": 0.16134661436080933,
+            "DA7403087": 0.19689489901065826,
+            "DA8474746": 0.15437909960746765
         },
-        "num_images": 140,
-        "num_observations": 28160,
-        "ground_reproj_error": 1.9432537202426865,
+        "epipolar_pairs": {
+            "DA7403103__DA7403087": {
+                "mean": -0.0014625154766135851,
+                "mean_abs": 0.2540790656382548,
+                "rms": 0.37246735614110577,
+                "median_abs": 0.16653060999760783,
+                "p90_abs": 0.5914676415778164,
+                "p95_abs": 0.8072681172064218,
+                "p99_abs": 1.3628111119790876,
+                "max_abs": 1.9158855786599815,
+                "left": "DA7403103",
+                "right": "DA7403087",
+                "frame_count": 36,
+                "point_count": 3168
+            },
+            "DA7403103__DA8474746": {
+                "mean": -0.002981755169146989,
+                "mean_abs": 0.6096565830908579,
+                "rms": 0.7767678555166856,
+                "median_abs": 0.5031358079618258,
+                "p90_abs": 1.269625788895007,
+                "p95_abs": 1.5171527764911044,
+                "p99_abs": 2.1058176780459728,
+                "max_abs": 3.486586135694324,
+                "left": "DA7403103",
+                "right": "DA8474746",
+                "frame_count": 39,
+                "point_count": 3432
+            },
+            "DA7403087__DA8474746": {
+                "mean": 0.13939330602635594,
+                "mean_abs": 1.2891906177878962,
+                "rms": 1.938405683414113,
+                "median_abs": 0.9182408268306972,
+                "p90_abs": 2.57502503340595,
+                "p95_abs": 4.069087387524332,
+                "p99_abs": 7.712423950639935,
+                "max_abs": 11.473166415872583,
+                "left": "DA7403087",
+                "right": "DA8474746",
+                "frame_count": 23,
+                "point_count": 2024
+            }
+        },
+        "epipolar_filter": {
+            "enabled": true,
+            "status": "applied",
+            "reran_ba": true,
+            "max_frame_rms_px": 1.5,
+            "max_frame_p95_px": 3.0,
+            "input_images": 226,
+            "output_images": 52,
+            "removed_count": 174
+        },
+        "num_images": 52,
+        "num_observations": 11176,
+        "ground_reproj_error": 0.6800023867898641,
         "ground_registration": {
-            "registered_at": "2026-03-19T12:26:12",
+            "registered_at": "2026-06-29T21:32:48",
             "ground_index": 1,
-            "images_dir": "data/four_camera_ground_registration/ground_reg_20260319_121635",
+            "images_dir": "calibration/images/ground_reg_0629_3cams_epipolar150",
             "reference_serial": "DA7403103",
             "anchor_serial": "DA7403103",
             "num_cameras_annotated": 3,
-            "num_cameras_registered": 4,
-            "missing_ground_annotations": [
-                "DA8571029"
-            ],
-            "total_rms_px": 1.9432537202426865,
+            "num_cameras_registered": 3,
+            "missing_ground_annotations": [],
+            "total_rms_px": 0.6800023867898641,
             "per_camera_rms_px": {
-                "DA7403103": 2.0395557573242225,
-                "DA7403087": 2.061084841315358,
-                "DA8474746": 1.7090484643148032
-            }
-        },
-        "position_observation_validation": {
-            "observed_at": "2026-03-19T12:30:00",
-            "method": "manual_rough_field_measurement",
-            "units": "mm",
-            "notes": [
-                "These are coarse manual validation observations, not high-precision survey ground truth.",
-                "The quoted bounds are limited by manual measurement uncertainty and should be treated as upper bounds on disagreement."
-            ],
-            "per_camera": {
-                "DA8571029": {
-                    "observed_axes": [
-                        "z"
-                    ],
-                    "observed_error_upper_bound_mm": 10.0,
-                    "note": "Measured camera height agrees within about 1 cm."
-                },
-                "DA7403103": {
-                    "observed_axes": [
-                        "x",
-                        "y"
-                    ],
-                    "observed_error_upper_bound_mm": 100.0,
-                    "measurement_limited": true,
-                    "note": "Manual x/y check is within about 10 cm; the bound is dominated by tape-measure uncertainty."
-                },
-                "DA7403087": {
-                    "observed_axes": [
-                        "x",
-                        "y"
-                    ],
-                    "observed_error_upper_bound_mm": 100.0,
-                    "measurement_limited": true,
-                    "note": "Manual x/y check is within about 10 cm; the bound is dominated by tape-measure uncertainty."
-                },
-                "DA8474746": {
-                    "observed_axes": [
-                        "x",
-                        "y"
-                    ],
-                    "observed_error_upper_bound_mm": 100.0,
-                    "measurement_limited": true,
-                    "note": "Manual x/y check is within about 10 cm; the bound is dominated by tape-measure uncertainty."
-                }
+                "DA7403103": 0.5916062128906878,
+                "DA7403087": 0.72598702853902,
+                "DA8474746": 0.7142511192724575
             }
         }
     },
@@ -519,24 +388,18 @@
         "inner_rows": 11,
         "square_size": 45.0
     },
+    "config_written_at": "2026-06-29T21:32:48",
     "sources": {
-        "fixed_intrinsics_config": "src/config/four_camera_intrinsics.json",
-        "fixed_intrinsics_dataset": "data/four_camera_calibration/retake_mono8_g10_e5000_retry_03181523",
-        "relative_extrinsics_result": "data/four_camera_calibration/merge_old_plus_bridge_all_reordered_20260319/extrinsics_4cams_score08_reordered.json",
-        "relative_extrinsics_dataset": "data/four_camera_calibration/merge_old_plus_bridge_all_reordered_20260319",
         "ground_registration": {
-            "status": "completed",
-            "images_dir": "data/four_camera_ground_registration/ground_reg_20260319_121635",
+            "images_dir": "calibration/images/ground_reg_0629_3cams_epipolar150",
             "ground_index": 1,
-            "annotator": "calibration/ground_annotator.py",
-            "point_definition_source": "calibration/ground_annotator.py:GROUND_POINTS",
             "annotation_files": {
-                "DA7403103": "data/four_camera_ground_registration/ground_reg_20260319_121635/DA7403103/ground_001_annotations.json",
-                "DA7403087": "data/four_camera_ground_registration/ground_reg_20260319_121635/DA7403087/ground_001_annotations.json",
-                "DA8474746": "data/four_camera_ground_registration/ground_reg_20260319_121635/DA8474746/ground_001_annotations.json"
+                "DA7403103": "calibration/images/ground_reg_0629_3cams_epipolar150/DA7403103/ground_001_annotations.json",
+                "DA7403087": "calibration/images/ground_reg_0629_3cams_epipolar150/DA7403087/ground_001_annotations.json",
+                "DA8474746": "calibration/images/ground_reg_0629_3cams_epipolar150/DA8474746/ground_001_annotations.json"
             },
-            "registered_at": "2026-03-19T12:26:12",
-            "input_calib": "src/config/four_camera_calib.json"
+            "registered_at": "2026-06-29T21:32:48",
+            "input_calib": "src/config/multi_calib_3cams_no_DA8571029_003_intrinsics_epipolar150_300_0629.json"
         }
     }
 }

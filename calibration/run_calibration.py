@@ -139,7 +139,7 @@ def main() -> None:
         action="store_false",
         help="Optimize intrinsics and extrinsics together.",
     )
-    parser.add_argument("--max-images", type=int, default=50)
+    parser.add_argument("--max-images", type=int, default=0)
     parser.add_argument("--min-cameras", type=int, default=2)
     parser.add_argument(
         "--score-threshold",
