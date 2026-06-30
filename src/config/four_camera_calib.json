@@ -1,19 +1,17 @@
 {
-    "config_role": "four_camera_full_calibration",
-    "config_written_at": "2026-03-19T12:26:12",
     "reference_serial": "DA7403103",
     "cameras": {
         "DA7403103": {
             "K": [
                 [
-                    2350.058013024033,
+                    2342.298141792156,
                     0.0,
-                    1033.5762556747222
+                    1027.83313881267
                 ],
                 [
                     0.0,
-                    2351.3734312609245,
-                    732.715786440456
+                    2341.3600523476493,
+                    742.8385481324473
                 ],
                 [
                     0.0,
@@ -22,11 +20,11 @@
                 ]
             ],
             "D": [
-                -0.11547935746978659,
-                0.14861048436476648,
-                -0.0006701498053508905,
-                0.0018704533881678045,
-                -0.0777946287859176
+                -0.10881741671314543,
+                0.1452857748797451,
+                -0.0004677558556882232,
+                0.00025463224674464406,
+                -0.011282352459409681
             ],
             "image_size": [
                 2048,
@@ -60,69 +58,60 @@
                     0.0
                 ]
             ],
-            "diagnostics": {
-                "relative_extrinsics_rms_px": 0.16415800154209137,
-                "intrinsics_rms_px": 0.07306369361418884,
-                "intrinsics_frames_used": 120,
-                "intrinsics_frames_detected": 158
-            },
-            "sources": {
-                "intrinsics_config": "src/config/four_camera_intrinsics.json",
-                "intrinsics_session": "data/four_camera_calibration/retake_mono8_g10_e5000_retry_03181523",
-                "ground_image": "data/four_camera_ground_registration/ground_reg_20260319_121635/DA7403103/ground_001.png",
-                "ground_annotation": "data/four_camera_ground_registration/ground_reg_20260319_121635/DA7403103/ground_001_annotations.json"
-            },
             "R_world": [
                 [
-                    0.9662700818191345,
-                    0.25404857827321964,
-                    -0.04220721334793756
+                    0.965546049500277,
+                    0.04327737344797218,
+                    0.256608447331442
                 ],
                 [
-                    0.04175592511054978,
-                    -0.3162753569027632,
-                    -0.9477480368400621
+                    0.0424012929609071,
+                    0.9467341989925515,
+                    -0.3192122911373797
                 ],
                 [
-                    -0.25412314278594283,
-                    0.9140181718616898,
-                    -0.31621544840062726
+                    -0.2567546623717903,
+                    0.3190946966111732,
+                    0.9122804491739211
                 ]
             ],
             "t_world": [
                 [
-                    539.7950464300297
+                    544.7950566150156
                 ],
                 [
-                    2108.8933388112127
+                    2103.7015029343374
                 ],
                 [
-                    2169.8519068374458
+                    2127.338136660042
                 ]
             ],
             "pos_world": [
                 [
-                    -58.2370100554441
+                    -69.0203934013449
                 ],
                 [
-                    -1453.427243800263
+                    -2694.0457737246184
                 ],
                 [
-                    2707.623460135802
+                    -1409.0006278280407
                 ]
-            ]
+            ],
+            "sources": {
+                "ground_annotation": "calibration/images/ground_4cams_0630/DA7403103/ground_001_annotations.json"
+            }
         },
         "DA8571029": {
             "K": [
                 [
-                    2325.9850420481157,
+                    2332.643144380498,
                     0.0,
-                    1017.9355498844174
+                    996.086385323414
                 ],
                 [
                     0.0,
-                    2326.012664199984,
-                    721.6700341734936
+                    2331.587366644796,
+                    735.9226482153051
                 ],
                 [
                     0.0,
@@ -131,11 +120,11 @@
                 ]
             ],
             "D": [
-                -0.10337788614593328,
-                0.09725696354358956,
-                -0.0020398475807376333,
-                -0.00032762454573333764,
-                0.022416515378245898
+                -0.11301699458859837,
+                0.18977929210459343,
+                -0.0013297846415435783,
+                -0.0024248406541213046,
+                -0.163863162344996
             ],
             "image_size": [
                 2048,
@@ -143,94 +132,84 @@
             ],
             "R_to_ref": [
                 [
-                    -0.9894545811782064,
-                    0.07119722478220816,
-                    -0.12613717520529755
+                    -0.9891095446542274,
+                    0.0752466953058478,
+                    -0.1264920689982411
                 ],
                 [
-                    -0.04167722459602083,
-                    0.6940763349537826,
-                    0.7186939892660142
+                    -0.03997029905557445,
+                    0.6898020948209208,
+                    0.7228937993744844
                 ],
                 [
-                    0.13871784577131036,
-                    0.7163721075254372,
-                    -0.6837897065795377
+                    0.14164986363323764,
+                    0.7200770825586786,
+                    -0.6792822029955348
                 ]
             ],
             "t_to_ref": [
                 [
-                    248.38887828921634
+                    299.1468375123074
                 ],
                 [
-                    -3381.6331194030295
+                    -3394.7909234281533
                 ],
                 [
-                    6484.31058080861
+                    6482.471532877865
                 ]
             ],
-            "diagnostics": {
-                "relative_extrinsics_rms_px": 0.10488665103912354,
-                "intrinsics_rms_px": 0.06616593500027024,
-                "intrinsics_frames_used": 84,
-                "intrinsics_frames_detected": 84
-            },
-            "sources": {
-                "intrinsics_config": "src/config/four_camera_intrinsics.json",
-                "intrinsics_session": "data/four_camera_calibration/retake_mono8_g10_e5000_retry_03181523",
-                "ground_image": "data/four_camera_ground_registration/ground_reg_20260319_121635/DA8571029/ground_001.png"
-            },
             "R_world": [
                 [
-                    -0.9210530777399868,
-                    -0.38917912757767015,
-                    0.014171614007615997
+                    -0.9193628277235512,
+                    -0.011930391718449646,
+                    -0.39322977602618087
                 ],
                 [
-                    -0.1939264310107027,
-                    0.4267920859866451,
-                    -0.883312546437907
+                    -0.19495101703196174,
+                    0.8820010017381126,
+                    0.4290318564992225
                 ],
                 [
-                    0.33771847349700684,
-                    -0.8163259900291375,
-                    -0.4685702835880651
+                    0.3417105382606158,
+                    0.4710964855381644,
+                    -0.8132047770120575
                 ]
             ],
             "t_world": [
                 [
-                    -409.2654403555397
+                    -350.5099692252821
                 ],
                 [
-                    -380.9377963369093
+                    -427.58929299861484
                 ],
                 [
-                    6586.219753780525
+                    6629.40598317586
                 ]
             ],
             "pos_world": [
                 [
-                    -2675.1171820953705
+                    -2670.9426908534774
                 ],
                 [
-                    5379.806030758875
+                    -2750.137396356637
                 ],
                 [
-                    2755.4196747328324
+                    5436.68308577191
                 ]
-            ]
+            ],
+            "sources": {}
         },
         "DA7403087": {
             "K": [
                 [
-                    2336.593746234942,
+                    2324.383578590905,
                     0.0,
-                    1053.4070521777064
+                    1044.9442747117223
                 ],
                 [
                     0.0,
-                    2334.765038047966,
-                    742.4043996654592
+                    2323.5038885360323,
+                    742.6798012815202
                 ],
                 [
                     0.0,
@@ -239,11 +218,11 @@
                 ]
             ],
             "D": [
-                -0.11708747538054855,
-                0.21009341802345796,
-                -0.000805397848721204,
-                0.0017573560655000785,
-                -0.2892097376080056
+                -0.11093660409805908,
+                0.14838048308313365,
+                -0.0011000460848549249,
+                0.001014452484228688,
+                -0.03676282481600398
             ],
             "image_size": [
                 2048,
@@ -251,95 +230,86 @@
             ],
             "R_to_ref": [
                 [
-                    0.9459772284855704,
-                    -0.12075607755600318,
-                    0.300907050299669
+                    0.9452712013767959,
+                    -0.12177587025338162,
+                    0.30270942052024175
                 ],
                 [
-                    0.11562041593988323,
-                    0.9926805994182982,
-                    0.03488763328769266
+                    0.11521741787735311,
+                    0.9925545701015354,
+                    0.03950154412465028
                 ],
                 [
-                    -0.30291748481170144,
-                    0.0017880916689786558,
-                    0.9530151101234103
+                    -0.30526595366228504,
+                    -0.0024622742714545537,
+                    0.9522639522422697
                 ]
             ],
             "t_to_ref": [
                 [
-                    -2434.5890617358205
+                    -2426.509384795719
                 ],
                 [
-                    -410.56604094701606
+                    -407.52810240112757
                 ],
                 [
-                    1524.7935363777542
+                    1517.4513250395046
                 ]
             ],
-            "diagnostics": {
-                "relative_extrinsics_rms_px": 0.15859177708625793,
-                "intrinsics_rms_px": 0.09430860737522985,
-                "intrinsics_frames_used": 120,
-                "intrinsics_frames_detected": 185
-            },
-            "sources": {
-                "intrinsics_config": "src/config/four_camera_intrinsics.json",
-                "intrinsics_session": "data/four_camera_calibration/retake_mono8_g10_e5000_retry_03181523",
-                "ground_image": "data/four_camera_ground_registration/ground_reg_20260319_121635/DA7403087/ground_001.png",
-                "ground_annotation": "data/four_camera_ground_registration/ground_reg_20260319_121635/DA7403087/ground_001_annotations.json"
-            },
             "R_world": [
                 [
-                    0.8325597669281184,
-                    0.5535508535179995,
-                    -0.020632185102192793
+                    0.829817364783128,
+                    0.022212444512891366,
+                    0.5575928159626402
                 ],
                 [
-                    0.14430509052276752,
-                    -0.2526992777843877,
-                    -0.9567231134745645
+                    0.14319111414677432,
+                    0.9572763963407909,
+                    -0.2512333692768431
                 ],
                 [
-                    -0.534808634318681,
-                    0.793551843030273,
-                    -0.2902674578409438
+                    -0.5393509487650785,
+                    0.2883201489968242,
+                    0.7911839519028799
                 ]
             ],
             "t_world": [
                 [
-                    -1525.6931904689584
+                    -1523.7450937993076
                 ],
                 [
-                    1821.0037881382286
+                    1827.3134594346736
                 ],
                 [
-                    3432.952727155427
+                    3371.751474217525
                 ]
             ],
             "pos_world": [
                 [
-                    2843.423410261649
+                    2821.332444805188
                 ],
                 [
-                    -1419.510853774135
+                    -2687.541827511499
                 ],
                 [
-                    2707.1924905212127
+                    -1358.9642214062724
                 ]
-            ]
+            ],
+            "sources": {
+                "ground_annotation": "calibration/images/ground_4cams_0630/DA7403087/ground_001_annotations.json"
+            }
         },
         "DA8474746": {
             "K": [
                 [
-                    2352.7041554735224,
+                    2353.7175961140542,
                     0.0,
-                    1030.9601117947952
+                    1038.6714577194998
                 ],
                 [
                     0.0,
-                    2350.49861561156,
-                    731.7939599000376
+                    2351.7406717963263,
+                    739.8499599696803
                 ],
                 [
                     0.0,
@@ -348,11 +318,11 @@
                 ]
             ],
             "D": [
-                -0.11283511080393412,
-                0.09266192092944718,
-                -0.0004926969542486408,
-                0.0002803392113538839,
-                0.07321306793155717
+                -0.10821434574893979,
+                0.15275615062572398,
+                -0.00044949412857713314,
+                0.00010835078324050513,
+                -0.029762482395868088
             ],
             "image_size": [
                 2048,
@@ -360,100 +330,91 @@
             ],
             "R_to_ref": [
                 [
-                    0.82895717538001,
-                    0.1716426129315998,
-                    -0.5323239754247485
+                    0.8260014315480478,
+                    0.16568472295145112,
+                    -0.5387673038159206
                 ],
                 [
-                    -0.1476639895830351,
-                    0.9851415859133325,
-                    0.08770063788015144
+                    -0.14231304953047205,
+                    0.986158044704424,
+                    0.0850841160151792
                 ],
                 [
-                    0.5394676520111438,
-                    0.005905008905764439,
-                    0.8419856194160362
+                    0.5454068490713269,
+                    0.00639401636281578,
+                    0.8381470548423104
                 ]
             ],
             "t_to_ref": [
                 [
-                    2807.483969083368
+                    2798.7096827669357
                 ],
                 [
-                    -358.82956867791967
+                    -338.0813970117983
                 ],
                 [
-                    916.8661133209898
+                    941.1302395064336
                 ]
             ],
-            "diagnostics": {
-                "relative_extrinsics_rms_px": 0.1710696965456009,
-                "intrinsics_rms_px": 0.06627313354193172,
-                "intrinsics_frames_used": 120,
-                "intrinsics_frames_detected": 126
-            },
-            "sources": {
-                "intrinsics_config": "src/config/four_camera_intrinsics.json",
-                "intrinsics_session": "data/four_camera_calibration/retake_mono8_g10_e5000_retry_03181523",
-                "ground_image": "data/four_camera_ground_registration/ground_reg_20260319_121635/DA8474746/ground_001.png",
-                "ground_annotation": "data/four_camera_ground_registration/ground_reg_20260319_121635/DA8474746/ground_001_annotations.json"
-            },
             "R_world": [
                 [
-                    0.9434394553855959,
-                    -0.3302447236658647,
-                    -0.029332857218248798
+                    0.9428986827780188,
+                    0.02068877653524842,
+                    -0.3324365331021123
                 ],
                 [
-                    -0.1238345587338898,
-                    -0.26892985659389484,
-                    -0.9551658150790205
+                    -0.11744117008789651,
+                    0.9546205017285471,
+                    -0.2736919239727811
                 ],
                 [
-                    0.3075499895706587,
-                    0.9047735378111162,
-                    -0.2946147470712284
+                    0.31168837896826224,
+                    0.29710549002839265,
+                    0.9025401277567251
                 ]
             ],
             "t_world": [
                 [
-                    2461.8627159930484
+                    2451.12214792435
                 ],
                 [
-                    1829.3180658627102
+                    1839.972002710775
                 ],
                 [
-                    3047.5052153524257
+                    3034.7384904520495
                 ]
             ],
             "pos_world": [
                 [
-                    -3033.3458217387106
+                    -3040.9641003601646
                 ],
                 [
-                    -1452.3266577287427
+                    -2708.8231810870257
                 ],
                 [
-                    2717.3555271769915
+                    -1420.545238337107
                 ]
-            ]
+            ],
+            "sources": {
+                "ground_annotation": "calibration/images/ground_4cams_0630/DA8474746/ground_001_annotations.json"
+            }
         }
     },
     "diagnostics": {
-        "total_rms": 0.11538621783256531,
+        "total_rms": 0.18642237782478333,
         "per_camera_rms": {
-            "DA7403103": 0.16415800154209137,
-            "DA8571029": 0.10488665103912354,
-            "DA7403087": 0.15859177708625793,
-            "DA8474746": 0.1710696965456009
+            "DA7403103": 0.24179431796073914,
+            "DA8571029": 0.26928946375846863,
+            "DA7403087": 0.32393068075180054,
+            "DA8474746": 0.23643848299980164
         },
-        "num_images": 140,
-        "num_observations": 28160,
-        "ground_reproj_error": 1.9432537202426865,
+        "num_images": 120,
+        "num_observations": 27896,
+        "ground_reproj_error": 1.0664498388164423,
         "ground_registration": {
-            "registered_at": "2026-03-19T12:26:12",
+            "registered_at": "2026-06-30T20:13:09",
             "ground_index": 1,
-            "images_dir": "data/four_camera_ground_registration/ground_reg_20260319_121635",
+            "images_dir": "calibration/images/ground_4cams_0630",
             "reference_serial": "DA7403103",
             "anchor_serial": "DA7403103",
             "num_cameras_annotated": 3,
@@ -461,56 +422,11 @@
             "missing_ground_annotations": [
                 "DA8571029"
             ],
-            "total_rms_px": 1.9432537202426865,
+            "total_rms_px": 1.0664498388164423,
             "per_camera_rms_px": {
-                "DA7403103": 2.0395557573242225,
-                "DA7403087": 2.061084841315358,
-                "DA8474746": 1.7090484643148032
-            }
-        },
-        "position_observation_validation": {
-            "observed_at": "2026-03-19T12:30:00",
-            "method": "manual_rough_field_measurement",
-            "units": "mm",
-            "notes": [
-                "These are coarse manual validation observations, not high-precision survey ground truth.",
-                "The quoted bounds are limited by manual measurement uncertainty and should be treated as upper bounds on disagreement."
-            ],
-            "per_camera": {
-                "DA8571029": {
-                    "observed_axes": [
-                        "z"
-                    ],
-                    "observed_error_upper_bound_mm": 10.0,
-                    "note": "Measured camera height agrees within about 1 cm."
-                },
-                "DA7403103": {
-                    "observed_axes": [
-                        "x",
-                        "y"
-                    ],
-                    "observed_error_upper_bound_mm": 100.0,
-                    "measurement_limited": true,
-                    "note": "Manual x/y check is within about 10 cm; the bound is dominated by tape-measure uncertainty."
-                },
-                "DA7403087": {
-                    "observed_axes": [
-                        "x",
-                        "y"
-                    ],
-                    "observed_error_upper_bound_mm": 100.0,
-                    "measurement_limited": true,
-                    "note": "Manual x/y check is within about 10 cm; the bound is dominated by tape-measure uncertainty."
-                },
-                "DA8474746": {
-                    "observed_axes": [
-                        "x",
-                        "y"
-                    ],
-                    "observed_error_upper_bound_mm": 100.0,
-                    "measurement_limited": true,
-                    "note": "Manual x/y check is within about 10 cm; the bound is dominated by tape-measure uncertainty."
-                }
+                "DA7403103": 0.9921609701133611,
+                "DA7403087": 1.379919078271913,
+                "DA8474746": 0.7234540226854463
             }
         }
     },
@@ -519,24 +435,18 @@
         "inner_rows": 11,
         "square_size": 45.0
     },
+    "config_written_at": "2026-06-30T20:13:09",
     "sources": {
-        "fixed_intrinsics_config": "src/config/four_camera_intrinsics.json",
-        "fixed_intrinsics_dataset": "data/four_camera_calibration/retake_mono8_g10_e5000_retry_03181523",
-        "relative_extrinsics_result": "data/four_camera_calibration/merge_old_plus_bridge_all_reordered_20260319/extrinsics_4cams_score08_reordered.json",
-        "relative_extrinsics_dataset": "data/four_camera_calibration/merge_old_plus_bridge_all_reordered_20260319",
         "ground_registration": {
-            "status": "completed",
-            "images_dir": "data/four_camera_ground_registration/ground_reg_20260319_121635",
+            "images_dir": "calibration/images/ground_4cams_0630",
             "ground_index": 1,
-            "annotator": "calibration/ground_annotator.py",
-            "point_definition_source": "calibration/ground_annotator.py:GROUND_POINTS",
             "annotation_files": {
-                "DA7403103": "data/four_camera_ground_registration/ground_reg_20260319_121635/DA7403103/ground_001_annotations.json",
-                "DA7403087": "data/four_camera_ground_registration/ground_reg_20260319_121635/DA7403087/ground_001_annotations.json",
-                "DA8474746": "data/four_camera_ground_registration/ground_reg_20260319_121635/DA8474746/ground_001_annotations.json"
+                "DA7403103": "calibration/images/ground_4cams_0630/DA7403103/ground_001_annotations.json",
+                "DA7403087": "calibration/images/ground_4cams_0630/DA7403087/ground_001_annotations.json",
+                "DA8474746": "calibration/images/ground_4cams_0630/DA8474746/ground_001_annotations.json"
             },
-            "registered_at": "2026-03-19T12:26:12",
-            "input_calib": "src/config/four_camera_calib.json"
+            "registered_at": "2026-06-30T20:13:09",
+            "input_calib": "src/config/multi_calib_4cams_merged_002_003_004_calib_0630.json"
         }
     }
 }
