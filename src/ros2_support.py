@@ -16,6 +16,15 @@ ROS2_SITE_PACKAGES = ROS2_ROOT / "Lib" / "site-packages"
 ROS2_SCRIPTS_DIR = ROS2_ROOT / "Scripts"
 ROS2_BIN_DIR = ROS2_ROOT / "bin"
 CYCLONEDDS_XML_PATH = Path(__file__).resolve().parent.parent / "ros2" / "cyclonedds.xml"
+ROS2_DLL_DIRS = (
+    ROS2_ROOT,
+    ROS2_ROOT / "Library" / "mingw-w64" / "bin",
+    ROS2_ROOT / "Library" / "usr" / "bin",
+    ROS2_ROOT / "Library" / "bin",
+    ROS2_SCRIPTS_DIR,
+    ROS2_BIN_DIR,
+)
+_DLL_HANDLES = []
 
 ROS2_TRACKER_PEERS = (
     ARM_RK_IP,
@@ -54,11 +63,23 @@ def _prepend_unique_env_path(name: str, value: Path | str) -> None:
         os.environ[name] = value_str
 
 
+def _add_dll_directory(path: Path) -> None:
+    if not hasattr(os, "add_dll_directory") or not path.exists():
+        return
+    path_str = str(path)
+    if any(item[0] == path_str for item in _DLL_HANDLES):
+        return
+    _DLL_HANDLES.append((path_str, os.add_dll_directory(path_str)))
+
+
 def ensure_ros2_environment() -> None:
     """Prepare the current process to load ROS 2 Jazzy with Cyclone DDS."""
     if ROS2_SITE_PACKAGES.exists():
         _prepend_unique_sys_path(ROS2_SITE_PACKAGES)
         _prepend_unique_env_path("PYTHONPATH", ROS2_SITE_PACKAGES)
+
+    for dll_dir in ROS2_DLL_DIRS:
+        _add_dll_directory(dll_dir)
 
     if ROS2_SCRIPTS_DIR.exists():
         _prepend_unique_env_path("PATH", ROS2_SCRIPTS_DIR)

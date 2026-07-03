@@ -3,15 +3,16 @@
   <Domain id="any">
     <General>
       <Interfaces>
-        <NetworkInterface address="192.168.50.18" multicast="false" />
+        <NetworkInterface autodetermine="true" multicast="true" />
       </Interfaces>
-      <AllowMulticast>false</AllowMulticast>
-      <MulticastRecvNetworkInterfaceAddresses>none</MulticastRecvNetworkInterfaceAddresses>
+      <AllowMulticast>true</AllowMulticast>
+      <MulticastRecvNetworkInterfaceAddresses>preferred</MulticastRecvNetworkInterfaceAddresses>
     </General>
     <Discovery>
       <ParticipantIndex>auto</ParticipantIndex>
       <MaxAutoParticipantIndex>8</MaxAutoParticipantIndex>
       <Peers>
+        <Peer Address="10.8.48.201" />
         <Peer Address="192.168.50.18" />
         <Peer Address="192.168.50.17" />
         <Peer Address="192.168.50.68" />

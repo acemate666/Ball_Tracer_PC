@@ -93,6 +93,16 @@ def _infer_fixed_engine_batch(model_path: Path) -> int | None:
     return batch if batch > 0 else None
 
 
+def _infer_engine_imgsz(model_path: Path) -> int | None:
+    if model_path.suffix != ".engine":
+        return None
+    match = re.search(r"_b\d+_(\d+)(?:_|\.engine$)", model_path.name)
+    if not match:
+        return None
+    imgsz = int(match.group(1))
+    return imgsz if imgsz > 0 else None
+
+
 class BallDetector:
     """
     通用检测器。
@@ -128,6 +138,7 @@ class BallDetector:
         self._onnx_input_name: str | None = None
         self._onnx_input_hw: tuple[int, int] | None = None
         self._fixed_engine_batch = _infer_fixed_engine_batch(self._model_path)
+        self._engine_imgsz = _infer_engine_imgsz(self._model_path)
 
         if self._model_path.suffix == ".onnx":
             self._init_onnx_runtime()
@@ -181,6 +192,8 @@ class BallDetector:
             kwargs["device"] = self._device
         if self._half:
             kwargs["half"] = True
+        if self._engine_imgsz is not None:
+            kwargs["imgsz"] = self._engine_imgsz
         return self._model.predict(source, **kwargs)
 
     def _predict_fixed_batch(self, images: list[np.ndarray], conf: float) -> list:

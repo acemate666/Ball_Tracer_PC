@@ -22,7 +22,7 @@
 
 用法：
   python run_tracker.py [--duration 60] [--no-video] [--output-dir tracker_output]
-                        [--display] [--ros2-mode auto|direct|off]
+                        [--display] [--ros2-mode auto|direct|bridge|off]
 
 输出文件（存放在 tracker_output/ 下）：
   tracker_YYYYMMDD_HHMMSS.avi   — 原始拼接视频（半分辨率）
@@ -125,6 +125,19 @@ def _terminate_process_tree(proc: subprocess.Popen | None, *, timeout: float = 3
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
+
+
+def _ros2_python_executable() -> str:
+    configured = os.environ.get("BALL_TRACER_ROS2_PYTHON", "").strip()
+    if configured:
+        return configured
+    ros2_root = os.environ.get("BALL_TRACER_ROS2_ROOT", "").strip()
+    if ros2_root:
+        python_name = "python.exe" if os.name == "nt" else "bin/python"
+        candidate = Path(ros2_root) / python_name
+        if candidate.exists():
+            return str(candidate)
+    return sys.executable
 
 
 def _ros_runtime_config() -> dict[str, str]:
@@ -338,17 +351,19 @@ class UdpBridgeRos2Sink:
         except OSError:
             pass
 
+    def publish_logger_control(self, payload: dict) -> None:
+        try:
+            routed = dict(payload)
+            routed["topic"] = "logger_control"
+            self._sock_car.sendto(json.dumps(routed).encode(), self._addr_car)
+        except OSError:
+            pass
+
     def close(self) -> None:
         self._sock_car.close()
         self._sock_hit.close()
         for proc in (self._proc_car, self._proc_hit):
-            if proc is None or proc.poll() is not None:
-                continue
-            proc.terminate()
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            _terminate_process_tree(proc)
         print("  ROS2 桥接已关闭")
 
 
@@ -362,7 +377,7 @@ class TimeSyncResponderProcess:
 
         try:
             self._proc = subprocess.Popen(
-                [sys.executable, "-u", str(script)],
+                [_ros2_python_executable(), "-u", str(script)],
             )
             print(f"  time_sync 独立进程已启动 (PID={self._proc.pid})")
             _print_ros_comm_config(
@@ -421,7 +436,7 @@ class PcEventLoggerProcess:
             pass
 
         command = [
-            sys.executable,
+            _ros2_python_executable(),
             "-u",
             str(script),
             "--target-path",
@@ -613,13 +628,14 @@ class DirectRos2Sink:
 
 
 def _create_ros2_sink(mode: str):
-    if mode in ("auto", "direct"):
-        try:
-            return DirectRos2Sink()
-        except Exception as e:
-            raise RuntimeError(
-                "ROS2 direct mode failed and bridge mode is disabled"
-            ) from e
+    if mode == "direct":
+        return DirectRos2Sink()
+
+    if mode == "bridge":
+        return UdpBridgeRos2Sink()
+
+    if mode == "auto":
+        return UdpBridgeRos2Sink()
 
     return NullRos2Sink()
 
@@ -880,14 +896,10 @@ def _infer_engine_batch_from_model_path(model_path: Path) -> int | None:
 
 
 def _infer_model_input_size_from_model_path(model_path: Path) -> int | None:
-    stem = model_path.stem
-    marker = stem.rfind("_")
-    if marker < 0:
+    match = re.search(r"_b\d+_(\d+)(?:_|$)", model_path.stem)
+    if not match:
         return None
-    suffix = stem[marker + 1:]
-    if not suffix.isdigit():
-        return None
-    size = int(suffix)
+    size = int(match.group(1))
     return size if size > 0 else None
 
 
@@ -1585,8 +1597,8 @@ def main() -> int:
         help="实时显示拼接画面（按 q 退出）")
     parser.add_argument(
         "--ros2-mode",
-        choices=("auto", "direct", "off"),
-        default="direct",
+        choices=("auto", "direct", "bridge", "off"),
+        default="auto",
         help="ROS2 output mode",
     )
     parser.add_argument(
@@ -1594,6 +1606,11 @@ def main() -> int:
         help="保存每相机全分辨率视频（多个 mp4，无拼接、无 badge；编码慢、丢帧多，但保留原图细节供训练数据用）"
     )
     args = parser.parse_args()
+    # 临时关闭所有 ROS 发送功能（/pc_car_loc、/predict_hit_pos、logger_control、
+    # time_sync、pc_logger、UDP 桥接均不启动）。恢复时删除以下两行即可。
+    if args.ros2_mode != "off":
+        print(f"[ROS2] 发送功能已在代码中关闭（忽略 --ros2-mode={args.ros2_mode}，强制 off）")
+    args.ros2_mode = "off"
     save_logs = not args.no_log
 
     output_dir = Path(args.output_dir)

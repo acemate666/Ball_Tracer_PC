@@ -39,6 +39,7 @@ PUBLISH_HZ = 30
 TOPICS = {
     "car_loc": "/pc_car_loc",
     "predict_hit": "/predict_hit_pos",
+    "logger_control": "/arm_logger/control",
 }
 
 
@@ -48,8 +49,9 @@ class TrackerBridge(Node):
 
         self._pubs = {}
         for key, topic in TOPICS.items():
+            depth = 20 if key == "logger_control" else 1
             self._pubs[key] = self.create_publisher(
-                String, topic, make_topic_qos(topic)
+                String, topic, make_topic_qos(topic, depth=depth)
             )
 
         self._timer = self.create_timer(1.0 / PUBLISH_HZ, self._on_timer)
