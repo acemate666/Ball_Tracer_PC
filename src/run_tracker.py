@@ -25,8 +25,9 @@
                         [--display] [--ros2-mode auto|direct|bridge|off]
 
 输出文件（存放在 tracker_output/ 下）：
-  tracker_YYYYMMDD_HHMMSS.avi   — 原始拼接视频（半分辨率）
-  tracker_YYYYMMDD_HHMMSS.json  — 观测、预测、状态变化等完整日志
+  tracker_YYYYMMDD_HHMMSS.avi     — 原始拼接视频（半分辨率）
+  tracker_YYYYMMDD_HHMMSS.json    — 观测、预测、状态变化等完整日志
+  tracker_YYYYMMDD_HHMMSS_rosbag/ — ros2 bag（局域网全部 ROS topic 录制）
 """
 
 from __future__ import annotations
@@ -79,10 +80,6 @@ from src.curve4 import (
     Curve4Tracker,
     TrackerState,
     TrackerResult,
-)
-from src.pc_logger_protocol import (
-    LOGGER_CONTROL_TOPIC,
-    build_logger_control_payload,
 )
 from src.ros2_support import (
     CYCLONEDDS_XML_PATH,
@@ -291,9 +288,6 @@ class NullRos2Sink:
     def publish_predict_hit(self, payload: dict) -> None:
         return None
 
-    def publish_logger_control(self, payload: dict) -> None:
-        return None
-
     def close(self) -> None:
         return None
 
@@ -351,14 +345,6 @@ class UdpBridgeRos2Sink:
         except OSError:
             pass
 
-    def publish_logger_control(self, payload: dict) -> None:
-        try:
-            routed = dict(payload)
-            routed["topic"] = "logger_control"
-            self._sock_car.sendto(json.dumps(routed).encode(), self._addr_car)
-        except OSError:
-            pass
-
     def close(self) -> None:
         self._sock_car.close()
         self._sock_hit.close()
@@ -398,125 +384,66 @@ class TimeSyncResponderProcess:
         print("  time_sync 独立进程已关闭")
 
 
-class PcEventLoggerProcess:
-    def __init__(
-        self,
-        *,
-        target_path: Path,
-        run_id: str,
-        group_id: str,
-        tracker_output_dir: Path,
-        tracker_json_path: Path,
-        tracker_video_path: Path | None,
-        idle_record_period_sec: float,
-        high_rate_tail_sec: float,
-        min_save_interval_sec: float,
-        post_hit_save_delay_sec: float,
-        tick_period_sec: float,
-    ) -> None:
-        self.target_path = target_path.resolve()
-        self.ready_file = self.target_path.with_suffix(".ready")
-        self.run_id = str(run_id)
-        self.group_id = str(group_id)
-        self.tracker_output_dir = tracker_output_dir.resolve()
-        self.tracker_json_path = tracker_json_path.resolve()
-        self.tracker_video_path = (
-            tracker_video_path.resolve() if tracker_video_path is not None else None
-        )
+class RosbagRecorderProcess:
+    """独立 ros2 bag 录制进程：录制局域网内全部 ROS topic 到 {run_id}_rosbag/。
+
+    通过 ros2/run_ros2.bat 启动 src/rosbag_recorder.py，ROS2 环境由 bat 自带，
+    与 tracker 进程的 ros2_mode 无关。停止协议：close() 创建 stop 文件，
+    子进程轮询到后调用 Recorder.stop() 并写出 bag 元数据。
+    """
+
+    def __init__(self, *, bag_dir: Path) -> None:
+        self.bag_dir = bag_dir.resolve()
+        self.stop_file = self.bag_dir.with_name(self.bag_dir.name + ".stop")
         self._proc: subprocess.Popen | None = None
 
-        script = _ROOT / "src" / "pc_event_logger.py"
-        if not script.exists():
-            print(f"  pc logger 脚本不存在，跳过: {script}")
+        launcher = _ROOT / "ros2" / "run_ros2.bat"
+        script = _ROOT / "src" / "rosbag_recorder.py"
+        missing = [str(p) for p in (launcher, script) if not p.exists()]
+        if missing:
+            print(f"  rosbag 录制启动文件不存在，跳过: {', '.join(missing)}")
             return
 
         try:
-            self.ready_file.unlink(missing_ok=True)
-        except Exception:
+            self.stop_file.unlink(missing_ok=True)
+        except OSError:
             pass
-
-        command = [
-            _ros2_python_executable(),
-            "-u",
-            str(script),
-            "--target-path",
-            str(self.target_path),
-            "--ready-file",
-            str(self.ready_file),
-            "--run-id",
-            self.run_id,
-            "--group-id",
-            self.group_id,
-            "--tracker-output-dir",
-            str(self.tracker_output_dir),
-            "--tracker-json-path",
-            str(self.tracker_json_path),
-            "--idle-record-period-sec",
-            str(float(idle_record_period_sec)),
-            "--high-rate-tail-sec",
-            str(float(high_rate_tail_sec)),
-            "--min-save-interval-sec",
-            str(float(min_save_interval_sec)),
-            "--post-hit-save-delay-sec",
-            str(float(post_hit_save_delay_sec)),
-            "--tick-period-sec",
-            str(float(tick_period_sec)),
-        ]
-        if self.tracker_video_path is not None:
-            command.extend(["--tracker-video-path", str(self.tracker_video_path)])
-
         try:
-            self._proc = subprocess.Popen(command)
-            print(f"  pc logger 独立进程已启动 (PID={self._proc.pid})")
-            _print_ros_comm_config(
-                "pc logger ROS2",
+            self._proc = subprocess.Popen(
                 [
-                    (LOGGER_CONTROL_TOPIC, 20),
+                    str(launcher),
+                    str(script),
+                    "--output",
+                    str(self.bag_dir),
+                    "--stop-file",
+                    str(self.stop_file),
                 ],
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
             )
+            print(f"  rosbag 录制进程已启动 (PID={self._proc.pid}) -> {self.bag_dir}")
         except Exception as e:
-            print(f"  pc logger 独立进程启动失败: {e}")
+            print(f"  rosbag 录制进程启动失败: {e}")
             self._proc = None
-
-    def is_running(self) -> bool:
-        return self._proc is not None and self._proc.poll() is None
 
     def was_started(self) -> bool:
         return self._proc is not None
 
-    def returncode(self) -> int | None:
-        if self._proc is None:
-            return None
-        return self._proc.poll()
-
-    def wait_until_ready(self, timeout_sec: float) -> bool:
-        if self._proc is None:
-            return False
-        deadline = time.perf_counter() + max(float(timeout_sec), 0.0)
-        while time.perf_counter() < deadline:
-            if self._proc.poll() is not None:
-                return False
-            if self.ready_file.exists():
-                return True
-            time.sleep(0.1)
-        return self.ready_file.exists()
-
-    def close(self, *, timeout_sec: float = 5.0) -> None:
+    def close(self, *, timeout_sec: float = 10.0) -> None:
         if self._proc is None:
             return
         try:
-            self.ready_file.unlink(missing_ok=True)
-        except Exception:
+            self.stop_file.write_text("stop", encoding="utf-8")
+        except OSError:
             pass
-        if self._proc.poll() is None:
-            try:
-                self._proc.wait(timeout=max(float(timeout_sec), 0.1))
-            except subprocess.TimeoutExpired:
-                _terminate_process_tree(
-                    self._proc,
-                    timeout=max(float(timeout_sec), 0.1),
-                )
-        print("  pc logger 独立进程已关闭")
+        try:
+            self._proc.wait(timeout=max(float(timeout_sec), 0.1))
+        except subprocess.TimeoutExpired:
+            _terminate_process_tree(self._proc)
+        try:
+            self.stop_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        print("  rosbag 录制进程已关闭")
 
 
 class DirectRos2Sink:
@@ -546,11 +473,6 @@ class DirectRos2Sink:
         self._hit_pub = self._node.create_publisher(
             String, "/predict_hit_pos", make_topic_qos("/predict_hit_pos")
         )
-        self._logger_control_pub = self._node.create_publisher(
-            String,
-            LOGGER_CONTROL_TOPIC,
-            make_topic_qos(LOGGER_CONTROL_TOPIC, depth=20),
-        )
         self._executor = self._executor_type()
         self._executor.add_node(self._node)
         self._spin_thread = threading.Thread(
@@ -565,7 +487,6 @@ class DirectRos2Sink:
             [
                 ("/pc_car_loc", 1),
                 ("/predict_hit_pos", 1),
-                (LOGGER_CONTROL_TOPIC, 20),
             ],
         )
 
@@ -607,15 +528,6 @@ class DirectRos2Sink:
             f"duration={payload.get('duration')}"
         )
 
-    def publish_logger_control(self, payload: dict) -> None:
-        self._publish(self._logger_control_pub, payload)
-        self._node.get_logger().info(
-            f"{LOGGER_CONTROL_TOPIC} "
-            f"command={payload.get('command')} "
-            f"command_id={payload.get('command_id')} "
-            f"reason={payload.get('reason')}"
-        )
-
     def close(self) -> None:
         self._spin_stop.set()
         self._spin_thread.join(timeout=2.0)
@@ -644,19 +556,6 @@ def _create_time_sync_process(mode: str):
     if mode == "off":
         return None
     return TimeSyncResponderProcess()
-
-
-def _publish_logger_control(
-    ros2_sink,
-    payload: dict,
-    *,
-    repeat: int = 1,
-    interval_s: float = 0.15,
-) -> None:
-    for index in range(max(int(repeat), 1)):
-        ros2_sink.publish_logger_control(payload)
-        if index + 1 < repeat:
-            time.sleep(max(float(interval_s), 0.0))
 
 
 def _run_postprocess_command(
@@ -1606,8 +1505,8 @@ def main() -> int:
         help="保存每相机全分辨率视频（多个 mp4，无拼接、无 badge；编码慢、丢帧多，但保留原图细节供训练数据用）"
     )
     args = parser.parse_args()
-    # 临时关闭所有 ROS 发送功能（/pc_car_loc、/predict_hit_pos、logger_control、
-    # time_sync、pc_logger、UDP 桥接均不启动）。恢复时删除以下两行即可。
+    # 临时关闭所有 ROS 发送功能（/pc_car_loc、/predict_hit_pos、time_sync、UDP 桥接均不启动）。
+    # 恢复时删除以下强制 off 两行即可。rosbag 录制是纯接收，不受此开关影响。
     if args.ros2_mode != "off":
         print(f"[ROS2] 发送功能已在代码中关闭（忽略 --ros2-mode={args.ros2_mode}，强制 off）")
     args.ros2_mode = "off"
@@ -1618,9 +1517,7 @@ def main() -> int:
         output_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     run_id = f"tracker_{ts}"
-    group_id = run_id
     json_path = output_dir / f"{run_id}.json"
-    pc_logger_path = output_dir / f"{run_id}_pc_logger.json"
 
     # ── 加载追踪配置 ──────────────────────────────────────────────────────
     _config_dir = Path(__file__).resolve().parent / "config"
@@ -1676,25 +1573,6 @@ def main() -> int:
     post_run_annotated_video_no_racket = post_run_cfg.get(
         "annotated_video_no_racket", True
     )
-    pc_logger_cfg = tracker_cfg.get("pc_logger", {})
-    pc_logger_enabled = bool(pc_logger_cfg.get("enabled", True)) and save_logs
-    pc_logger_idle_record_period_sec = float(
-        pc_logger_cfg.get("idle_record_period_sec", 1.0)
-    )
-    pc_logger_high_rate_tail_sec = float(
-        pc_logger_cfg.get("high_rate_tail_sec", 1.0)
-    )
-    pc_logger_min_save_interval_sec = float(
-        pc_logger_cfg.get("min_save_interval_sec", 20.0)
-    )
-    pc_logger_post_hit_save_delay_sec = float(
-        pc_logger_cfg.get("post_hit_save_delay_sec", 2.0)
-    )
-    pc_logger_tick_period_sec = float(pc_logger_cfg.get("tick_period_sec", 0.5))
-    pc_logger_startup_wait_sec = float(
-        pc_logger_cfg.get("startup_wait_sec", 5.0)
-    )
-
 
     # ── 初始化组件 ──────────────────────────────────────────────────────
     print("=" * 60)
@@ -1768,22 +1646,26 @@ def main() -> int:
     else:
         print("  小车定位: disabled")
 
-    # ── ROS2 桥接子进程（UDP → /pc_car_loc topic）──
+    # ── ROS2 边车子进程（rosbag 录制 / time_sync / UDP 桥接）──
     _ros2_sink = _create_ros2_sink(args.ros2_mode)
     _time_sync_proc = _create_time_sync_process(args.ros2_mode)
-    _pc_logger_proc: PcEventLoggerProcess | None = None
+    if save_logs:
+        _rosbag_proc = RosbagRecorderProcess(bag_dir=output_dir / f"{run_id}_rosbag")
+    else:
+        _rosbag_proc = None
+        print("  rosbag 录制已禁用：--no-log")
     _sidecars_closed = False
     _sidecar_lock = threading.Lock()
 
-    def _close_sidecars(*, pc_logger_timeout_sec: float) -> None:
+    def _close_sidecars(*, timeout_sec: float) -> None:
         nonlocal _sidecars_closed
         with _sidecar_lock:
             if _sidecars_closed:
                 return
             _sidecars_closed = True
         try:
-            if _pc_logger_proc is not None:
-                _pc_logger_proc.close(timeout_sec=pc_logger_timeout_sec)
+            if _rosbag_proc is not None:
+                _rosbag_proc.close(timeout_sec=timeout_sec)
         except Exception:
             pass
         try:
@@ -1792,60 +1674,7 @@ def main() -> int:
         except Exception:
             pass
 
-    atexit.register(lambda: _close_sidecars(pc_logger_timeout_sec=0.5))
-    if pc_logger_enabled and args.ros2_mode != "off":
-        _pc_logger_proc = PcEventLoggerProcess(
-            target_path=pc_logger_path,
-            run_id=run_id,
-            group_id=group_id,
-            tracker_output_dir=output_dir,
-            tracker_json_path=json_path,
-            tracker_video_path=(
-                None if args.no_video or args.full_res_video else video_path
-            ),
-            idle_record_period_sec=pc_logger_idle_record_period_sec,
-            high_rate_tail_sec=pc_logger_high_rate_tail_sec,
-            min_save_interval_sec=pc_logger_min_save_interval_sec,
-            post_hit_save_delay_sec=pc_logger_post_hit_save_delay_sec,
-            tick_period_sec=pc_logger_tick_period_sec,
-        )
-        if _pc_logger_proc.is_running():
-            ready = _pc_logger_proc.wait_until_ready(pc_logger_startup_wait_sec)
-            if not ready:
-                if _pc_logger_proc.is_running():
-                    print(
-                        "  pc logger 就绪等待超时，继续运行；初始配置由命令行参数提供"
-                    )
-                else:
-                    print(
-                        "  pc logger 启动失败，进程在就绪前退出"
-                        f" (returncode={_pc_logger_proc.returncode()})"
-                    )
-            if _pc_logger_proc.is_running():
-                _publish_logger_control(
-                    _ros2_sink,
-                    build_logger_control_payload(
-                        "new_file",
-                        reason="tracker_start",
-                        command_id=f"{run_id}-new-file",
-                        run_id=run_id,
-                        group_id=group_id,
-                        target_path=pc_logger_path,
-                        tracker_output_dir=output_dir,
-                        tracker_json_path=json_path,
-                        tracker_video_path=(
-                            None
-                            if args.no_video or args.full_res_video
-                            else video_path
-                        ),
-                    ),
-                    repeat=3,
-                    interval_s=0.2,
-                )
-    elif not save_logs:
-        print("  pc logger 已禁用：--no-log")
-    elif args.ros2_mode == "off":
-        print("  pc logger 已禁用：ROS2 mode=off")
+    atexit.register(lambda: _close_sidecars(timeout_sec=0.5))
 
     # log_frames / log_observations / log_predictions / log_car_locs /
     # log_state_transitions / frame_entry_by_idx / car_loc_missed_frames
@@ -2350,48 +2179,11 @@ def main() -> int:
                 frame_data["video_frame_idx"] = video_frame_idx
                 frame_data["video_mapping_exact"] = True
 
-    # ── 关闭 ROS2 桥接子进程 ──
-    if _pc_logger_proc is not None and _pc_logger_proc.is_running():
-        _publish_logger_control(
-            _ros2_sink,
-            build_logger_control_payload(
-                "save_now",
-                reason="tracker_stop",
-                command_id=f"{run_id}-save-now",
-                run_id=run_id,
-                group_id=group_id,
-                target_path=pc_logger_path,
-                tracker_output_dir=output_dir,
-                tracker_json_path=json_path,
-                tracker_video_path=(
-                    None if args.no_video or args.full_res_video else video_path
-                ),
-            ),
-            repeat=2,
-            interval_s=0.1,
-        )
-        _publish_logger_control(
-            _ros2_sink,
-            build_logger_control_payload(
-                "shutdown",
-                reason="tracker_stop",
-                command_id=f"{run_id}-shutdown",
-                run_id=run_id,
-                group_id=group_id,
-                target_path=pc_logger_path,
-                tracker_output_dir=output_dir,
-                tracker_json_path=json_path,
-                tracker_video_path=(
-                    None if args.no_video or args.full_res_video else video_path
-                ),
-            ),
-            repeat=2,
-            interval_s=0.1,
-        )
+    # ── 关闭 ROS2 边车子进程（rosbag / time_sync / 发送 sink）──
     try:
         _ros2_sink.close()
     finally:
-        _close_sidecars(pc_logger_timeout_sec=5.0)
+        _close_sidecars(timeout_sec=5.0)
 
     total_elapsed = time.perf_counter() - t_start
     elapsed = processing_elapsed
@@ -2494,33 +2286,14 @@ def main() -> int:
                 "generate_annotated_video": post_run_generate_annotated_video,
                 "annotated_video_no_racket": post_run_annotated_video_no_racket,
             },
-            "pc_logger": {
-                "enabled": bool(
-                    _pc_logger_proc is not None and _pc_logger_proc.was_started()
-                ),
-                "artifact_path": str(pc_logger_path.resolve())
-                if _pc_logger_proc is not None and _pc_logger_proc.was_started()
+            "rosbag": {
+                "enabled": _rosbag_proc is not None and _rosbag_proc.was_started(),
+                "bag_dir": str(_rosbag_proc.bag_dir)
+                if _rosbag_proc is not None and _rosbag_proc.was_started()
                 else None,
-                "artifact_exists": pc_logger_path.exists()
-                if _pc_logger_proc is not None and _pc_logger_proc.was_started()
+                "bag_exists": _rosbag_proc.bag_dir.exists()
+                if _rosbag_proc is not None and _rosbag_proc.was_started()
                 else False,
-                "group_id": (
-                    group_id
-                    if _pc_logger_proc is not None and _pc_logger_proc.was_started()
-                    else None
-                ),
-                "control_schema": "pc_logger_control_v1"
-                if _pc_logger_proc is not None and _pc_logger_proc.was_started()
-                else None,
-                "control_topic": LOGGER_CONTROL_TOPIC
-                if _pc_logger_proc is not None and _pc_logger_proc.was_started()
-                else None,
-                "startup_wait_sec": pc_logger_startup_wait_sec,
-                "idle_record_period_sec": pc_logger_idle_record_period_sec,
-                "high_rate_tail_sec": pc_logger_high_rate_tail_sec,
-                "min_save_interval_sec": pc_logger_min_save_interval_sec,
-                "post_hit_save_delay_sec": pc_logger_post_hit_save_delay_sec,
-                "tick_period_sec": pc_logger_tick_period_sec,
             },
             "video_frame_mapping_exact": bool(written_frame_indices),
         },
@@ -2630,13 +2403,13 @@ def main() -> int:
             print(f"  视频丢帧:   {drop_count}")
     if save_logs:
         print(f"  JSON:       {json_path}")
-        if _pc_logger_proc is not None and _pc_logger_proc.was_started():
-            if pc_logger_path.exists():
-                print(f"  PC Logger:  {pc_logger_path}")
+        if _rosbag_proc is not None and _rosbag_proc.was_started():
+            if _rosbag_proc.bag_dir.exists():
+                print(f"  ROSBAG:     {_rosbag_proc.bag_dir}")
             else:
                 print(
-                    "  PC Logger:  missing"
-                    f" (target={pc_logger_path})"
+                    "  ROSBAG:     missing"
+                    f" (target={_rosbag_proc.bag_dir})"
                 )
         if "html" in generated_artifacts:
             print(f"  HTML:       {generated_artifacts['html']}")

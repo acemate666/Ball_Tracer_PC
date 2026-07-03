@@ -4,9 +4,9 @@ import os
 import sys
 from pathlib import Path
 
-TRACKER_PC_IP = "192.168.50.18"
+TRACKER_PC_IP = "192.168.50.230"
 ARM_RK_IP = "192.168.50.17"
-CHASSIS_RK_IP = "192.168.50.68"
+CHASSIS_RK_IP = "192.168.50.143"
 DEFAULT_ROS_DOMAIN_ID = "2"
 
 ROS2_ROOT = Path(
