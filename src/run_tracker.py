@@ -583,19 +583,38 @@ def _generate_post_run_artifacts(
     generated: dict[str, Path] = {}
     python_exe = sys.executable
 
+    # ── rosbag → 机械臂 JSON（供 HTML Arm tab；bag 不存在时跳过）──
+    arm_json_path: Path | None = None
+    bag_dir = json_path.with_name(f"{json_path.stem}_rosbag")
+    if (bag_dir / "metadata.yaml").exists():
+        candidate = json_path.with_name(f"{json_path.stem}_arm.json")
+        if _run_postprocess_command(
+            "Extract arm rosbag",
+            [
+                str(_ROOT / "ros2" / "run_ros2.bat"),
+                str(_ROOT / "test_src" / "extract_arm_bag.py"),
+                "--bag",
+                str(bag_dir),
+                "--output",
+                str(candidate),
+            ],
+        ) and candidate.exists():
+            arm_json_path = candidate
+            generated["arm_json"] = candidate
+
     if generate_html:
         html_path = json_path.with_suffix(".html")
-        if _run_postprocess_command(
-            "Generate HTML",
-            [
-                python_exe,
-                str(_ROOT / "test_src" / "generate_curve3_html.py"),
-                "--input",
-                str(json_path),
-                "--output",
-                str(html_path),
-            ],
-        ):
+        html_command = [
+            python_exe,
+            str(_ROOT / "test_src" / "generate_curve3_html.py"),
+            "--input",
+            str(json_path),
+            "--output",
+            str(html_path),
+        ]
+        if arm_json_path is not None:
+            html_command.extend(["--arm-json", str(arm_json_path)])
+        if _run_postprocess_command("Generate HTML", html_command):
             generated["html"] = html_path
 
     if generate_annotated_video:

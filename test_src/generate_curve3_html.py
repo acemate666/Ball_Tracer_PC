@@ -88,10 +88,17 @@ def _merge_racket_json(base_data: dict, racket_data: dict, racket_json_path: str
     return merged
 
 
-def generate_html(input_path: str, output_path: str, racket_json_path: str | None = None) -> None:
+def generate_html(
+    input_path: str,
+    output_path: str,
+    racket_json_path: str | None = None,
+    arm_json_path: str | None = None,
+) -> None:
     data = _load_json(input_path)
     if racket_json_path:
         data = _merge_racket_json(data, _load_json(racket_json_path), racket_json_path)
+    if arm_json_path:
+        data["arm"] = _load_json(arm_json_path)
     data_json = json.dumps(data, ensure_ascii=False)
     html = HTML_TEMPLATE.replace("%%DATA_JSON%%", data_json)
     with open(output_path, "w", encoding="utf-8") as f:
@@ -136,6 +143,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 .zx{overflow:hidden;padding-bottom:6px;border-radius:16px;transition:box-shadow .18s ease}
 .cc.zoom-active .zx{box-shadow:0 0 0 1px rgba(92,208,255,.55),0 0 0 4px rgba(92,208,255,.10)}
 .cb{width:100%;min-width:100%;height:780px;min-height:780px}
+.cbt{width:100%;min-width:100%;height:1500px;min-height:1500px}
+.armEv{padding:0 24px 4px;font-size:12px;color:#a0a0c0;line-height:1.7}
+.armEv b{color:#e94560;font-weight:600}
 </style>
 </head>
 <body>
@@ -148,11 +158,16 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
   <div class="tab" onclick="sw(1)">X / Y / Z Subplots</div>
   <div class="tab" onclick="sw(2)">3D Trajectory</div>
   <div class="tab" onclick="sw(3)">Car Location</div>
+  <div class="tab" id="tabArm" onclick="sw(4)">Arm</div>
 </div>
 <div id="p0" class="pnl on"><div class="cc"><div class="lc" id="l0"></div><div class="zt"><span class="ztl">X zoom / click plot + wheel</span><button type="button" class="zb" data-plot="c0" data-action="out">X-</button><button type="button" class="zb on" data-plot="c0" data-action="reset">Reset</button><button type="button" class="zb" data-plot="c0" data-action="in">X+</button><span id="c0r" class="zr">1.00x</span></div><div class="zx"><div id="c0" class="cb"></div></div></div></div>
 <div id="p1" class="pnl"><div class="cc"><div class="lc" id="l1"></div><div class="zt"><span class="ztl">X zoom / click plot + wheel</span><button type="button" class="zb" data-plot="c1" data-action="out">X-</button><button type="button" class="zb on" data-plot="c1" data-action="reset">Reset</button><button type="button" class="zb" data-plot="c1" data-action="in">X+</button><span id="c1r" class="zr">1.00x</span></div><div class="zx"><div id="c1" class="cb"></div></div></div></div>
 <div id="p2" class="pnl"><div class="cc"><div class="lc" id="l2"></div><div class="zt"><span class="ztl">X zoom</span><button type="button" class="zb" data-plot="c2" data-action="out">X-</button><button type="button" class="zb on" data-plot="c2" data-action="reset">Reset</button><button type="button" class="zb" data-plot="c2" data-action="in">X+</button><span id="c2r" class="zr">n/a</span></div><div class="zx"><div id="c2" class="cb"></div></div></div></div>
 <div id="p3" class="pnl"><div class="cc"><div class="lc" id="l3"></div><div class="zt"><span class="ztl">X zoom / click plot + wheel</span><button type="button" class="zb" data-plot="c3" data-action="out">X-</button><button type="button" class="zb on" data-plot="c3" data-action="reset">Reset</button><button type="button" class="zb" data-plot="c3" data-action="in">X+</button><span id="c3r" class="zr">1.00x</span></div><div class="zx"><div id="c3" class="cb"></div></div></div></div>
+<div id="p4" class="pnl">
+  <div class="armEv" id="armEv"></div>
+  <div class="cc"><div class="lc" id="l4"></div><div class="zt"><span class="ztl">X zoom / click plot + wheel</span><button type="button" class="zb" data-plot="c4" data-action="out">X-</button><button type="button" class="zb on" data-plot="c4" data-action="reset">Reset</button><button type="button" class="zb" data-plot="c4" data-action="in">X+</button><span id="c4r" class="zr">1.00x</span></div><div class="zx"><div id="c4" class="cbt"></div></div></div>
+</div>
 
 <script>
 const D = %%DATA_JSON%%;
@@ -177,6 +192,11 @@ const s0Full = preds.filter(p=>p.stage===0).map(p=>({...p, x:p.x*distanceScale, 
 const s1Full = preds.filter(p=>p.stage===1).map(p=>({...p, x:p.x*distanceScale, y:p.y*distanceScale, z:p.z*distanceScale}));
 const resets = D.reset_times || summary.reset_times || [];
 const throws = D.throws || [];
+const ARM = (D.arm && Array.isArray(D.arm.states) && D.arm.states.length) ? D.arm : null;
+if(!ARM){
+  const tabArm=document.getElementById('tabArm');
+  if(tabArm) tabArm.style.display='none';
+}
 const sourceType = cfg.replay_source ? 'Replay JSON' : 'Tracker JSON';
 const fps = cfg.fps || summary.actual_fps;
 const durationS = cfg.duration_s || summary.duration_s;
@@ -288,6 +308,9 @@ document.getElementById('st').innerHTML=[
     : '',
   stat('2D render', 'full scattergl'),
   stat('Resets', resets.length),
+  ARM ? stat('Arm states', ARM.states.length) : '',
+  ARM ? stat('Arm cmds', ARM.commands.length) : '',
+  ARM && ARM.duration_sec ? stat('Arm bag', ARM.duration_sec.toFixed(1)+'s') : '',
   throws.length ? stat('Throws', throws.length) : '',
   fps ? stat('FPS', fps.toFixed ? fps.toFixed(1) : fps) : '',
   cfg.noise_mm!=null ? stat('Noise', cfg.noise_mm+'mm') : '',
@@ -524,6 +547,97 @@ buildPlots[3] = () => {
     yaxis5:{title:'Reproj (px)',...GS,domain:[0.0,0.19]},
   },PLOT_CONFIG).then(()=>{wl('c3','l3');wz('c3');});
 };
+
+buildPlots[4] = () => {
+  if(!ARM) return;
+  const escA = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const J = ARM.joint_names || ['joint1','joint2','joint3','joint4','joint5','joint6'];
+  const JC = ['#2563eb','#dc2626','#16a34a','#9333ea','#ea580c','#0891b2'];
+  const AXC = ['#2ecc71','#f1c40f','#5cd0ff'];
+  const events = ARM.events || [];
+  // 渲染点数控制（session viewer 的窗口化思路）：hit/predict 事件前后保留全
+  // 分辨率，窗口外抽稀到 2Hz。软渲染 WebGL 画不动 15 万点全量 32Hz 数据。
+  const hitTs = [];
+  events.forEach(e=>{
+    if(e.topic.indexOf('hit')>=0 || e.topic.indexOf('predict')>=0){
+      if(!hitTs.length || e.t - hitTs[hitTs.length-1] > 1.0) hitTs.push(e.t);
+    }
+  });
+  const windows = hitTs.map(t=>[t-2.0, t+4.0]);
+  const inWin = t => windows.some(w=>t>=w[0]&&t<=w[1]);
+  const thin = (rows, outStep) => {
+    const out=[]; let lastT=-1e9;
+    rows.forEach(r=>{
+      if(inWin(r.t) || r.t-lastT>=outStep){ out.push(r); lastT=r.t; }
+    });
+    return out;
+  };
+  const states = thin(ARM.states, 0.5), cmds = thin(ARM.commands || [], 0.5);
+  const sT = states.map(s=>s.t);
+  // 命令流在两次动作之间有长间隔，插入 null 断开连线，避免斜拉直线
+  const gapX = rows => {const X=[];let prev=null;
+    rows.forEach(r=>{if(prev!==null&&r.t-prev>0.5){X.push(null);}X.push(r.t);prev=r.t;});
+    return X;};
+  const gapY = (rows,get) => {const Y=[];let prev=null;
+    rows.forEach(r=>{if(prev!==null&&r.t-prev>0.5){Y.push(null);}Y.push(get(r));prev=r.t;});
+    return Y;};
+  const cX = gapX(cmds);
+  // 用 SVG scatter（非 scattergl）：lines 模式下每条 trace 只是一条 path，
+  // 软渲染 WebGL 的机器上 scattergl 数万点会把渲染器卡死，SVG 反而流畅。
+  const sv = t => ({type:'scatter', ...t});
+  const fieldSeries = field => {
+    const tr=[];
+    J.forEach((name,i)=>{
+      tr.push(sv({x:cX, y:gapY(cmds,r=>(r[field]&&r[field][i]!=null)?r[field][i]:null),
+        name:`${name} target`, mode:'lines', line:{color:JC[i%JC.length],width:2},
+        hovertemplate:`t=%{x:.3f}s<br>%{y:.4f}<extra>${name} target</extra>`}));
+      tr.push(sv({x:sT, y:states.map(r=>(r[field]&&r[field][i]!=null)?r[field][i]:null),
+        name:`${name} actual`, mode:'lines', line:{color:JC[i%JC.length],width:1,dash:'dot'},
+        hovertemplate:`t=%{x:.3f}s<br>%{y:.4f}<extra>${name} actual</extra>`}));
+    });
+    return tr;
+  };
+  const tcpSeries = () => {
+    const tr=[];
+    ['x','y','z'].forEach((ax,i)=>{
+      tr.push(sv({x:cX, y:gapY(cmds,r=>(r.tcp&&r.tcp[i]!=null)?r.tcp[i]:null),
+        name:`TCP ${ax} target`, mode:'lines', line:{color:AXC[i],width:2},
+        hovertemplate:`t=%{x:.3f}s<br>${ax}=%{y:.4f} m<extra>TCP ${ax} target</extra>`}));
+      tr.push(sv({x:sT, y:states.map(r=>(r.tcp&&r.tcp[i]!=null)?r.tcp[i]:null),
+        name:`TCP ${ax} actual`, mode:'lines', line:{color:AXC[i],width:1,dash:'dot'},
+        hovertemplate:`t=%{x:.3f}s<br>${ax}=%{y:.4f} m<extra>TCP ${ax} actual</extra>`}));
+    });
+    return tr;
+  };
+  const evShapes = events.map(e=>({type:'line',xref:'x',yref:'paper',x0:e.t,x1:e.t,y0:0,y1:1,
+    line:{color:(e.topic.indexOf('hit')>=0||e.topic.indexOf('predict')>=0)?'#e94560':'#f1c40f',width:1,dash:'dot'},
+    opacity:0.55}));
+  document.getElementById('armEv').innerHTML =
+    (ARM.fk_source ? `FK: ${escA(ARM.fk_source)} &nbsp; ` : '') +
+    (events.length
+      ? 'Events: ' + events.map(e=>`<b>${e.t.toFixed(2)}s</b> ${escA(e.topic.replace('/tennis/',''))} ${escA(e.text).slice(0,60)}`).join(' &nbsp;|&nbsp; ')
+      : 'Events: none');
+  // 单 plot 四层 subplot（同 Car Location 模式）：只占一个 WebGL context，
+  // 拆成 4 个独立 scattergl plot 会同时创建 4 个 context，软渲染机器直接卡死。
+  const bindAxis=(traces,ya)=>traces.map(t=>({...t,xaxis:'x',yaxis:ya}));
+  const tr=[
+    ...bindAxis(fieldSeries('position'),'y'),
+    ...bindAxis(fieldSeries('velocity'),'y2'),
+    ...bindAxis(fieldSeries('effort'),'y3'),
+    ...bindAxis(tcpSeries(),'y4'),
+  ];
+  Plotly.newPlot('c4',tr,{
+    ...DL,
+    title:{text:'Arm — target(solid) vs actual(dot): Position / Velocity / Effort / TCP(FK)',
+      font:{size:13,color:'#a0a0c0'}},
+    xaxis:{title:'Bag time (s)',...GS,domain:[0,1],anchor:'y4'},
+    yaxis:{title:'Position (rad)',...GS,domain:[0.79,1]},
+    yaxis2:{title:'Velocity (rad/s)',...GS,domain:[0.53,0.76]},
+    yaxis3:{title:'Effort (Nm)',...GS,domain:[0.27,0.50]},
+    yaxis4:{title:'TCP (m)',...GS,domain:[0.0,0.24]},
+    shapes:evShapes,
+  },PLOT_CONFIG).then(()=>{wl('c4','l4');wz('c4');});
+};
 })();
 
 function sw(i){
@@ -710,12 +824,21 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", default="curve3_output/curve3_result.json")
     parser.add_argument("--racket-json", default=None)
+    parser.add_argument(
+        "--arm-json", default=None,
+        help="extract_arm_bag.py 输出的机械臂 JSON；缺省时自动探测 <input>_arm.json",
+    )
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
 
     base = os.path.splitext(args.input)[0]
     out = args.output or (base + ".html")
-    generate_html(args.input, out, args.racket_json)
+    arm_json = args.arm_json
+    if arm_json is None:
+        candidate = base + "_arm.json"
+        if os.path.exists(candidate):
+            arm_json = candidate
+    generate_html(args.input, out, args.racket_json, arm_json)
 
 
 if __name__ == "__main__":
