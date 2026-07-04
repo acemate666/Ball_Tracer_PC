@@ -135,7 +135,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 .zb.on{background:#0f3460;border-color:#5cd0ff;color:#fff}
 .zr{font-size:12px;color:#a0a0c0;min-width:44px;text-align:right}
 .lc{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 10px}
-.lb{appearance:none;display:inline-flex;align-items:center;gap:8px;border:1px solid #0f3460;background:#16213e;color:#d7d7eb;
+.lb{appearance:none;display:inline-flex;align-items:center;gap:8px;border:1px solid #0f3460;background:#16213e;color:#d7d7eb;user-select:none;
     border-radius:999px;padding:4px 10px;font:inherit;font-size:12px;cursor:pointer;transition:background .18s ease,border-color .18s ease,opacity .18s ease,transform .18s ease}
 .lb:hover{background:#1a1a3e;border-color:#e94560;transform:translateY(-1px)}
 .lb.off{opacity:.45}
@@ -143,7 +143,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 .zx{overflow:hidden;padding-bottom:6px;border-radius:16px;transition:box-shadow .18s ease}
 .cc.zoom-active .zx{box-shadow:0 0 0 1px rgba(92,208,255,.55),0 0 0 4px rgba(92,208,255,.10)}
 .cb{width:100%;min-width:100%;height:780px;min-height:780px}
-.cbt{width:100%;min-width:100%;height:1500px;min-height:1500px}
+.cbt{width:100%;min-width:100%;height:2000px;min-height:2000px}
 .armEv{padding:0 24px 4px;font-size:12px;color:#a0a0c0;line-height:1.7}
 .armEv b{color:#e94560;font-weight:600}
 </style>
@@ -166,7 +166,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 <div id="p3" class="pnl"><div class="cc"><div class="lc" id="l3"></div><div class="zt"><span class="ztl">X zoom / click plot + wheel</span><button type="button" class="zb" data-plot="c3" data-action="out">X-</button><button type="button" class="zb on" data-plot="c3" data-action="reset">Reset</button><button type="button" class="zb" data-plot="c3" data-action="in">X+</button><span id="c3r" class="zr">1.00x</span></div><div class="zx"><div id="c3" class="cb"></div></div></div></div>
 <div id="p4" class="pnl">
   <div class="armEv" id="armEv"></div>
-  <div class="cc"><div class="lc" id="l4"></div><div class="zt"><span class="ztl">X zoom / click plot + wheel</span><button type="button" class="zb" data-plot="c4" data-action="out">X-</button><button type="button" class="zb on" data-plot="c4" data-action="reset">Reset</button><button type="button" class="zb" data-plot="c4" data-action="in">X+</button><span id="c4r" class="zr">1.00x</span></div><div class="zx"><div id="c4" class="cbt"></div></div></div>
+  <div class="cc"><div class="zt"><span class="ztl">X zoom / click plot + wheel</span><button type="button" class="zb" data-plot="c4" data-action="out">X-</button><button type="button" class="zb on" data-plot="c4" data-action="reset">Reset</button><button type="button" class="zb" data-plot="c4" data-action="in">X+</button><span id="c4r" class="zr">1.00x</span></div><div class="zx"><div id="c4" class="cbt"></div></div><div class="lc" id="l4" style="margin:10px 0 0"></div></div>
 </div>
 
 <script>
@@ -628,6 +628,7 @@ buildPlots[4] = () => {
   ];
   Plotly.newPlot('c4',tr,{
     ...DL,
+    showlegend:false,
     title:{text:'Arm — target(solid) vs actual(dot): Position / Velocity / Effort / TCP(FK)',
       font:{size:13,color:'#a0a0c0'}},
     xaxis:{title:'Bag time (s)',...GS,domain:[0,1],anchor:'y4'},
@@ -663,18 +664,29 @@ function tl(plotId,ctrlId){
     const name=trace&&trace.name?trace.name:`trace ${idx+1}`;
     return `<button type="button" class="lb${on?'':' off'}" data-plot="${plotId}" data-index="${idx}" aria-pressed="${on?'true':'false'}"><span class="ls" style="background:${tc(trace)}"></span><span>${name}</span></button>`;
   }).join('');
-  ctrl.querySelectorAll('.lb').forEach(btn=>{
-    btn.addEventListener('click',()=>{
-      const idx=Number(btn.dataset.index);
-      const next=!tv(plot.data[idx]);
-      Plotly.restyle(plotId,{visible:next?true:'legendonly'},[idx]).then(()=>tl(plotId,ctrlId));
-    });
-  });
 }
 function wl(plotId,ctrlId){
   const plot=document.getElementById(plotId);
-  if(!plot) return;
+  const ctrl=document.getElementById(ctrlId);
+  if(!plot||!ctrl) return;
   tl(plotId,ctrlId);
+  // 事件委托挂在容器上：单击后按钮条会整体重建，直接绑在按钮上 dblclick 收不到
+  ctrl.addEventListener('click',ev=>{
+    const btn=ev.target.closest('.lb');
+    if(!btn) return;
+    const idx=Number(btn.dataset.index);
+    const next=!tv(plot.data[idx]);
+    Plotly.restyle(plotId,{visible:next?true:'legendonly'},[idx]).then(()=>tl(plotId,ctrlId));
+  });
+  // 双击一个系列：只显示它；已是 solo 时再双击恢复全部
+  ctrl.addEventListener('dblclick',ev=>{
+    const btn=ev.target.closest('.lb');
+    if(!btn) return;
+    const idx=Number(btn.dataset.index);
+    const alreadySolo=plot.data.every((t,j)=>tv(t)===(j===idx));
+    const vis=plot.data.map((t,j)=>(alreadySolo||j===idx)?true:'legendonly');
+    Plotly.restyle(plotId,{visible:vis}).then(()=>tl(plotId,ctrlId));
+  });
   plot.on('plotly_restyle',()=>tl(plotId,ctrlId));
 }
 
