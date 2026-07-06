@@ -41,14 +41,16 @@
 
 ```text
 p_apriltag = (x, y, z)
-p_car      = (x + 0.06, y + 0.10, z - 0.34)   [m]
+p_car      = (x + 0.04, y + 0.16, z - 0.61)   [m]
 ```
 
 也就是：
 
 ```text
-apriltag_center_to_car_base_offset = (60, 100, -340)   [mm]
+apriltag_center_to_car_base_offset = (40, 160, -610)   [mm]
 ```
+
+物理含义（2026-07-05 重新测量）：tag 中心相对小车原点（世界轴向）在 x −40mm（左方）、y −160mm（后方）、z +610mm（地面上方），反号即得上面的偏移。
 
 ## 2. 配置字段含义
 
@@ -309,7 +311,7 @@ min_theta  Σ rho( || pi_c( p_world(q_k; theta) ) - u_obs(k, c) ||^2 )
 - `p_racket_rel_base_in_world(by vision)`
   由视觉三角化得到的世界系相对位移，即 `p_racket_world(by vision) - p_car`
 
-其中 `p_car = p_apriltag + (60, 100, -340) mm`。
+其中 `p_car = p_apriltag + (40, 160, -610) mm`。
 
 如果 RK 端要做的是完整末端姿态或拍面法向控制，则还需要补：
 

@@ -24,7 +24,7 @@ from ArmCalibration.common import ARM_DATA_ROOT, load_json, rel_or_abs, save_jso
 
 DEFAULT_CAMERA_CALIB_PATH = PROJECT_ROOT / "src" / "config" / "four_camera_calib.json"
 DEFAULT_EXPORT_CONFIG_PATH = PROJECT_ROOT / "src" / "config" / "arm_poe_racket_center.json"
-APRILTAG_TO_CAR_BASE_OFFSET_M = [0.06, 0.10, -0.34]
+APRILTAG_TO_CAR_BASE_OFFSET_M = [0.04, 0.16, -0.61]
 APRILTAG_TO_CAR_BASE_OFFSET_MM = [value * 1000.0 for value in APRILTAG_TO_CAR_BASE_OFFSET_M]
 
 
@@ -1068,7 +1068,7 @@ def build_export_config(
             "apriltag_center_to_car_base_offset_mm": APRILTAG_TO_CAR_BASE_OFFSET_MM,
             "offset_axis_convention": (
                 "The offset is applied directly in the world frame axes, exactly as "
-                "p_car = (x + 0.06, y + 0.10, z - 0.34) when p_apriltag = (x, y, z) in meters."
+                "p_car = (x + 0.04, y + 0.16, z - 0.61) when p_apriltag = (x, y, z) in meters."
             ),
         },
         "T_base_in_world": {

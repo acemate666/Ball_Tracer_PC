@@ -127,7 +127,7 @@ powershell -ExecutionPolicy Bypass -File .\ArmCalibration\run_armcalib_ros2.ps1 
 
 核心约定：
 
-- `p_car = p_apriltag + (60, 100, -340) mm`
+- `p_car = p_apriltag + (40, 160, -610) mm`
 - `car chassis center = robotic arm base`
 - `p_racket_rel_base_in_world(by vision) = p_racket_world(by vision) - p_car`
 - `p_racket_rel_base_in_world(by poe) = p_racket_world(by poe) - T_base_in_world.t`

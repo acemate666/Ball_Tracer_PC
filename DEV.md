@@ -228,7 +228,7 @@ T点宽2m中间在1m处，长2.54m
 			已完成：当前 `base` 原点 = `joint_1` 轴与世界地面 `z=0` 的交点
 
 	- 15.6） 继续接受来自RK的JointState信息， 这里要做的是以1HZ的速度打印基于最新JointState信息和刚计算出来的POE模型， 正解得到末端位置 在大地坐标系下， 相对于base的位移（x，y，z）。  同时也打印出4个相机 识别出的AprilTag 码下的，然后多目计算得到的小车位置p_car。 以及4个相机识别到的球拍几何中点，以及根据此多目三角测距算出的球拍中点在大地坐标系下的位置（p_racket), 以及p_racket - p_car。请注意利用视觉计算车位置和球拍位置（都是基于，几个相机识别到了就用几个相机的原则）。 整个流程相当于启动相机， 然后做ball_location, car_location, 和racket_location。 其中ball_location, car_location 已经有相关代码了，唯一的区别是用3个和4个相机要改一下。 racket_location只要参照类似逻辑来做就能输出了！
-		补充约定：视觉先多目三角化得到 AprilTag 中心坐标 `p_apriltag = (x, y, z)`，再换算车底盘中心坐标 `p_car = (x + 0.06, y + 0.10, z - 0.34)`（单位 m）。这里车底盘中心 = 机械臂 base；也就是 `p_car = p_apriltag + (60, 100, -340) mm`。
+		补充约定：视觉先多目三角化得到 AprilTag 中心坐标 `p_apriltag = (x, y, z)`，再换算车底盘中心坐标 `p_car = (x + 0.06, y + 0.10, z - 0.34)`（单位 m）。这里车底盘中心 = 机械臂 base；也就是 `p_car = p_apriltag + (60, 100, -340) mm`。（2026-07-05 重新测量后改为 `p_car = p_apriltag + (40, 160, -610) mm`，即 tag 中心在小车原点左方 40mm、后方 160mm、地面上方 610mm，见 `src/config/arm_poe_racket_center.json`。）
 			已完成：1Hz 实时输出已接通，重点比较
 			- `p_racket_rel_base_in_world(by poe)`
 			- `p_racket_rel_base_in_world(by vision)`

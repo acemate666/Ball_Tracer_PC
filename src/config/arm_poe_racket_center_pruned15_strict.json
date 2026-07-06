@@ -33,16 +33,16 @@
     "apriltag_center_measurement": "p_apriltag is the multi-camera triangulated world position of the detected AprilTag center.",
     "p_car_definition": "p_car = p_apriltag + apriltag_center_to_car_base_offset_world",
     "apriltag_center_to_car_base_offset_m": [
-      0.06,
-      0.1,
-      -0.34
+      0.04,
+      0.16,
+      -0.61
     ],
     "apriltag_center_to_car_base_offset_mm": [
-      60.0,
-      100.0,
-      -340.0
+      40.0,
+      160.0,
+      -610.0
     ],
-    "offset_axis_convention": "The offset is applied directly in the world frame axes, exactly as p_car = (x + 0.06, y + 0.10, z - 0.34) when p_apriltag = (x, y, z) in meters."
+    "offset_axis_convention": "The offset is applied directly in the world frame axes, exactly as p_car = (x + 0.04, y + 0.16, z - 0.61) when p_apriltag = (x, y, z) in meters."
   },
   "T_base_in_world": {
     "R": [
