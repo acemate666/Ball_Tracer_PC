@@ -93,12 +93,15 @@ def generate_html(
     output_path: str,
     racket_json_path: str | None = None,
     arm_json_path: str | None = None,
+    rk_tracking_json_path: str | None = None,
 ) -> None:
     data = _load_json(input_path)
     if racket_json_path:
         data = _merge_racket_json(data, _load_json(racket_json_path), racket_json_path)
     if arm_json_path:
         data["arm"] = _load_json(arm_json_path)
+    if rk_tracking_json_path:
+        data["rk_tracking"] = _load_json(rk_tracking_json_path)
     data_json = json.dumps(data, ensure_ascii=False)
     html = HTML_TEMPLATE.replace("%%DATA_JSON%%", data_json)
     with open(output_path, "w", encoding="utf-8") as f:
@@ -146,6 +149,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 .cbt{width:100%;min-width:100%;height:2000px;min-height:2000px}
 .armEv{padding:0 24px 4px;font-size:12px;color:#a0a0c0;line-height:1.7}
 .armEv b{color:#e94560;font-weight:600}
+.rkCtl{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 10px;font-size:12px;color:#a0a0c0}
+.rkCtl input{width:92px;border:1px solid #0f3460;background:#16213e;color:#fff;border-radius:4px;padding:4px 6px;font:inherit}
 </style>
 </head>
 <body>
@@ -159,6 +164,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
   <div class="tab" onclick="sw(2)">3D Trajectory</div>
   <div class="tab" onclick="sw(3)">Car Location</div>
   <div class="tab" id="tabArm" onclick="sw(4)">Arm</div>
+  <div class="tab" id="tabRk" onclick="sw(5)">RK Move</div>
+  <div class="tab" id="tabRkSignals" onclick="sw(6)">RK Signals</div>
 </div>
 <div id="p0" class="pnl on"><div class="cc"><div class="lc" id="l0"></div><div class="zt"><span class="ztl">X zoom / click plot + wheel</span><button type="button" class="zb" data-plot="c0" data-action="out">X-</button><button type="button" class="zb on" data-plot="c0" data-action="reset">Reset</button><button type="button" class="zb" data-plot="c0" data-action="in">X+</button><span id="c0r" class="zr">1.00x</span></div><div class="zx"><div id="c0" class="cb"></div></div></div></div>
 <div id="p1" class="pnl"><div class="cc"><div class="lc" id="l1"></div><div class="zt"><span class="ztl">X zoom / click plot + wheel</span><button type="button" class="zb" data-plot="c1" data-action="out">X-</button><button type="button" class="zb on" data-plot="c1" data-action="reset">Reset</button><button type="button" class="zb" data-plot="c1" data-action="in">X+</button><span id="c1r" class="zr">1.00x</span></div><div class="zx"><div id="c1" class="cb"></div></div></div></div>
@@ -167,6 +174,18 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 <div id="p4" class="pnl">
   <div class="armEv" id="armEv"></div>
   <div class="cc"><div class="zt"><span class="ztl">X zoom / click plot + wheel</span><button type="button" class="zb" data-plot="c4" data-action="out">X-</button><button type="button" class="zb on" data-plot="c4" data-action="reset">Reset</button><button type="button" class="zb" data-plot="c4" data-action="in">X+</button><span id="c4r" class="zr">1.00x</span></div><div class="zx"><div id="c4" class="cbt"></div></div><div class="lc" id="l4" style="margin:10px 0 0"></div></div>
+</div>
+<div id="p5" class="pnl">
+  <div class="cc">
+    <div class="rkCtl"><span>RK offset(s)</span><input id="rkOff" type="number" step="0.001" value="0"><button type="button" class="zb" id="rkApply">Apply</button><button type="button" class="zb" id="rkAuto">Auto Z align</button><span id="rkInfo"></span></div>
+    <div class="lc" id="l5"></div><div class="zt"><span class="ztl">X zoom / click plot + wheel</span><button type="button" class="zb" data-plot="c5" data-action="out">X-</button><button type="button" class="zb on" data-plot="c5" data-action="reset">Reset</button><button type="button" class="zb" data-plot="c5" data-action="in">X+</button><span id="c5r" class="zr">1.00x</span></div><div class="zx"><div id="c5" class="cb"></div></div>
+  </div>
+</div>
+<div id="p6" class="pnl">
+  <div class="cc">
+    <div class="rkCtl"><span>RK offset(s)</span><input id="rkSigOff" type="number" step="0.001" value="0"><button type="button" class="zb" id="rkSigApply">Apply</button><button type="button" class="zb" id="rkSigAuto">Auto Z align</button><span id="rkSigInfo"></span></div>
+    <div class="lc" id="l6"></div><div class="zt"><span class="ztl">X zoom / click plot + wheel</span><button type="button" class="zb" data-plot="c6" data-action="out">X-</button><button type="button" class="zb on" data-plot="c6" data-action="reset">Reset</button><button type="button" class="zb" data-plot="c6" data-action="in">X+</button><span id="c6r" class="zr">1.00x</span></div><div class="zx"><div id="c6" class="cb"></div></div>
+  </div>
 </div>
 
 <script>
@@ -193,9 +212,16 @@ const s1Full = preds.filter(p=>p.stage===1).map(p=>({...p, x:p.x*distanceScale, 
 const resets = D.reset_times || summary.reset_times || [];
 const throws = D.throws || [];
 const ARM = (D.arm && Array.isArray(D.arm.states) && D.arm.states.length) ? D.arm : null;
+const RK = (D.rk_tracking && D.rk_tracking.world && Array.isArray(D.rk_tracking.world.t)) ? D.rk_tracking : null;
 if(!ARM){
   const tabArm=document.getElementById('tabArm');
   if(tabArm) tabArm.style.display='none';
+}
+if(!RK){
+  const tabRk=document.getElementById('tabRk');
+  if(tabRk) tabRk.style.display='none';
+  const tabRkSignals=document.getElementById('tabRkSignals');
+  if(tabRkSignals) tabRkSignals.style.display='none';
 }
 const sourceType = cfg.replay_source ? 'Replay JSON' : 'Tracker JSON';
 const fps = cfg.fps || summary.actual_fps;
@@ -311,6 +337,8 @@ document.getElementById('st').innerHTML=[
   ARM ? stat('Arm states', ARM.states.length) : '',
   ARM ? stat('Arm cmds', ARM.commands.length) : '',
   ARM && ARM.duration_sec ? stat('Arm bag', ARM.duration_sec.toFixed(1)+'s') : '',
+  RK ? stat('RK topics', Object.keys(RK.counts || {}).length) : '',
+  RK && RK.world ? stat('RK world ball', RK.world.t.length) : '',
   throws.length ? stat('Throws', throws.length) : '',
   fps ? stat('FPS', fps.toFixed ? fps.toFixed(1) : fps) : '',
   cfg.noise_mm!=null ? stat('Noise', cfg.noise_mm+'mm') : '',
@@ -324,6 +352,7 @@ const DL={paper_bgcolor:'#1a1a2e',plot_bgcolor:'#16213e',font:{color:'#e0e0e0',s
   legend:{bgcolor:'rgba(22,33,62,0.9)',bordercolor:'#0f3460',borderwidth:1,font:{size:10},itemsizing:'constant'},
   hovermode:'closest',margin:{l:60,r:30,t:40,b:50}};
 const GS={gridcolor:'#0f3460',zerolinecolor:'#0f3460'};
+const predRemainingMs = p => (p && isNum(p.ht) && isNum(p.ct)) ? (p.ht - p.ct) * 1000 : null;
 
 buildPlots[0] = () => {
   const oT=obs.map(o=>isNum(o.rel_s) ? o.rel_s : relTime(o.t));
@@ -357,30 +386,36 @@ buildPlots[0] = () => {
 
     g2({x:s0.map(p=>relTime(p.ct)), y:s0.map(p=>p.x), name:'S0 X', mode:'markers',
      marker:{color:'#3498db',symbol:'triangle-up',size:5},
-     hovertemplate:'t=%{x:.3f}s<br>pred x=%{y:.3f} m<extra>S0 X</extra>'}),
+     customdata:s0.map(predRemainingMs),
+     hovertemplate:'t=%{x:.3f}s<br>pred x=%{y:.3f} m<br>remaining=%{customdata:.1f} ms<extra>S0 X</extra>'}),
     g2({x:s0.map(p=>relTime(p.ct)), y:s0.map(p=>p.y), name:'S0 Y', mode:'markers',
      marker:{color:'#2980b9',symbol:'triangle-up',size:5},
-     hovertemplate:'t=%{x:.3f}s<br>pred y=%{y:.3f} m<extra>S0 Y</extra>'}),
+     customdata:s0.map(predRemainingMs),
+     hovertemplate:'t=%{x:.3f}s<br>pred y=%{y:.3f} m<br>remaining=%{customdata:.1f} ms<extra>S0 Y</extra>'}),
     g2({x:s0.map(p=>relTime(p.ct)), y:s0.map(p=>p.z), name:'S0 Z', mode:'markers',
      marker:{color:'#1abc9c',symbol:'triangle-up',size:5},
-     hovertemplate:'t=%{x:.3f}s<br>pred z=%{y:.3f} m<extra>S0 Z</extra>'}),
+     customdata:s0.map(predRemainingMs),
+     hovertemplate:'t=%{x:.3f}s<br>pred z=%{y:.3f} m<br>remaining=%{customdata:.1f} ms<extra>S0 Z</extra>'}),
 
     g2({x:s1.map(p=>relTime(p.ct)), y:s1.map(p=>p.x), name:'S1 X', mode:'markers',
      marker:{color:'#e74c3c',symbol:'square',size:5,line:{width:0.5,color:'#fff'}},
-     hovertemplate:'t=%{x:.3f}s<br>pred x=%{y:.3f} m<extra>S1 X</extra>'}),
+     customdata:s1.map(predRemainingMs),
+     hovertemplate:'t=%{x:.3f}s<br>pred x=%{y:.3f} m<br>remaining=%{customdata:.1f} ms<extra>S1 X</extra>'}),
     g2({x:s1.map(p=>relTime(p.ct)), y:s1.map(p=>p.y), name:'S1 Y', mode:'markers',
      marker:{color:'#c0392b',symbol:'square',size:5,line:{width:0.5,color:'#fff'}},
-     hovertemplate:'t=%{x:.3f}s<br>pred y=%{y:.3f} m<extra>S1 Y</extra>'}),
+     customdata:s1.map(predRemainingMs),
+     hovertemplate:'t=%{x:.3f}s<br>pred y=%{y:.3f} m<br>remaining=%{customdata:.1f} ms<extra>S1 Y</extra>'}),
     g2({x:s1.map(p=>relTime(p.ct)), y:s1.map(p=>p.z), name:'S1 Z', mode:'markers',
      marker:{color:'#e67e22',symbol:'square',size:5,line:{width:0.5,color:'#fff'}},
-     hovertemplate:'t=%{x:.3f}s<br>pred z=%{y:.3f} m<extra>S1 Z</extra>'}),
+     customdata:s1.map(predRemainingMs),
+     hovertemplate:'t=%{x:.3f}s<br>pred z=%{y:.3f} m<br>remaining=%{customdata:.1f} ms<extra>S1 Z</extra>'}),
 
-    g2({x:s0.map(p=>relTime(p.ct)), y:s0.map(p=>(p.ht-p.ct)*1000), name:'S0 lead(ms)', mode:'markers',
+    g2({x:s0.map(p=>relTime(p.ct)), y:s0.map(predRemainingMs), name:'S0 remaining(ms)', mode:'markers',
      marker:{color:'#9b59b6',symbol:'triangle-up',size:4}, yaxis:'y2',
-     hovertemplate:'t=%{x:.3f}s<br>lead=%{y:.1f} ms<extra>S0 lead</extra>'}),
-    g2({x:s1.map(p=>relTime(p.ct)), y:s1.map(p=>(p.ht-p.ct)*1000), name:'S1 lead(ms)', mode:'markers',
+     hovertemplate:'t=%{x:.3f}s<br>remaining=%{y:.1f} ms<extra>S0 remaining</extra>'}),
+    g2({x:s1.map(p=>relTime(p.ct)), y:s1.map(predRemainingMs), name:'S1 remaining(ms)', mode:'markers',
      marker:{color:'#8e44ad',symbol:'square',size:4}, yaxis:'y2',
-     hovertemplate:'t=%{x:.3f}s<br>lead=%{y:.1f} ms<extra>S1 lead</extra>'}),
+     hovertemplate:'t=%{x:.3f}s<br>remaining=%{y:.1f} ms<extra>S1 remaining</extra>'}),
 
     // compute_latency = compute_t - ct（算完时刻 − 曝光时刻；tracker 内部耗时）
     // 旧 JSON 没有 compute_t 时过滤掉，避免 null 画成 0
@@ -415,7 +450,7 @@ buildPlots[0] = () => {
     ...DL,
     title:{text:'All Curves - click legend to toggle, scroll to zoom',font:{size:13,color:'#a0a0c0'}},
     xaxis:{title:'Time (s)',...GS}, yaxis:{title:'Value (m)',...GS},
-    yaxis2:{title:'Lead (ms)',...GS,overlaying:'y',side:'right'},
+    yaxis2:{title:'Remaining / compute (ms)',...GS,overlaying:'y',side:'right'},
   },PLOT_CONFIG).then(()=>{wl('c0','l0');wz('c0');});
 };
 
@@ -437,20 +472,22 @@ buildPlots[1] = () => {
     }
     tr.push(g2({x:s0.map(p=>relTime(p.ct)),y:s0.map(p=>p[k]),name:`S0 ${k.toUpperCase()}`,mode:'markers',
       marker:{color:'#3498db',symbol:'triangle-up',size:4},
-      hovertemplate:`t=%{x:.3f}s<br>pred ${k}=%{y:.3f} m<extra>S0</extra>`,
+      customdata:s0.map(predRemainingMs),
+      hovertemplate:`t=%{x:.3f}s<br>pred ${k}=%{y:.3f} m<br>remaining=%{customdata:.1f} ms<extra>S0</extra>`,
       yaxis:ya,xaxis:'x'}));
     tr.push(g2({x:s1.map(p=>relTime(p.ct)),y:s1.map(p=>p[k]),name:`S1 ${k.toUpperCase()}`,mode:'markers',
       marker:{color:'#e74c3c',symbol:'square',size:4,line:{width:0.5,color:'#fff'}},
-      hovertemplate:`t=%{x:.3f}s<br>pred ${k}=%{y:.3f} m<extra>S1</extra>`,
+      customdata:s1.map(predRemainingMs),
+      hovertemplate:`t=%{x:.3f}s<br>pred ${k}=%{y:.3f} m<br>remaining=%{customdata:.1f} ms<extra>S1</extra>`,
       yaxis:ya,xaxis:'x'}));
   });
-  tr.push(g2({x:s0.map(p=>relTime(p.ct)),y:s0.map(p=>(p.ht-p.ct)*1000),name:'S0 lead',mode:'markers',
+  tr.push(g2({x:s0.map(p=>relTime(p.ct)),y:s0.map(predRemainingMs),name:'S0 remaining',mode:'markers',
     marker:{color:'#9b59b6',symbol:'triangle-up',size:3},
-    hovertemplate:'t=%{x:.3f}s<br>lead=%{y:.1f} ms<extra>S0</extra>',
+    hovertemplate:'t=%{x:.3f}s<br>remaining=%{y:.1f} ms<extra>S0</extra>',
     yaxis:'y4',xaxis:'x'}));
-  tr.push(g2({x:s1.map(p=>relTime(p.ct)),y:s1.map(p=>(p.ht-p.ct)*1000),name:'S1 lead',mode:'markers',
+  tr.push(g2({x:s1.map(p=>relTime(p.ct)),y:s1.map(predRemainingMs),name:'S1 remaining',mode:'markers',
     marker:{color:'#8e44ad',symbol:'square',size:3},
-    hovertemplate:'t=%{x:.3f}s<br>lead=%{y:.1f} ms<extra>S1</extra>',
+    hovertemplate:'t=%{x:.3f}s<br>remaining=%{y:.1f} ms<extra>S1</extra>',
     yaxis:'y4',xaxis:'x'}));
   tr.push(g2({x:s0.filter(p=>p.compute_t!=null).map(p=>relTime(p.ct)),
     y:s0.filter(p=>p.compute_t!=null).map(p=>(p.compute_t-p.ct)*1000),
@@ -467,12 +504,12 @@ buildPlots[1] = () => {
 
   Plotly.newPlot('c1',tr,{
     ...DL,
-    title:{text:'X / Y / Z / Lead (shared time axis)',font:{size:13,color:'#a0a0c0'}},
+    title:{text:'X / Y / Z / Remaining (shared time axis)',font:{size:13,color:'#a0a0c0'}},
     xaxis:{title:'Time (s)',...GS,domain:[0,1],anchor:'y4'},
     yaxis:{title:'X (m)',...GS,domain:[0.78,1]},
     yaxis2:{title:'Y (m)',...GS,domain:[0.53,0.75]},
     yaxis3:{title:'Z (m)',...GS,domain:[0.28,0.50]},
-    yaxis4:{title:'Lead (ms)',...GS,domain:[0.0,0.25]},
+    yaxis4:{title:'Remaining / compute (ms)',...GS,domain:[0.0,0.25]},
   },PLOT_CONFIG).then(()=>{wl('c1','l1');wz('c1');});
 };
 
@@ -494,12 +531,14 @@ buildPlots[2] = () => {
     {x:s0.map(p=>p.x),y:s0.map(p=>p.y),z:s0.map(p=>p.z),
      mode:'markers',type:'scatter3d',name:'S0 pred',
      marker:{color:'#3498db',size:4,symbol:'diamond'},
-     hovertemplate:'t=%{text}s<br>x=%{x:.3f}<br>y=%{y:.3f}<br>z=%{z:.3f}<extra>S0</extra>',
-      text:s0.map(p=>relTime(p.ct).toFixed(3))},
+     customdata:s0.map(predRemainingMs),
+     hovertemplate:'t=%{text}s<br>x=%{x:.3f}<br>y=%{y:.3f}<br>z=%{z:.3f}<br>remaining=%{customdata:.1f} ms<extra>S0</extra>',
+     text:s0.map(p=>relTime(p.ct).toFixed(3))},
     {x:s1.map(p=>p.x),y:s1.map(p=>p.y),z:s1.map(p=>p.z),
      mode:'markers',type:'scatter3d',name:'S1 pred',
      marker:{color:'#e74c3c',size:4,symbol:'diamond',line:{width:0.5,color:'#fff'}},
-     hovertemplate:'t=%{text}s<br>x=%{x:.3f}<br>y=%{y:.3f}<br>z=%{z:.3f}<extra>S1</extra>',
+     customdata:s1.map(predRemainingMs),
+     hovertemplate:'t=%{text}s<br>x=%{x:.3f}<br>y=%{y:.3f}<br>z=%{z:.3f}<br>remaining=%{customdata:.1f} ms<extra>S1</extra>',
       text:s1.map(p=>relTime(p.ct).toFixed(3))},
     ...(car.length ? [{x:car.map(c=>c.x),y:car.map(c=>c.y),z:car.map(c=>c.z),
      mode:'markers',type:'scatter3d',name:'Car',
@@ -518,7 +557,6 @@ buildPlots[2] = () => {
 buildPlots[3] = () => {
   if(car.length <= 0) return;
   const cT=car.map(c=>relTime(c.t));
-  const yawDeg=car.map(c=>c.yaw*180/Math.PI);
   const tr=[];
   ['x','y','z'].forEach((k,i)=>{
     const ya=i===0?'y':`y${i+1}`;
@@ -527,9 +565,9 @@ buildPlots[3] = () => {
       hovertemplate:`t=%{x:.3f}s<br>${k}=%{y:.3f} m<extra>Car ${k.toUpperCase()}</extra>`,
       yaxis:ya,xaxis:'x'}));
   });
-  tr.push(g2({x:cT,y:yawDeg,name:'Car Yaw',mode:'markers',
+  tr.push(g2({x:cT,y:car.map(c=>c.yaw),name:'Car Yaw',mode:'markers',
     marker:{color:'#e94560',size:2},
-    hovertemplate:'t=%{x:.3f}s<br>yaw=%{y:.1f}deg<extra>Car Yaw</extra>',
+    hovertemplate:'t=%{x:.3f}s<br>yaw=%{y:.4f}rad<extra>Car Yaw</extra>',
     yaxis:'y4',xaxis:'x'}));
   tr.push(g2({x:cT,y:car.map(c=>c.reprojection_error),name:'Reproj Err',mode:'markers',
     marker:{color:'#e67e22',size:2},
@@ -543,7 +581,7 @@ buildPlots[3] = () => {
     yaxis:{title:'X (m)',...GS,domain:[0.82,1]},
     yaxis2:{title:'Y (m)',...GS,domain:[0.62,0.79]},
     yaxis3:{title:'Z (m)',...GS,domain:[0.42,0.59]},
-    yaxis4:{title:'Yaw (deg)',...GS,domain:[0.22,0.39]},
+    yaxis4:{title:'Yaw (rad)',...GS,domain:[0.22,0.39]},
     yaxis5:{title:'Reproj (px)',...GS,domain:[0.0,0.19]},
   },PLOT_CONFIG).then(()=>{wl('c3','l3');wz('c3');});
 };
@@ -638,6 +676,272 @@ buildPlots[4] = () => {
     yaxis4:{title:'TCP (m)',...GS,domain:[0.0,0.24]},
     shapes:evShapes,
   },PLOT_CONFIG).then(()=>{wl('c4','l4');wz('c4');});
+};
+
+buildPlots[6] = () => {
+  ensurePlot(5);
+  if(typeof window.__buildRkSignals === 'function') window.__buildRkSignals();
+};
+
+buildPlots[5] = () => {
+  if(!RK) return;
+  const ts = series => (series && Array.isArray(series.t)) ? series.t : [];
+  const ys = (series, key) => (series && series.y && Array.isArray(series.y[key])) ? series.y[key] : [];
+  const pairs = (series, key) => ts(series).map((t,i)=>({t:Number(t), v:Number(ys(series,key)[i])}))
+    .filter(p=>isNum(p.t)&&isNum(p.v))
+    .sort((a,b)=>a.t-b.t);
+  const pcRows = obs.map(o=>({t:isNum(o.rel_s)?o.rel_s:relTime(o.t), x:o.x, y:o.y, z:o.z}))
+    .filter(p=>isNum(p.t))
+    .sort((a,b)=>a.t-b.t);
+  const pcCarRows = car.map(c=>({t:isNum(c.elapsed_s)?c.elapsed_s:relTime(c.t), x:c.x, y:c.y, z:c.z, yaw:c.yaw}))
+    .filter(p=>isNum(p.t))
+    .sort((a,b)=>a.t-b.t);
+  const pcZ = pcRows.map(p=>({t:p.t, v:p.z}))
+    .filter(p=>isNum(p.t)&&isNum(p.v))
+    .sort((a,b)=>a.t-b.t);
+  const rkWorldZ = pairs(RK.world, 'z');
+  const nearest = (rows, t) => {
+    let lo=0, hi=rows.length;
+    while(lo<hi){
+      const mid=(lo+hi)>>1;
+      if(rows[mid].t<t) lo=mid+1; else hi=mid;
+    }
+    const cand=[];
+    if(lo<rows.length) cand.push(rows[lo]);
+    if(lo>0) cand.push(rows[lo-1]);
+    if(!cand.length) return null;
+    return cand.reduce((best,row)=>Math.abs(row.t-t)<Math.abs(best.t-t)?row:best,cand[0]);
+  };
+  const scoreOffset = off => {
+    if(pcZ.length<10 || rkWorldZ.length<10) return null;
+    const step=Math.max(1,Math.floor(rkWorldZ.length/500));
+    let err=0, n=0;
+    for(let i=0;i<rkWorldZ.length;i+=step){
+      const p=nearest(pcZ, rkWorldZ[i].t + off);
+      if(!p || Math.abs(p.t - (rkWorldZ[i].t + off)) > 0.08) continue;
+      err += Math.abs(p.v - rkWorldZ[i].v);
+      n += 1;
+    }
+    return n>=10 ? {err:err/n, n} : null;
+  };
+  const estimateOffset = () => {
+    let best=null;
+    for(let off=-30.0; off<=30.0001; off+=0.02){
+      const s=scoreOffset(off);
+      if(!s) continue;
+      if(!best || s.err<best.err) best={off, ...s};
+    }
+    return best || {off:0, err:null, n:0};
+  };
+  const auto = estimateOffset();
+  let rkOffset = Math.round(auto.off*1000)/1000;
+  const input = document.getElementById('rkOff');
+  const info = document.getElementById('rkInfo');
+  const shifted = xs => xs.map(x=>isNum(Number(x)) ? Number(x)+rkOffset : null);
+  const setInfo = () => {
+    const errText = auto.err==null ? 'n/a' : `${auto.err.toFixed(3)}m / ${auto.n} pts`;
+    info.textContent = `display t = RK t + ${rkOffset.toFixed(3)}s; auto Z MAE ${errText}`;
+  };
+  const tr = (series,key,name,axis,color,mode='markers',extra={}) => g2({
+    x:shifted(ts(series)), y:ys(series,key), name, mode,
+    marker:{color,size:3}, line:{color,width:1.4},
+    yaxis:axis, xaxis:'x',
+    hovertemplate:`t=%{x:.3f}s<br>${name}=%{y:.4f}<extra>${name}</extra>`,
+    ...extra,
+  });
+  const rkPredTr = (key,name,color,extra={}) => tr(RK.pred,key,name,'y',color,'markers',{
+    customdata:ys(RK.pred,'duration').map(v=>isNum(v)?v*1000:null),
+    hovertemplate:`t=%{x:.3f}s<br>${name}=%{y:.4f}m<br>remaining=%{customdata:.1f} ms<extra>${name}</extra>`,
+    ...extra,
+  });
+  const pcRemainingTr = (rows,name,color,symbol) => g2({
+    x:rows.map(p=>relTime(p.ct)), y:rows.map(predRemainingMs), name, mode:'markers',
+    marker:{color,size:4,symbol}, yaxis:'y2', xaxis:'x',
+    hovertemplate:`t=%{x:.3f}s<br>remaining=%{y:.1f} ms<extra>${name}</extra>`,
+  });
+  const rkRemainingTr = () => g2({
+    x:shifted(ts(RK.pred)), y:ys(RK.pred,'duration').map(v=>isNum(v)?v*1000:null),
+    name:'RK Predict remaining(ms)', mode:'markers',
+    marker:{color:'#fde047',size:4,symbol:'triangle-up'}, yaxis:'y2', xaxis:'x',
+    hovertemplate:'t=%{x:.3f}s<br>remaining=%{y:.1f} ms<extra>RK Predict remaining</extra>',
+  });
+  const pcPredTr = (rows,key,name,color,symbol,extra={}) => g2({
+    x:rows.map(p=>relTime(p.ct)), y:rows.map(p=>p[key]), name, mode:'markers',
+    customdata:rows.map(predRemainingMs),
+    marker:{color,size:5,symbol}, yaxis:'y', xaxis:'x',
+    hovertemplate:`t=%{x:.3f}s<br>${name}=%{y:.4f}m<br>remaining=%{customdata:.1f} ms<extra>${name}</extra>`,
+    ...extra,
+  });
+  const pcTr = (key,name,color,extra={}) => g2({
+    x:pcRows.map(p=>p.t), y:pcRows.map(p=>p[key]), name, mode:'markers',
+    marker:{color,size:2.5}, yaxis:'y', xaxis:'x',
+    hovertemplate:`t=%{x:.3f}s<br>${name}=%{y:.4f}m<extra>${name}</extra>`,
+    ...extra,
+  });
+  const pcCarTr = (key,name,color,extra={}) => g2({
+    x:pcCarRows.map(c=>c.t), y:pcCarRows.map(c=>c[key]), name, mode:'markers',
+    marker:{color,size:2.5,symbol:'diamond'}, yaxis:'y', xaxis:'x',
+    hovertemplate:`t=%{x:.3f}s<br>${name}=%{y:.4f}m<extra>${name}</extra>`,
+    ...extra,
+  });
+  const pcCarYawTr = () => g2({
+    x:pcCarRows.map(c=>c.t), y:pcCarRows.map(c=>isNum(c.yaw)?c.yaw*10:null),
+    name:'PC Car Yaw x10', mode:'markers',
+    customdata:pcCarRows.map(c=>c.yaw),
+    marker:{color:'#f472b6',size:2.5,symbol:'diamond'}, yaxis:'y3', xaxis:'x',
+    hovertemplate:'t=%{x:.3f}s<br>PC Car Yaw=%{customdata:.4f}rad<br>display=%{y:.3f}<extra>PC Car Yaw x10</extra>',
+    visible:'legendonly',
+  });
+  const makeRelSeries = (rows, carRows) => {
+    const out={t:[], y:{dx:[], dy:[], dist:[]}};
+    rows.forEach(row=>{
+      const c=nearest(carRows, row.t);
+      if(!c || Math.abs(c.t-row.t)>0.08 || !isNum(row.x) || !isNum(row.y) || !isNum(c.x) || !isNum(c.y)) return;
+      const dx=row.x-c.x, dy=row.y-c.y;
+      out.t.push(row.t);
+      out.y.dx.push(dx);
+      out.y.dy.push(dy);
+      out.y.dist.push(Math.hypot(dx, dy));
+    });
+    return out;
+  };
+  const rkRel = {t:[], y:{dx:[], dy:[], dist:[]}};
+  ts(RK.world).forEach((t,i)=>{
+    const x=ys(RK.world,'x')[i], y=ys(RK.world,'y')[i];
+    const cx=ys(RK.world,'bot_x')[i], cy=ys(RK.world,'bot_y')[i];
+    if(!isNum(t) || !isNum(x) || !isNum(y) || !isNum(cx) || !isNum(cy)) return;
+    const dx=x-cx, dy=y-cy;
+    rkRel.t.push(t);
+    rkRel.y.dx.push(dx);
+    rkRel.y.dy.push(dy);
+    rkRel.y.dist.push(Math.hypot(dx, dy));
+  });
+  const pcRel = makeRelSeries(pcRows, pcCarRows);
+  const pcRelTr = (series,key,name,color,extra={}) => g2({
+    x:series.t, y:series.y[key], name, mode:'markers',
+    marker:{color,size:3,symbol:'x'}, yaxis:'y', xaxis:'x',
+    hovertemplate:`t=%{x:.3f}s<br>${name}=%{y:.4f}m<extra>${name}</extra>`,
+    ...extra,
+  });
+  const traceData = () => [
+    pcTr('x','PC Ball X','#7f8c8d',{visible:'legendonly'}),
+    pcTr('y','PC Ball Y','#95a5a6',{visible:'legendonly'}),
+    pcTr('z','PC Ball Z','#bdc3c7'),
+    tr(RK.world,'x','RK World X','y','#3498db','markers',{visible:'legendonly'}),
+    tr(RK.world,'y','RK World Y','y','#2980b9','markers',{visible:'legendonly'}),
+    tr(RK.world,'z','RK World Z','y','#5cd0ff'),
+    rkPredTr('x','RK Predict X','#f97316',{visible:'legendonly',marker:{color:'#f97316',size:6,symbol:'triangle-up'}}),
+    rkPredTr('y','RK Predict Y','#fb923c',{visible:'legendonly',marker:{color:'#fb923c',size:6,symbol:'triangle-up'}}),
+    rkPredTr('z','RK Predict Z','#e94560',{marker:{color:'#e94560',size:6,symbol:'triangle-up'}}),
+    pcPredTr(s0,'x','PC S0 Hit X','#38bdf8','triangle-up',{visible:'legendonly'}),
+    pcPredTr(s0,'y','PC S0 Hit Y','#0ea5e9','triangle-up',{visible:'legendonly'}),
+    pcPredTr(s0,'z','PC S0 Hit Z','#0284c7','triangle-up'),
+    pcPredTr(s1,'x','PC S1 Hit X','#fb7185','square',{visible:'legendonly'}),
+    pcPredTr(s1,'y','PC S1 Hit Y','#f43f5e','square',{visible:'legendonly'}),
+    pcPredTr(s1,'z','PC S1 Hit Z','#e11d48','square'),
+    tr(RK.estimate,'x','RK Estimate X','y','#facc15','markers',{visible:'legendonly',marker:{color:'#facc15',size:4}}),
+    tr(RK.estimate,'y','RK Estimate Y','y','#fde047','markers',{visible:'legendonly',marker:{color:'#fde047',size:4}}),
+    tr(RK.estimate,'z','RK Estimate Z','y','#f1c40f','markers',{visible:'legendonly',marker:{color:'#f1c40f',size:4}}),
+    pcCarTr('x','PC Car X','#d946ef'),
+    pcCarTr('y','PC Car Y','#c084fc'),
+    pcCarTr('z','PC Car Z','#a78bfa',{visible:'legendonly'}),
+    pcCarYawTr(),
+    tr(RK.bot,'x','Bot X','y','#67e8c3'),
+    tr(RK.bot,'y','Bot Y','y','#9fffce'),
+    g2({x:shifted(ts(RK.bot)), y:ys(RK.bot,'yaw').map(v=>isNum(v)?v*10:null), name:'Bot Yaw x10', mode:'markers',
+      customdata:ys(RK.bot,'yaw'),
+      marker:{color:'#5eead4',size:2.5,symbol:'diamond'}, yaxis:'y3', xaxis:'x',
+      hovertemplate:'t=%{x:.3f}s<br>Bot Yaw=%{customdata:.4f}rad<br>display=%{y:.3f}<extra>Bot Yaw x10</extra>',
+      visible:'legendonly'}),
+    tr(RK.bot,'target_x','Bot Target X','y','#ffd27f','markers',{visible:'legendonly'}),
+    tr(RK.bot,'target_y','Bot Target Y','y','#ff9f7f','markers',{visible:'legendonly'}),
+    tr(rkRel,'dx','RK Ball-Car dX','y','#ef4444','markers',{visible:'legendonly',marker:{color:'#ef4444',size:3,symbol:'cross'}}),
+    tr(rkRel,'dy','RK Ball-Car dY','y','#f97316','markers',{visible:'legendonly',marker:{color:'#f97316',size:3,symbol:'cross'}}),
+    tr(rkRel,'dist','RK Ball-Car XY Dist','y','#facc15','markers',{marker:{color:'#facc15',size:3,symbol:'cross'}}),
+    pcRelTr(pcRel,'dx','PC Ball-Car dX','#ec4899',{visible:'legendonly'}),
+    pcRelTr(pcRel,'dy','PC Ball-Car dY','#d946ef',{visible:'legendonly'}),
+    pcRelTr(pcRel,'dist','PC Ball-Car XY Dist','#a855f7'),
+    pcRemainingTr(s0,'PC S0 remaining(ms)','#9b59b6','triangle-up'),
+    pcRemainingTr(s1,'PC S1 remaining(ms)','#8e44ad','square'),
+    rkRemainingTr(),
+  ];
+  const layout = () => ({
+    ...DL,
+    title:{text:'RK Move ball and car positions aligned to PC timeline',font:{size:13,color:'#a0a0c0'}},
+    xaxis:{title:'PC report time (s)',...GS,domain:[0,1],anchor:'y'},
+    yaxis:{title:'Ball + Car XYZ/XY (m)',...GS,domain:[0,1]},
+    yaxis2:{title:'Remaining (ms)',...GS,overlaying:'y',side:'right'},
+    yaxis3:{title:'Yaw rad x10',...GS,overlaying:'y',side:'right',position:0.94},
+  });
+  const redraw = () => {
+    setInfo();
+    syncSignalControls();
+    const jobs=[Plotly.react('c5', traceData(), layout(), PLOT_CONFIG).then(()=>tl('c5','l5'))];
+    if(document.getElementById('c6') && builtPlots.has(6)){
+      jobs.push(Plotly.react('c6', signalTraceData(), signalLayout(), PLOT_CONFIG).then(()=>tl('c6','l6')));
+    }
+    return Promise.all(jobs);
+  };
+  if(input) input.value = rkOffset.toFixed(3);
+  setInfo();
+  Plotly.newPlot('c5', traceData(), layout(), PLOT_CONFIG).then(()=>{wl('c5','l5');wz('c5');});
+  const apply = document.getElementById('rkApply');
+  if(apply) apply.addEventListener('click',()=>{
+    const v=Number(input.value);
+    rkOffset=isNum(v) ? v : 0;
+    redraw();
+  });
+  const autoBtn = document.getElementById('rkAuto');
+  if(autoBtn) autoBtn.addEventListener('click',()=>{
+    rkOffset=Math.round(auto.off*1000)/1000;
+    if(input) input.value=rkOffset.toFixed(3);
+    redraw();
+  });
+
+  const signalTraceData = () => [
+    tr(RK.camera_cmd,'position','Camera Cmd Pos','y','#b197fc'),
+    tr(RK.camera_motor,'position','Camera Motor Pos','y','#7fd1ff'),
+    tr(RK.steer_cmd,'position','Steer Cmd Pos','y2','#f59e0b'),
+    tr(RK.steer_motor,'position','Steer Motor Pos','y2','#facc15'),
+    tr(RK.wheels_cmd,'current_avg','Wheel Current Avg','y3','#ff7f7f'),
+    tr(RK.wheels_cmd,'speed_avg','Wheel Speed Avg','y3','#67e8c3','markers',{visible:'legendonly'}),
+    tr(RK.wheels_pos_diff,'value_avg','Wheel PosDiff Avg','y3','#c084fc','markers',{visible:'legendonly'}),
+    tr(RK.imu,'yaw_speed','IMU Yaw Speed','y4','#94a3b8','markers',{visible:'legendonly'}),
+  ];
+  const signalLayout = () => ({
+    ...DL,
+    title:{text:'RK move signals aligned to PC timeline',font:{size:13,color:'#a0a0c0'}},
+    xaxis:{title:'PC report time (s)',...GS,domain:[0,1],anchor:'y4'},
+    yaxis:{title:'Camera pos',...GS,domain:[0.78,1]},
+    yaxis2:{title:'Steer pos',...GS,domain:[0.52,0.74]},
+    yaxis3:{title:'Wheels avg',...GS,domain:[0.26,0.48]},
+    yaxis4:{title:'IMU',...GS,domain:[0.0,0.22]},
+  });
+  const sigInput = document.getElementById('rkSigOff');
+  const sigInfo = document.getElementById('rkSigInfo');
+  const syncSignalControls = () => {
+    if(sigInput) sigInput.value = rkOffset.toFixed(3);
+    if(sigInfo) sigInfo.textContent = info.textContent;
+  };
+  syncSignalControls();
+  const sigApply = document.getElementById('rkSigApply');
+  if(sigApply) sigApply.addEventListener('click',()=>{
+    const v=Number(sigInput.value);
+    rkOffset=isNum(v) ? v : 0;
+    if(input) input.value=rkOffset.toFixed(3);
+    redraw().then(syncSignalControls);
+  });
+  const sigAuto = document.getElementById('rkSigAuto');
+  if(sigAuto) sigAuto.addEventListener('click',()=>{
+    rkOffset=Math.round(auto.off*1000)/1000;
+    if(input) input.value=rkOffset.toFixed(3);
+    redraw().then(syncSignalControls);
+  });
+
+  window.__buildRkSignals = () => {
+    syncSignalControls();
+    Plotly.newPlot('c6', signalTraceData(), signalLayout(), PLOT_CONFIG).then(()=>{wl('c6','l6');wz('c6');});
+  };
 };
 })();
 
@@ -816,7 +1120,7 @@ function wz(id){
   },{passive:false});
   plot.on('plotly_relayout',()=>ux(id));
 }
-document.querySelectorAll('.zb').forEach(btn=>{
+document.querySelectorAll('.zb[data-plot]').forEach(btn=>{
   btn.addEventListener('click',()=>{
     const id=btn.dataset.plot;
     sap(id);
@@ -840,6 +1144,7 @@ def main() -> None:
         "--arm-json", default=None,
         help="extract_arm_bag.py 输出的机械臂 JSON；缺省时自动探测 <input>_arm.json",
     )
+    parser.add_argument("--rk-tracking-json", default=None)
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
 
@@ -850,7 +1155,12 @@ def main() -> None:
         candidate = base + "_arm.json"
         if os.path.exists(candidate):
             arm_json = candidate
-    generate_html(args.input, out, args.racket_json, arm_json)
+    rk_tracking_json = args.rk_tracking_json
+    if rk_tracking_json is None:
+        candidate = base + "_rk_tracking.json"
+        if os.path.exists(candidate):
+            rk_tracking_json = candidate
+    generate_html(args.input, out, args.racket_json, arm_json, rk_tracking_json)
 
 
 if __name__ == "__main__":

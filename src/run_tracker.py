@@ -585,8 +585,24 @@ def _generate_post_run_artifacts(
 
     # ── rosbag → 机械臂 JSON（供 HTML Arm tab；bag 不存在时跳过）──
     arm_json_path: Path | None = None
+    rk_tracking_json_path: Path | None = None
     bag_dir = json_path.with_name(f"{json_path.stem}_rosbag")
     if (bag_dir / "metadata.yaml").exists():
+        rk_candidate = json_path.with_name(f"{json_path.stem}_rk_tracking.json")
+        if _run_postprocess_command(
+            "Extract RK tracking rosbag",
+            [
+                str(_ROOT / "ros2" / "run_ros2.bat"),
+                str(_ROOT / "test_src" / "extract_rk_tracking_bag.py"),
+                "--bag",
+                str(bag_dir),
+                "--output",
+                str(rk_candidate),
+            ],
+        ) and rk_candidate.exists():
+            rk_tracking_json_path = rk_candidate
+            generated["rk_tracking_json"] = rk_candidate
+
         candidate = json_path.with_name(f"{json_path.stem}_arm.json")
         if _run_postprocess_command(
             "Extract arm rosbag",
@@ -614,6 +630,8 @@ def _generate_post_run_artifacts(
         ]
         if arm_json_path is not None:
             html_command.extend(["--arm-json", str(arm_json_path)])
+        if rk_tracking_json_path is not None:
+            html_command.extend(["--rk-tracking-json", str(rk_tracking_json_path)])
         if _run_postprocess_command("Generate HTML", html_command):
             generated["html"] = html_path
 
