@@ -460,18 +460,12 @@ class DirectRos2Sink:
         self._executor_type = SingleThreadedExecutor
         self._msg_type = String
         self._pub_lock = threading.Lock()
-        self._log_interval_s = 2.0
         self._car_count = 0
-        self._predict_count = 0
-        self._last_car_log_t = 0.0
         self._spin_stop = threading.Event()
         self._rclpy.init(args=None)
         self._node = Node("ball_tracer_tracker")
         self._car_pub = self._node.create_publisher(
             String, "/pc_car_loc", make_best_effort_qos()
-        )
-        self._hit_pub = self._node.create_publisher(
-            String, "/predict_hit_pos", make_topic_qos("/predict_hit_pos")
         )
         self._executor = self._executor_type()
         self._executor.add_node(self._node)
@@ -481,21 +475,17 @@ class DirectRos2Sink:
             daemon=True,
         )
         self._spin_thread.start()
-        print("  ROS2 直连已启用（/pc_car_loc 与 /predict_hit_pos 进程内发布）")
+        print("  ROS2 car_loc publish enabled (/pc_car_loc only)")
         _print_ros_comm_config(
-            "ROS2 直连",
+            "ROS2 car_loc",
             [
                 ("/pc_car_loc", 1),
-                ("/predict_hit_pos", 1),
             ],
         )
 
     def _spin_loop(self) -> None:
         while not self._spin_stop.is_set():
             self._executor.spin_once(timeout_sec=0.1)
-
-    def _should_log(self, last_log_t: float) -> bool:
-        return (time.perf_counter() - last_log_t) >= self._log_interval_s
 
     def _publish(self, publisher, payload: dict) -> None:
         msg = self._msg_type()
@@ -506,27 +496,16 @@ class DirectRos2Sink:
     def publish_car_loc(self, payload: dict) -> None:
         self._car_count += 1
         self._publish(self._car_pub, payload)
-        if self._should_log(self._last_car_log_t):
-            self._last_car_log_t = time.perf_counter()
-            self._node.get_logger().info(
-                "/pc_car_loc "
-                f"#{self._car_count}: "
-                f"x={payload.get('x')} y={payload.get('y')} z={payload.get('z')} "
-                f"yaw={payload.get('yaw')} tag_id={payload.get('tag_id')}"
-            )
+        print(
+            "/pc_car_loc "
+            f"#{self._car_count}: "
+            f"x={payload.get('x')} y={payload.get('y')} z={payload.get('z')} "
+            f"yaw={payload.get('yaw')} tag_id={payload.get('tag_id')}",
+            flush=True,
+        )
 
     def publish_predict_hit(self, payload: dict) -> None:
-        self._predict_count += 1
-        self._publish(self._hit_pub, payload)
-        self._node.get_logger().info(
-            "/predict_hit_pos "
-            f"#{self._predict_count}: "
-            f"stage={payload.get('stage')} "
-            f"x={payload.get('x')} y={payload.get('y')} z={payload.get('z')} "
-            f"vx={payload.get('vx')} vy={payload.get('vy')} vz={payload.get('vz')} "
-            f"ct={payload.get('ct')} ht={payload.get('ht')} "
-            f"duration={payload.get('duration')}"
-        )
+        return None
 
     def close(self) -> None:
         self._spin_stop.set()
@@ -540,24 +519,27 @@ class DirectRos2Sink:
 
 
 def _create_ros2_sink(mode: str):
-    if mode == "direct":
-        return DirectRos2Sink()
-
-    if mode == "bridge":
-        return UdpBridgeRos2Sink()
-
-    if mode == "auto":
-        return UdpBridgeRos2Sink()
-
-    return NullRos2Sink()
+    if mode == "off":
+        return NullRos2Sink()
+    return DirectRos2Sink()
 
 
 def _create_time_sync_process(mode: str):
-    if mode == "off":
-        return None
-    return TimeSyncResponderProcess()
+    return None
 
+def _publish_logger_control(
+    ros2_sink,
+    payload: dict,
+    *,
+    repeat: int = 1,
+    interval_s: float = 0.15,
+) -> None:
+    for index in range(max(int(repeat), 1)):
+        ros2_sink.publish_logger_control(payload)
+        if index + 1 < repeat:
+            time.sleep(max(float(interval_s), 0.0))
 
+ 
 def _run_postprocess_command(
     description: str,
     command: list[str],
@@ -582,6 +564,8 @@ def _generate_post_run_artifacts(
 ) -> dict[str, Path]:
     generated: dict[str, Path] = {}
     python_exe = sys.executable
+    json_path = json_path.resolve()
+    video_path = video_path.resolve() if video_path is not None else None
 
     # ── rosbag → 机械臂 JSON（供 HTML Arm tab；bag 不存在时跳过）──
     arm_json_path: Path | None = None
@@ -1534,7 +1518,7 @@ def main() -> int:
     parser.add_argument(
         "--ros2-mode",
         choices=("auto", "direct", "bridge", "off"),
-        default="auto",
+        default="direct",
         help="ROS2 output mode",
     )
     parser.add_argument(
@@ -1542,11 +1526,6 @@ def main() -> int:
         help="保存每相机全分辨率视频（多个 mp4，无拼接、无 badge；编码慢、丢帧多，但保留原图细节供训练数据用）"
     )
     args = parser.parse_args()
-    # 临时关闭所有 ROS 发送功能（/pc_car_loc、/predict_hit_pos、time_sync、UDP 桥接均不启动）。
-    # 恢复时删除以下强制 off 两行即可。rosbag 录制是纯接收，不受此开关影响。
-    if args.ros2_mode != "off":
-        print(f"[ROS2] 发送功能已在代码中关闭（忽略 --ros2-mode={args.ros2_mode}，强制 off）")
-    args.ros2_mode = "off"
     save_logs = not args.no_log
 
     output_dir = Path(args.output_dir)

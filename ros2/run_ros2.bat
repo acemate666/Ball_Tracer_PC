@@ -17,6 +17,7 @@ if not defined BALL_TRACER_ROS_DOMAIN_ID (
 )
 set "RMW_IMPLEMENTATION=rmw_cyclonedds_cpp"
 set "CYCLONEDDS_URI=file://%CYCLONEDDS_XML:\=/%"
+if not exist "%ROS_LOG_DIR%" mkdir "%ROS_LOG_DIR%"
 set FASTRTPS_DEFAULT_PROFILES_FILE=
 set FASTDDS_DEFAULT_PROFILES_FILE=
 set "PATH=%ROS2_ROOT%\.pixi\envs\default;%ROS2_ROOT%\.pixi\envs\default\Library\bin;%PATH%"

@@ -158,6 +158,9 @@ def main() -> int:
                 stage=stage,
                 duration=duration,
                 ht_rel=(ht - t0) if _finite(ht) else None,
+                rel_x=payload.get("rel_x"),
+                rel_y=payload.get("rel_y"),
+                rel_z=payload.get("rel_z"),
             )
             _append_xyz(xy_pred, t, payload, stage=stage)
         elif key == "estimate_loc_topic":

@@ -4,8 +4,7 @@ param(
     [switch]$NoLog,
     [switch]$FullResVideo,
     [ValidateSet('auto', 'direct', 'bridge', 'off')]
-    # ROS 发送已临时关闭：默认 off（run_tracker.py 内部也强制 off）
-    [string]$Ros2Mode = 'off',
+    [string]$Ros2Mode = 'direct',
     [ValidateSet('auto', 'ros2', 'clean')]
     [string]$PreferredEnv = 'auto',
     [int]$RosDomainId = 2,
