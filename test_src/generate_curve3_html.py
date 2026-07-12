@@ -177,13 +177,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 </div>
 <div id="p5" class="pnl">
   <div class="cc">
-    <div class="rkCtl"><span>RK offset(s)</span><input id="rkOff" type="number" step="0.001" value="0"><button type="button" class="zb" id="rkApply">Apply</button><button type="button" class="zb" id="rkAuto">Auto Z align</button><span id="rkInfo"></span></div>
+    <div class="rkCtl"><span>RK offset(s)</span><input id="rkOff" type="number" step="0.001" value="0"><button type="button" class="zb" id="rkApply">Apply</button><button type="button" class="zb" id="rkAuto">Auto align</button><span id="rkInfo"></span></div>
     <div class="lc" id="l5"></div><div class="zt"><span class="ztl">X zoom / click plot + wheel</span><button type="button" class="zb" data-plot="c5" data-action="out">X-</button><button type="button" class="zb on" data-plot="c5" data-action="reset">Reset</button><button type="button" class="zb" data-plot="c5" data-action="in">X+</button><span id="c5r" class="zr">1.00x</span></div><div class="zx"><div id="c5" class="cb"></div></div>
   </div>
 </div>
 <div id="p6" class="pnl">
   <div class="cc">
-    <div class="rkCtl"><span>RK offset(s)</span><input id="rkSigOff" type="number" step="0.001" value="0"><button type="button" class="zb" id="rkSigApply">Apply</button><button type="button" class="zb" id="rkSigAuto">Auto Z align</button><span id="rkSigInfo"></span></div>
+    <div class="rkCtl"><span>RK offset(s)</span><input id="rkSigOff" type="number" step="0.001" value="0"><button type="button" class="zb" id="rkSigApply">Apply</button><button type="button" class="zb" id="rkSigAuto">Auto align</button><span id="rkSigInfo"></span></div>
     <div class="lc" id="l6"></div><div class="zt"><span class="ztl">X zoom / click plot + wheel</span><button type="button" class="zb" data-plot="c6" data-action="out">X-</button><button type="button" class="zb on" data-plot="c6" data-action="reset">Reset</button><button type="button" class="zb" data-plot="c6" data-action="in">X+</button><span id="c6r" class="zr">1.00x</span></div><div class="zx"><div id="c6" class="cb"></div></div>
   </div>
 </div>
@@ -696,10 +696,6 @@ buildPlots[5] = () => {
   const pcCarRows = car.map(c=>({t:isNum(c.elapsed_s)?c.elapsed_s:relTime(c.t), x:c.x, y:c.y, z:c.z, yaw:c.yaw}))
     .filter(p=>isNum(p.t))
     .sort((a,b)=>a.t-b.t);
-  const pcZ = pcRows.map(p=>({t:p.t, v:p.z}))
-    .filter(p=>isNum(p.t)&&isNum(p.v))
-    .sort((a,b)=>a.t-b.t);
-  const rkWorldZ = pairs(RK.world, 'z');
   const nearest = (rows, t) => {
     let lo=0, hi=rows.length;
     while(lo<hi){
@@ -712,17 +708,47 @@ buildPlots[5] = () => {
     if(!cand.length) return null;
     return cand.reduce((best,row)=>Math.abs(row.t-t)<Math.abs(best.t-t)?row:best,cand[0]);
   };
-  const scoreOffset = off => {
-    if(pcZ.length<10 || rkWorldZ.length<10) return null;
-    const step=Math.max(1,Math.floor(rkWorldZ.length/500));
-    let err=0, n=0;
-    for(let i=0;i<rkWorldZ.length;i+=step){
-      const p=nearest(pcZ, rkWorldZ[i].t + off);
-      if(!p || Math.abs(p.t - (rkWorldZ[i].t + off)) > 0.08) continue;
-      err += Math.abs(p.v - rkWorldZ[i].v);
-      n += 1;
+  const lerp = (a,b,f) => a + (b-a)*f;
+  // 有界线性插值：t 落在相邻两行之间且间隔 ≤ maxGap 才给结果，绝不外推
+  const interpRow = (rows, t, maxGap) => {
+    if(!rows.length) return null;
+    let lo=0, hi=rows.length;
+    while(lo<hi){
+      const mid=(lo+hi)>>1;
+      if(rows[mid].t<t) lo=mid+1; else hi=mid;
     }
-    return n>=10 ? {err:err/n, n} : null;
+    if(lo<=0||lo>=rows.length) return null;
+    const a=rows[lo-1], b=rows[lo];
+    if(!(t>=a.t&&t<=b.t)||b.t-a.t>maxGap) return null;
+    return {a, b, f:(t-a.t)/Math.max(1e-9,b.t-a.t)};
+  };
+  const interpPcVal = (rows,t,key,maxGap) => {
+    const s=interpRow(rows,t,maxGap);
+    return (s && isNum(s.a[key]) && isNum(s.b[key])) ? lerp(s.a[key],s.b[key],s.f) : null;
+  };
+  // 时间对齐：只用 RK 球在运动的段（|dy/dt|>1.5 m/s），对 PC 观测插值比 y、取中位差。
+  // 旧的 Z 最近邻 MAE 会被 RK 锁死球/躺地球段拖进假极小（0712 场实测差 21s），已替换。
+  const rkMovY = (()=>{
+    const rows=pairs(RK.world,'y');
+    const out=[];
+    for(let i=1;i<rows.length;i++){
+      const dt=rows[i].t-rows[i-1].t;
+      if(dt>0&&dt<0.2&&Math.abs(rows[i].v-rows[i-1].v)/dt>1.5) out.push(rows[i]);
+    }
+    return out;
+  })();
+  const scoreOffset = off => {
+    if(rkMovY.length<30 || pcRows.length<10) return null;
+    const step=Math.max(1,Math.floor(rkMovY.length/400));
+    const ds=[];
+    for(let i=0;i<rkMovY.length;i+=step){
+      const v=interpPcVal(pcRows, rkMovY[i].t+off, 'y', 0.08);
+      if(v==null) continue;
+      ds.push(Math.abs(v-rkMovY[i].v));
+    }
+    if(ds.length<15) return null;
+    ds.sort((a,b)=>a-b);
+    return {err:ds[ds.length>>1], n:ds.length};
   };
   const estimateOffset = () => {
     let best=null;
@@ -730,6 +756,12 @@ buildPlots[5] = () => {
       const s=scoreOffset(off);
       if(!s) continue;
       if(!best || s.err<best.err) best={off, ...s};
+    }
+    if(best){
+      for(let off=best.off-0.05; off<=best.off+0.0501; off+=0.002){
+        const s=scoreOffset(off);
+        if(s && s.err<best.err) best={off, ...s};
+      }
     }
     return best || {off:0, err:null, n:0};
   };
@@ -740,7 +772,7 @@ buildPlots[5] = () => {
   const shifted = xs => xs.map(x=>isNum(Number(x)) ? Number(x)+rkOffset : null);
   const setInfo = () => {
     const errText = auto.err==null ? 'n/a' : `${auto.err.toFixed(3)}m / ${auto.n} pts`;
-    info.textContent = `display t = RK t + ${rkOffset.toFixed(3)}s; auto Z MAE ${errText}`;
+    info.textContent = `display t = RK t + ${rkOffset.toFixed(3)}s; auto traj |dy| ${errText}`;
   };
   const tr = (series,key,name,axis,color,mode='markers',extra={}) => g2({
     x:shifted(ts(series)), y:ys(series,key), name, mode,
@@ -754,22 +786,124 @@ buildPlots[5] = () => {
     hovertemplate:`t=%{x:.3f}s<br>${name}=%{y:.4f}m<br>remaining=%{customdata:.1f} ms<extra>${name}</extra>`,
     ...extra,
   });
-  const pcRemainingTr = (rows,name,color,symbol) => g2({
-    x:rows.map(p=>relTime(p.ct)), y:rows.map(predRemainingMs), name, mode:'markers',
-    marker:{color,size:4,symbol}, yaxis:'y2', xaxis:'x',
-    hovertemplate:`t=%{x:.3f}s<br>remaining=%{y:.1f} ms<extra>${name}</extra>`,
-  });
   const rkRemainingTr = () => g2({
     x:shifted(ts(RK.pred)), y:ys(RK.pred,'duration').map(v=>isNum(v)?v*1000:null),
     name:'RK Predict remaining(ms)', mode:'markers',
     marker:{color:'#fde047',size:4,symbol:'triangle-up'}, yaxis:'y2', xaxis:'x',
     hovertemplate:'t=%{x:.3f}s<br>remaining=%{y:.1f} ms<extra>RK Predict remaining</extra>',
   });
-  const pcPredTr = (rows,key,name,color,symbol,extra={}) => g2({
-    x:rows.map(p=>relTime(p.ct)), y:rows.map(p=>p[key]), name, mode:'markers',
-    customdata:rows.map(predRemainingMs),
-    marker:{color,size:5,symbol}, yaxis:'y', xaxis:'x',
-    hovertemplate:`t=%{x:.3f}s<br>${name}=%{y:.4f}m<br>remaining=%{customdata:.1f} ms<extra>${name}</extra>`,
+  // PC hit 预测 S0+S1 合成一条（按 ct 排序）；stage 用点形区分：S0=三角、S1=方块
+  const sAll = [...s0, ...s1].sort((a,b)=>((a.ct||0)-(b.ct||0)));
+  const stageSym = s => s===0 ? 'triangle-up' : 'square';
+  const pcHitTr = (key,name,color,extra={}) => g2({
+    x:sAll.map(p=>relTime(p.ct)), y:sAll.map(p=>p[key]), name, mode:'markers',
+    customdata:sAll.map(p=>[predRemainingMs(p), p.stage]),
+    marker:{color,size:5,symbol:sAll.map(p=>stageSym(p.stage))}, yaxis:'y', xaxis:'x',
+    hovertemplate:`t=%{x:.3f}s<br>${name}=%{y:.4f}m<br>S%{customdata[1]} remaining=%{customdata[0]:.1f} ms<extra>${name}</extra>`,
+    ...extra,
+  });
+  const pcHitRemainingTr = () => g2({
+    x:sAll.map(p=>relTime(p.ct)), y:sAll.map(predRemainingMs),
+    name:'PC Hit remaining(ms)', mode:'markers',
+    customdata:sAll.map(p=>p.stage),
+    marker:{color:'#8e44ad',size:4,symbol:sAll.map(p=>stageSym(p.stage))}, yaxis:'y2', xaxis:'x',
+    hovertemplate:'t=%{x:.3f}s<br>S%{customdata} remaining=%{y:.1f} ms<extra>PC Hit remaining</extra>',
+  });
+  // 分抛：按 ht_rel 聚类 RK 预测消息，取每抛最终 ht（击球时刻，RK 轴）+ 最后一条 ref 值
+  const rkPredStage = ys(RK.pred,'stage');
+  const rkPredDurMs = ys(RK.pred,'duration').map(v=>isNum(v)?v*1000:null);
+  const rkThrows = (()=>{
+    const t=ts(RK.pred), ht=ys(RK.pred,'ht_rel');
+    const relx=ys(RK.pred,'rel_x'), rely=ys(RK.pred,'rel_y'), relz=ys(RK.pred,'rel_z');
+    const out=[];
+    for(let i=0;i<t.length;i++){
+      const ti=Number(t[i]);
+      if(!isNum(ti) || !isNum(ht[i])) continue;
+      const cur=out[out.length-1];
+      const upd = th => {
+        th.ht=ht[i]; th.lastT=ti;
+        if(isNum(relx[i])&&isNum(rely[i])&&isNum(relz[i])){
+          th.stage=rkPredStage[i]; th.rel_x=relx[i]; th.rel_y=rely[i]; th.rel_z=relz[i];
+          th.lastRelIdx=i;
+        }
+      };
+      if(cur && Math.abs(ht[i]-cur.ht)<0.8 && ti-cur.lastT<2.0){
+        upd(cur);
+      } else {
+        const th={ht:ht[i], lastT:ti, stage:null, rel_x:null, rel_y:null, rel_z:null, lastRelIdx:null};
+        upd(th);
+        out.push(th);
+      }
+    }
+    return out;
+  })();
+  // RK ref：/predict_hit_pos 的 rel_x/rel_y/rel_z（击球点相对「击球时刻预测车位姿」车体系，臂端消费的量）。
+  // 每抛最后一条 ref 只画一次：作为 star 挪到最终 ht 处（击球时刻臂在执行的参考，
+  // 与 PC 真值 star 同横坐标可垂直对比），不再在其原消息时刻重复画常规点。
+  const rkRefRows = key => {
+    const t=ts(RK.pred), val=ys(RK.pred,key);
+    const finalIdx=new Set(rkThrows.map(th=>th.lastRelIdx).filter(i=>i!=null));
+    const rows=[];
+    for(let i=0;i<t.length;i++){
+      if(finalIdx.has(i)) continue;
+      const ti=Number(t[i]);
+      if(!isNum(ti) || !isNum(val[i])) continue;
+      rows.push({t:ti+rkOffset, v:val[i], stage:rkPredStage[i], sym:stageSym(rkPredStage[i]), size:5,
+                 note:isNum(rkPredDurMs[i])?`remaining=${rkPredDurMs[i].toFixed(1)} ms`:''});
+    }
+    rkThrows.forEach(th=>{
+      if(!isNum(th[key])) return;
+      rows.push({t:th.ht+rkOffset, v:th[key], stage:th.stage, sym:'star', size:11, note:'@ht final ref'});
+    });
+    return rows.sort((a,b)=>a.t-b.t);
+  };
+  const rkRefTr = (key,name,color,extra={}) => {
+    const rows=rkRefRows(key);
+    return g2({
+      x:rows.map(r=>r.t), y:rows.map(r=>r.v), name, mode:'markers',
+      customdata:rows.map(r=>[r.note, r.stage]),
+      marker:{color, size:rows.map(r=>r.size), symbol:rows.map(r=>r.sym)}, yaxis:'y', xaxis:'x',
+      hovertemplate:`t=%{x:.3f}s<br>${name}=%{y:.4f}m<br>S%{customdata[1]} %{customdata[0]}<extra>${name}</extra>`,
+      ...extra,
+    });
+  };
+  const ballAt = t => {
+    const s=interpRow(pcRows,t,0.12);
+    if(!s) return null;
+    return {x:lerp(s.a.x,s.b.x,s.f), y:lerp(s.a.y,s.b.y,s.f), z:lerp(s.a.z,s.b.z,s.f)};
+  };
+  const carAt = t => {
+    const s=interpRow(pcCarRows,t,0.5);
+    if(s && isNum(s.a.yaw) && isNum(s.b.yaw)){
+      const dyaw=Math.atan2(Math.sin(s.b.yaw-s.a.yaw),Math.cos(s.b.yaw-s.a.yaw));
+      return {x:lerp(s.a.x,s.b.x,s.f), y:lerp(s.a.y,s.b.y,s.f), yaw:s.a.yaw+dyaw*s.f};
+    }
+    const n=nearest(pcCarRows,t);
+    return (n && Math.abs(n.t-t)<=0.3 && isNum(n.yaw)) ? {x:n.x, y:n.y, yaw:n.yaw} : null;
+  };
+  const relToCar = (b,c) => {
+    const dx=b.x-c.x, dy=b.y-c.y, cy=Math.cos(c.yaw), sy=Math.sin(c.yaw);
+    return {x:cy*dx+sy*dy, y:-sy*dx+cy*dy, z:b.z};
+  };
+  // PC 真值：球相对车体系位置，只画每抛最终 ht 处的插值 star（被相邻观测夹住才给，绝不外推）。
+  // PC 在击球前丢球的抛没有 star；ht 前的过程真值与 PC Ball 曲线重复，不再展示。
+  const truthRows = () => {
+    const rows=[];
+    rkThrows.forEach(th=>{
+      const tHit=th.ht+rkOffset;
+      const b=ballAt(tHit), c=carAt(tHit);
+      if(b && c){
+        const r=relToCar(b,c);
+        rows.push({t:tHit, x:r.x, y:r.y, z:r.z});
+      }
+    });
+    return rows.sort((a,b)=>a.t-b.t);
+  };
+  const truthTr = (rows,key,name,color,extra={}) => g2({
+    x:rows.map(r=>r.t), y:rows.map(r=>r[key]), name, mode:'markers',
+    marker:{color, size:11, symbol:'star'},
+    yaxis:'y', xaxis:'x',
+    hovertemplate:`t=%{x:.3f}s<br>${name}=%{y:.4f}m @ht<extra>${name}</extra>`,
     ...extra,
   });
   const pcTr = (key,name,color,extra={}) => g2({
@@ -833,12 +967,17 @@ buildPlots[5] = () => {
     rkPredTr('x','RK Predict X','#f97316',{visible:'legendonly',marker:{color:'#f97316',size:6,symbol:'triangle-up'}}),
     rkPredTr('y','RK Predict Y','#fb923c',{visible:'legendonly',marker:{color:'#fb923c',size:6,symbol:'triangle-up'}}),
     rkPredTr('z','RK Predict Z','#e94560',{marker:{color:'#e94560',size:6,symbol:'triangle-up'}}),
-    pcPredTr(s0,'x','PC S0 Hit X','#38bdf8','triangle-up',{visible:'legendonly'}),
-    pcPredTr(s0,'y','PC S0 Hit Y','#0ea5e9','triangle-up',{visible:'legendonly'}),
-    pcPredTr(s0,'z','PC S0 Hit Z','#0284c7','triangle-up'),
-    pcPredTr(s1,'x','PC S1 Hit X','#fb7185','square',{visible:'legendonly'}),
-    pcPredTr(s1,'y','PC S1 Hit Y','#f43f5e','square',{visible:'legendonly'}),
-    pcPredTr(s1,'z','PC S1 Hit Z','#e11d48','square'),
+    pcHitTr('x','PC Hit X','#fb7185',{visible:'legendonly'}),
+    pcHitTr('y','PC Hit Y','#f43f5e',{visible:'legendonly'}),
+    pcHitTr('z','PC Hit Z','#e11d48'),
+    rkRefTr('rel_x','RK Ref X','#a3e635'),
+    rkRefTr('rel_y','RK Ref Y','#4d7c0f',{visible:'legendonly'}),
+    rkRefTr('rel_z','RK Ref Z','#84cc16'),
+    ...(rows=>[
+      truthTr(rows,'x','PC Truth X','#e2e8f0'),
+      truthTr(rows,'y','PC Truth Y','#94a3b8',{visible:'legendonly'}),
+      truthTr(rows,'z','PC Truth Z','#ffffff'),
+    ])(truthRows()),
     tr(RK.estimate,'x','RK Estimate X','y','#facc15','markers',{visible:'legendonly',marker:{color:'#facc15',size:4}}),
     tr(RK.estimate,'y','RK Estimate Y','y','#fde047','markers',{visible:'legendonly',marker:{color:'#fde047',size:4}}),
     tr(RK.estimate,'z','RK Estimate Z','y','#f1c40f','markers',{visible:'legendonly',marker:{color:'#f1c40f',size:4}}),
@@ -861,8 +1000,7 @@ buildPlots[5] = () => {
     pcRelTr(pcRel,'dx','PC Ball-Car dX','#ec4899',{visible:'legendonly'}),
     pcRelTr(pcRel,'dy','PC Ball-Car dY','#d946ef',{visible:'legendonly'}),
     pcRelTr(pcRel,'dist','PC Ball-Car XY Dist','#a855f7'),
-    pcRemainingTr(s0,'PC S0 remaining(ms)','#9b59b6','triangle-up'),
-    pcRemainingTr(s1,'PC S1 remaining(ms)','#8e44ad','square'),
+    pcHitRemainingTr(),
     rkRemainingTr(),
   ];
   const layout = () => ({
