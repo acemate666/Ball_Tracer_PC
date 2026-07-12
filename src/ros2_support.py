@@ -78,13 +78,12 @@ def ensure_ros2_environment() -> None:
         _prepend_unique_sys_path(ROS2_SITE_PACKAGES)
         _prepend_unique_env_path("PYTHONPATH", ROS2_SITE_PACKAGES)
 
-    for dll_dir in ROS2_DLL_DIRS:
+    # rcutils 在 C 层用 LoadLibrary 按文件名加载 RMW DLL（rmw_cyclonedds_cpp.dll），
+    # 该方式只搜索 PATH、不认 os.add_dll_directory，所以 DLL 目录必须同时进 PATH。
+    for dll_dir in reversed(ROS2_DLL_DIRS):
         _add_dll_directory(dll_dir)
-
-    if ROS2_SCRIPTS_DIR.exists():
-        _prepend_unique_env_path("PATH", ROS2_SCRIPTS_DIR)
-    if ROS2_BIN_DIR.exists():
-        _prepend_unique_env_path("PATH", ROS2_BIN_DIR)
+        if dll_dir.exists():
+            _prepend_unique_env_path("PATH", dll_dir)
 
     _prepend_unique_env_path("AMENT_PREFIX_PATH", ROS2_ROOT)
     _prepend_unique_env_path("COLCON_PREFIX_PATH", ROS2_ROOT)
