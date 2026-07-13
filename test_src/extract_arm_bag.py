@@ -9,13 +9,20 @@ sys.path 引用，不在本项目重复实现）。
   states   — /joint_states 实际关节位置/速度/力矩 + FK TCP
   commands — /tennis/motor_command 目标（首个轨迹点）+ FK TCP
   events   — status / arm_command / hit_pos / predict_hit_pos 文本事件
-时间轴 t 为相对 bag 第一条消息的秒数。
+
+时间轴 t 为相对 bag 第一条消息（接收时刻）的秒数。时间来源：
+  states/commands — header.stamp（发送端时钟，消息自带；相对时序无接收抖动），
+    用常数 median(stamp − recv) 校正"发送端时钟差 + 中位传输延迟"后落到接收轴；
+  events — bag 接收时刻。std_msgs/String 没有 header，消息本身不带时间戳；
+    /predict_hit_pos 的 payload 带 ct/ht（RK steady 时钟），由 HTML 端做桥。
+    要根治需发布端把发布时刻写进 payload（或换带 header 的消息类型）。
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import statistics
 import sys
 from pathlib import Path
 
@@ -92,11 +99,16 @@ def main() -> int:
     states: list[dict] = []
     commands: list[dict] = []
     events: list[dict] = []
+    state_stamps: list[float] = []   # (stamp − recv) 样本，秒
+    command_stamps: list[float] = []
     counts: dict[str, int] = {}
     seen_state_names: list[str] = []
     seen_command_names: list[str] = []
     start_ns: int | None = None
     end_ns: int | None = None
+
+    def _header_stamp_sec(msg) -> float:
+        return msg.header.stamp.sec + msg.header.stamp.nanosec / 1e9
 
     while reader.has_next():
         topic, data, timestamp = reader.read_next()
@@ -115,9 +127,13 @@ def main() -> int:
             if not seen_state_names and names:
                 seen_state_names = names
             positions = _ordered(list(msg.position), names, joint_names)
+            stamp = _header_stamp_sec(msg)
+            if stamp > 1e6:
+                state_stamps.append(stamp - timestamp / 1e9)
             states.append(
                 {
                     "t": t,
+                    "stamp": stamp,
                     "position": _round_list(positions, 5),
                     "velocity": _round_list(_ordered(list(msg.velocity), names, joint_names), 5),
                     "effort": _round_list(_ordered(list(msg.effort), names, joint_names), 5),
@@ -133,9 +149,13 @@ def main() -> int:
             if not seen_command_names and names:
                 seen_command_names = names
             positions = _ordered(list(point.positions), names, joint_names)
+            stamp = _header_stamp_sec(msg)
+            if stamp > 1e6:
+                command_stamps.append(stamp - timestamp / 1e9)
             commands.append(
                 {
                     "t": t,
+                    "stamp": stamp,
                     "position": _round_list(positions, 5),
                     "velocity": _round_list(_ordered(list(point.velocities), names, joint_names), 5),
                     "effort": _round_list(_ordered(list(point.effort), names, joint_names), 5),
@@ -158,8 +178,30 @@ def main() -> int:
     if start_ns is None:
         raise RuntimeError(f"bag has no messages: {args.bag}")
 
+    # 时间源改为消息自带的 header.stamp：相对时序取发送端时钟（无接收抖动），
+    # 用 median(stamp − recv) 一个常数把发送端时钟差+中位传输延迟校正回接收轴，
+    # 使 t 与 events（接收时刻，String 无 header）可比。stamp 缺失(=0)保留接收 t。
+    def _rebase(rows: list[dict], stamp_diffs: list[float]) -> float | None:
+        med = statistics.median(stamp_diffs) if stamp_diffs else None
+        t0 = start_ns / 1e9
+        for row in rows:
+            stamp = row.pop("stamp")
+            if med is not None and stamp > 1e6:
+                row["t"] = round(stamp - med - t0, 4)
+        return None if med is None else round(med, 4)
+
+    state_stamp_offset = _rebase(states, state_stamps)
+    command_stamp_offset = _rebase(commands, command_stamps)
+
     result = {
-        "schema": "tracker_arm_bag_v1",
+        "schema": "tracker_arm_bag_v2",
+        "time_sources": {
+            "states": "header.stamp − median(stamp−recv)（缺 stamp 退回接收时刻）",
+            "commands": "header.stamp − median(stamp−recv)（缺 stamp 退回接收时刻）",
+            "events": "bag 接收时刻（std_msgs/String 无 header；predict payload 带 ct/ht）",
+        },
+        "joint_states_stamp_minus_recv_sec": state_stamp_offset,
+        "motor_command_stamp_minus_recv_sec": command_stamp_offset,
         "bag_dir": str(args.bag.resolve()),
         "fk_source": "arm_controller.compact_arm_kinematics.fk",
         "start_ns": start_ns,
