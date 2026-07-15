@@ -180,8 +180,15 @@ def main() -> int:
                 x=payload.get("x"),
                 y=payload.get("y"),
                 yaw=payload.get("yaw"),
+                vx=payload.get("vx"),
+                vy=payload.get("vy"),
+                phase=payload.get("phase"),
+                steer_angle=payload.get("steer_angle"),
+                remaining=payload.get("remaining") if target_active else None,
+                v_target=payload.get("v_target") if target_active else None,
                 target_x=payload.get("target_x") if target_active else None,
                 target_y=payload.get("target_y") if target_active else None,
+                target_active=1 if target_active else 0,
             )
         elif key == "chassis_can/camera_cmd":
             if payload.get("cmd") == "mit":

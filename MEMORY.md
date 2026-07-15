@@ -65,6 +65,13 @@
   - 性能教训（本机 Chrome 的 WebGL 是软渲染）：4 个独立 scattergl plot（4 个 WebGL context）或单 context 全量 15 万点都会把渲染器卡死几十秒；最终方案 = SVG `scatter`（lines 模式一条 trace 一条 path）+ 窗口化抽稀（hit/predict 事件 ±[-2,+4]s 内全分辨率，窗口外 2Hz），实测秒开。全量数据仍在 `_arm.json`，抽稀只发生在绘图端。
   - Arm tab 时间轴是 bag 相对时间（bag 首条消息 = 0s），与 tracker 主时间轴（首帧 exposure_pc）无对齐锚点，暂不混画。
 
+- `2026-07-15`: HTML 报表删除 X/Y/Z Subplots tab，新增 RK Car Move tab（每抛底盘移动 ~100Hz 逐帧回放）。
+  - `extract_rk_tracking_bag.py` 的 `/bot_state` 提取新增 `vx/vy/phase/steer_angle/remaining/v_target/target_active`；老 `_rk_tracking.json` 需重提取才有这些字段（HTML 端会退回 target_x 非空段分段、缺字段显示 —）。
+  - 分段 = phase 离开 WAIT（RUN + BRAKE_IN_SWING + BRAKE_AFTER_SWING 为一段，天然一抛一段），前后补 0.5s；下拉框选第几次移动，2D 等比回放（播放/暂停/逐帧/倍速/滑条，快捷键 ←/→/空格），侧栏每帧显示 vx/vy 车速、yaw、IMU yaw_speed、舵轮角+旋转方向（steer_motor.velocity 最近邻 60ms）、剩余到位时间、目标位置/距离。
+  - 0715 用户反馈定稿的 2D 视觉口径：目标星标与右栏**逐帧**刷新（RUN 中目标随预测更新移动，视野 bbox 包含全段目标；未激活帧沿用上一次下发值、右栏带 *）；舵轮 = 车旁短箭头（方向 yaw+steer，运动中按速度符号消歧）；车 = 圆点，yaw 不在 2D 里画（只在侧栏数值显示）。
+  - 0712 bag 实测结论：`bot_state.vx/vy` 是世界系（与 dx/dt 中位差 0.02m/s）；速度方向 ≈ yaw+steer 或其 ±π（舵轮可反向驱动）；里程计跨移动连续（上段终点=下段起点），yaw 每次 WAIT 归零。
+  - 技术坑：Plotly `scaleanchor` 的约束求解器会把算出的范围当"用户编辑"，`Plotly.react` 换移动段时旧 X 范围粘住不更新 → 等比范围自己算（两轴 m/px 取大者）+ react 后按 `_fullLayout` 实测轴长二次校正；`requestAnimationFrame` 在被遮挡/后台标签页被 Chrome 挂起 → 播放循环加 200ms setInterval 看门狗兜底（推进量按墙钟算，双驱动不重复计帧）。
+
 ## 协作提醒
 
 - 如果更换相机 rig，必须同时检查：
