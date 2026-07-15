@@ -1532,9 +1532,10 @@ buildPlots[5] = () => {
     hovertemplate:`t=%{x:.3f}s<br>${name}=%{y:.4f}<extra>${name}</extra>`,
     ...extra,
   });
+  const rkPredNFit = ys(RK.pred,'n_bounce_fit');
   const rkPredTr = (key,name,color,extra={}) => tr(RK.pred,key,name,'y',color,'markers',{
-    customdata:ys(RK.pred,'duration').map(v=>isNum(v)?v*1000:null),
-    hovertemplate:`t=%{x:.3f}s<br>${name}=%{y:.4f}m<br>remaining=%{customdata:.1f} ms<extra>${name}</extra>`,
+    customdata:ys(RK.pred,'duration').map((v,i)=>[isNum(v)?v*1000:null, isNum(rkPredNFit[i])?rkPredNFit[i]:'']),
+    hovertemplate:`t=%{x:.3f}s<br>${name}=%{y:.4f}m<br>remaining=%{customdata[0]:.1f} ms n_fit=%{customdata[1]}<extra>${name}</extra>`,
     ...extra,
   });
   const rkRemainingTr = () => g2({
@@ -1572,7 +1573,8 @@ buildPlots[5] = () => {
       const ti=Number(t[i]);
       if(!isNum(ti) || !isNum(val[i])) continue;
       rows.push({t:ti+rkOffset, v:val[i], stage:rkPredStage[i], sym:stageSym(rkPredStage[i]), size:5,
-                 note:isNum(rkPredDurMs[i])?`remaining=${rkPredDurMs[i].toFixed(1)} ms`:''});
+                 note:(isNum(rkPredDurMs[i])?`remaining=${rkPredDurMs[i].toFixed(1)} ms`:'')
+                      +(isNum(rkPredNFit[i])?` n_fit=${rkPredNFit[i]}`:'')});
     }
     rkThrows.forEach(th=>{
       if(!isNum(th[key])) return;
