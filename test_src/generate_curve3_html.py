@@ -94,6 +94,7 @@ def generate_html(
     racket_json_path: str | None = None,
     arm_json_path: str | None = None,
     rk_tracking_json_path: str | None = None,
+    rk_offset: float | None = None,
 ) -> None:
     data = _load_json(input_path)
     if racket_json_path:
@@ -102,6 +103,8 @@ def generate_html(
         data["arm"] = _load_json(arm_json_path)
     if rk_tracking_json_path:
         data["rk_tracking"] = _load_json(rk_tracking_json_path)
+    if rk_offset is not None:
+        data["rk_offset_preset"] = rk_offset
     # annotate_video 写回的逐帧球拍 2D 检测（bbox+关键点）体积巨大且模板不消费，
     # 只保留 racket3d / racket_observations，避免 HTML 从 ~12MB 涨到 ~60MB
     for frame in data.get("frames", []):
@@ -423,6 +426,7 @@ const GS={gridcolor:'#0f3460',zerolinecolor:'#0f3460'};
 const predRemainingMs = p => (p && isNum(p.ht) && isNum(p.ct)) ? (p.ht - p.ct) * 1000 : null;
 
 // ================= RK / Arm 共享数据层（首页对比表、Arm tab、RK Move 共用） =================
+// [[align-core-begin]] —— test_report_time_align.py 抽取此段在 node 里回归测试,别在段内引新全局依赖
 const ts = series => (series && Array.isArray(series.t)) ? series.t : [];
 const ys = (series, key) => (series && series.y && Array.isArray(series.y[key])) ? series.y[key] : [];
 const pairs = (series, key) => ts(series).map((t,i)=>({t:Number(t), v:Number(ys(series,key)[i])}))
@@ -491,10 +495,18 @@ const scoreOffset = off => {
 };
 // 混叠防护（0712 晚场教训）：抛球间隔相似时，轨迹匹配错位整数个抛也能出深谷；
 // 且当 PC 观测只覆盖部分时段时，假谷只用到少量重叠样本反而 err 更低。
-// 对策：±60s 全扫收集所有候选，先按参与样本数 n ≥ 0.6×n_max 门控，再取 err 最小。
+// 对策：全范围扫描收集所有候选，先按参与样本数 n ≥ 0.6×n_max 门控，再取 err 最小。
+// 扫描界由数据重叠推导（0716 上午场教训：RK 节点晚入网 70s+，t0=全 bag 最小 payload
+// 把 RK 相对轴锚偏，真实 offset=+62s 溢出旧 ±60s 硬编码界，自动对齐落假谷、全报告错轴）：
+// off 须使 RK 运动段映射后与 PC 观测段有交集 → off ∈ [pc首-rk末, pc末-rk首]。
+// 粗扫步长自适应封顶 ~18k 次（谷宽由插值门限 0.08s 定，粗步 ≤0.1s 仍稳落谷内），谷邻域再细扫。
 const estimateOffset = () => {
+  if(rkMovY.length<30 || pcRows.length<10) return {off:0, err:null, n:0};
+  const lo=Math.floor(pcRows[0].t - rkMovY[rkMovY.length-1].t) - 1;
+  const hi=Math.ceil(pcRows[pcRows.length-1].t - rkMovY[0].t) + 1;
+  const coarse=Math.max(0.02, (hi-lo)/18000);
   const cands=[];
-  for(let off=-60.0; off<=60.0001; off+=0.02){
+  for(let off=lo; off<=hi+1e-4; off+=coarse){
     const s=scoreOffset(off);
     if(s) cands.push({off, ...s});
   }
@@ -502,15 +514,31 @@ const estimateOffset = () => {
   const nMax=cands.reduce((m,c)=>Math.max(m,c.n),0);
   const ok=cands.filter(c=>c.n>=0.6*nMax);
   let best=ok.reduce((a,b)=>b.err<a.err?b:a, ok[0]);
-  for(let off=best.off-0.05; off<=best.off+0.0501; off+=0.002){
+  const win=coarse*2.5;
+  for(let off=best.off-win; off<=best.off+win+1e-4; off+=0.002){
     const s=scoreOffset(off);
     if(s && s.n>=0.6*nMax && s.err<best.err) best={off, ...s};
   }
   return best;
 };
+// [[align-core-end]]
 const auto = RK ? estimateOffset() : {off:0, err:null, n:0};
-let rkOffset = Math.round(auto.off*1000)/1000;
+// 预置 offset（--rk-offset）：PC/RK 无共同球观测窗的场次（轨迹自动对齐结构性不可行）
+// 由外部锚（如车速互相关）离线求出后喂入，优先于 auto；Auto align 按钮仍可覆盖。
+const presetOff = isNum(D.rk_offset_preset) ? Number(D.rk_offset_preset) : null;
+let rkOffset = Math.round((presetOff!=null ? presetOff : auto.off)*1000)/1000;
 window.__rkOffset = rkOffset;
+// 对齐质量门（0716 早场教训：自动对齐落假谷时报告安静生成，全表错轴像"数据坏了"）：
+// 好场中位 |dy| ~0.07m，假谷实测 0.6~10m；n 是最优候选参与样本数，热身场仅 15。
+// 有 preset 时不告警（正是自动对齐不可行场次的正解，rkOffset 已取 preset）。
+const alignBad = !!RK && presetOff==null && (auto.err==null || auto.err>0.25 || auto.n<30);
+const alignWarnHtml = alignBad
+  ? `<div style="border:1px solid #e94560;background:rgba(233,69,96,0.12);color:#e94560;font-weight:600;border-radius:8px;padding:8px 12px;margin:0 0 10px">`+
+    `⚠ PC↔RK 自动对齐不可信（中位 |dy| ${auto.err==null?'n/a':auto.err.toFixed(3)+'m'} / ${auto.n} 点；门限 ≤0.25m 且 ≥30 点）`+
+    `——本页所有跨轴内容（北极星表 / RK 轨迹叠加 / Arm 对齐）不可靠。`+
+    `常见原因：两侧共同球观测太少（热身场、RK 晚入网、PC 未见球）。`+
+    `处置：RK 页手动 Apply offset，或用 --rk-offset 预置外部锚。</div>`
+  : '';
 const rkPredStage = RK ? ys(RK.pred,'stage') : [];
 const rkPredDurMs = (RK ? ys(RK.pred,'duration') : []).map(v=>isNum(v)?v*1000:null);
 // 分抛：按 ht_rel 聚类 RK 预测消息，取每抛最终 ht（击球时刻，RK 轴）+ 最后一条 ref 值
@@ -1111,7 +1139,7 @@ const hitTableHtml = () => {
 };
 const renderTable0 = () => {
   const el=document.getElementById('hitTbl0');
-  if(el) el.innerHTML=hitTableHtml();
+  if(el) el.innerHTML=alignWarnHtml+hitTableHtml();
 };
 // ================= 共享数据层结束 =================
 
@@ -1703,7 +1731,7 @@ buildPlots[4] = () => {
         : 'Axis: arm data time（未对齐：需 v3 _arm.json + RK 数据） &nbsp; ') +
       (ARM.fk_source ? `FK: ${escA(ARM.fk_source)} &nbsp; ` : '') +
       (marks.length ? '| ' + marks.join(' &nbsp;|&nbsp; ') : '| no accepted commands') +
-      hitTableHtml();
+      alignWarnHtml + hitTableHtml();
   };
   // 单 plot 四层 subplot（同 Car Location 模式）：只占一个渲染 context。
   const bindAxis=(traces,ya)=>traces.map(t=>({...t,xaxis:'x',yaxis:ya}));
@@ -1749,7 +1777,9 @@ buildPlots[5] = () => {
   const setInfo = () => {
     window.__rkOffset = rkOffset;  // Arm tab 同轴显示要用
     const errText = auto.err==null ? 'n/a' : `${auto.err.toFixed(3)}m / ${auto.n} pts`;
-    info.textContent = `display t = RK t + ${rkOffset.toFixed(3)}s; auto traj |dy| ${errText}`;
+    const srcText = presetOff!=null ? `preset ${presetOff.toFixed(3)}s; ` : '';
+    info.innerHTML = (alignBad ? '<span style="color:#e94560;font-weight:700">⚠ 对齐不可信</span> ' : '')
+      + `display t = RK t + ${rkOffset.toFixed(3)}s; ${srcText}auto traj |dy| ${errText}`;
   };
   const tr = (series,key,name,axis,color,mode='markers',extra={}) => g2({
     x:shifted(ts(series)), y:ys(series,key), name, mode,
@@ -2027,7 +2057,7 @@ buildPlots[5] = () => {
   const sigInfo = document.getElementById('rkSigInfo');
   const syncSignalControls = () => {
     if(sigInput) sigInput.value = rkOffset.toFixed(3);
-    if(sigInfo) sigInfo.textContent = info.textContent;
+    if(sigInfo) sigInfo.innerHTML = info.innerHTML;
   };
   syncSignalControls();
   const sigApply = document.getElementById('rkSigApply');
@@ -2251,6 +2281,12 @@ def main() -> None:
         help="extract_arm_bag.py 输出的机械臂 JSON；缺省时自动探测 <input>_arm.json",
     )
     parser.add_argument("--rk-tracking-json", default=None)
+    parser.add_argument(
+        "--rk-offset", type=float, default=None,
+        help="预置初始 RK offset（秒）。PC/RK 无共同球观测窗、轨迹自动对齐不可行的场次，"
+             "用外部锚（如 PC AprilTag 车速 × RK bot_state 车速互相关）离线求出后喂入；"
+             "页面 Auto align 按钮仍可重新估计覆盖。",
+    )
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
 
@@ -2266,7 +2302,7 @@ def main() -> None:
         candidate = base + "_rk_tracking.json"
         if os.path.exists(candidate):
             rk_tracking_json = candidate
-    generate_html(args.input, out, args.racket_json, arm_json, rk_tracking_json)
+    generate_html(args.input, out, args.racket_json, arm_json, rk_tracking_json, args.rk_offset)
 
 
 if __name__ == "__main__":
