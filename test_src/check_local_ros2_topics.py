@@ -32,7 +32,6 @@ class TopicCase:
 
 
 DEFAULT_CASES = (
-    TopicCase("/arm_logger/control", "reliable"),
     TopicCase("/predict_hit_pos", "reliable"),
     TopicCase("/pc_car_loc", "best_effort"),
 )

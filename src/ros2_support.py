@@ -33,10 +33,7 @@ ROS2_TRACKER_PEERS = (
 ROS2_BEST_EFFORT_DEPTH = 1
 ROS2_RELIABLE_TOPICS = frozenset(
     {
-        "/arm_controller/hit_command",
         "/predict_hit_pos",
-        "/arm_logger/control",
-        "/arm_controller/status",
     }
 )
 

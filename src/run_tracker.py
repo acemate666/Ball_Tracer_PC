@@ -353,37 +353,6 @@ class UdpBridgeRos2Sink:
         print("  ROS2 桥接已关闭")
 
 
-class TimeSyncResponderProcess:
-    def __init__(self) -> None:
-        self._proc: subprocess.Popen | None = None
-        script = _ROOT / "src" / "win_time_sync.py"
-        if not script.exists():
-            print(f"  time_sync 脚本不存在，跳过: {script}")
-            return
-
-        try:
-            self._proc = subprocess.Popen(
-                [_ros2_python_executable(), "-u", str(script)],
-            )
-            print(f"  time_sync 独立进程已启动 (PID={self._proc.pid})")
-            _print_ros_comm_config(
-                "time_sync ROS2",
-                [
-                    ("/time_sync/ping", 1),
-                    ("/time_sync/pong", 1),
-                ],
-            )
-        except Exception as e:
-            print(f"  time_sync 独立进程启动失败: {e}")
-            self._proc = None
-
-    def close(self) -> None:
-        if self._proc is None or self._proc.poll() is not None:
-            return
-        _terminate_process_tree(self._proc)
-        print("  time_sync 独立进程已关闭")
-
-
 class RosbagRecorderProcess:
     """独立 ros2 bag 录制进程：录制局域网内全部 ROS topic 到 {run_id}_rosbag/。
 
@@ -524,22 +493,6 @@ def _create_ros2_sink(mode: str):
     return DirectRos2Sink()
 
 
-def _create_time_sync_process(mode: str):
-    return None
-
-def _publish_logger_control(
-    ros2_sink,
-    payload: dict,
-    *,
-    repeat: int = 1,
-    interval_s: float = 0.15,
-) -> None:
-    for index in range(max(int(repeat), 1)):
-        ros2_sink.publish_logger_control(payload)
-        if index + 1 < repeat:
-            time.sleep(max(float(interval_s), 0.0))
-
- 
 def _run_postprocess_command(
     description: str,
     command: list[str],
@@ -1662,9 +1615,8 @@ def main() -> int:
     else:
         print("  小车定位: disabled")
 
-    # ── ROS2 边车子进程（rosbag 录制 / time_sync / UDP 桥接）──
+    # ── ROS2 边车子进程（rosbag 录制 / 发送 sink）──
     _ros2_sink = _create_ros2_sink(args.ros2_mode)
-    _time_sync_proc = _create_time_sync_process(args.ros2_mode)
     if save_logs:
         _rosbag_proc = RosbagRecorderProcess(bag_dir=output_dir / f"{run_id}_rosbag")
     else:
@@ -1682,11 +1634,6 @@ def main() -> int:
         try:
             if _rosbag_proc is not None:
                 _rosbag_proc.close(timeout_sec=timeout_sec)
-        except Exception:
-            pass
-        try:
-            if _time_sync_proc is not None:
-                _time_sync_proc.close()
         except Exception:
             pass
 
@@ -2195,7 +2142,7 @@ def main() -> int:
                 frame_data["video_frame_idx"] = video_frame_idx
                 frame_data["video_mapping_exact"] = True
 
-    # ── 关闭 ROS2 边车子进程（rosbag / time_sync / 发送 sink）──
+    # ── 关闭 ROS2 边车子进程（rosbag / 发送 sink）──
     try:
         _ros2_sink.close()
     finally:

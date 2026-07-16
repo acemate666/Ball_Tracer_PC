@@ -1,8 +1,7 @@
 param(
     [string]$ListenHost = "127.0.0.1",
     [int]$Port = 8765,
-    [string]$TrackerOutputDir = "",
-    [string]$PoeConfig = ""
+    [string]$TrackerOutputDir = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -110,9 +109,6 @@ if (-not (Test-TcpPortAvailable -BindHost $ListenHost -Port $Port)) {
 $argsList = @($serverScript, "--host", $ListenHost, "--port", "$Port")
 if ($TrackerOutputDir) {
     $argsList += @("--tracker-output-dir", $TrackerOutputDir)
-}
-if ($PoeConfig) {
-    $argsList += @("--poe-config", $PoeConfig)
 }
 
 Write-Host ("Using python: {0}" -f $pythonExe)
