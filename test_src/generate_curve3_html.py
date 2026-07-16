@@ -226,6 +226,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
         <div class="mvKV"><span class="k">IMU yaw_speed</span><span class="v" id="mvImuW">—</span></div>
         <h3>舵轮</h3>
         <div class="mvKV"><span class="k">舵轮角 steer</span><span class="v" id="mvSteer">—</span></div>
+        <div class="mvKV"><span class="k">目标 steer (cmd)</span><span class="v" id="mvSteerTgt">—</span></div>
         <div class="mvKV"><span class="k">旋转方向</span><span class="v" id="mvSteerDir">—</span></div>
         <div id="mvNote"></div>
       </div>
@@ -513,6 +514,7 @@ window.__rkOffset = rkOffset;
 const rkPredStage = RK ? ys(RK.pred,'stage') : [];
 const rkPredDurMs = (RK ? ys(RK.pred,'duration') : []).map(v=>isNum(v)?v*1000:null);
 // 分抛：按 ht_rel 聚类 RK 预测消息，取每抛最终 ht（击球时刻，RK 轴）+ 最后一条 ref 值
+const REF_LEAD_TARGET=0.3;  // 降级表选 ref 的目标提前量（s）：臂端执行需要 ~300ms 窗口（0715 用户定标）
 const rkThrows = (()=>{
   if(!RK) return [];
   const t=ts(RK.pred), ht=ys(RK.pred,'ht_rel');
@@ -526,13 +528,26 @@ const rkThrows = (()=>{
       th.ht=ht[i]; th.lastT=ti; th.msgs=(th.msgs||0)+1;
       if(isNum(relx[i])&&isNum(rely[i])&&isNum(relz[i])){
         th.stage=rkPredStage[i]; th.rel_x=relx[i]; th.rel_y=rely[i]; th.rel_z=relz[i];
-        th.lastRelIdx=i;
+        th.lastRelIdx=i; th.refT=ti;  // 最终 ref 定格的计算时刻（该消息的 ct，RK 相对轴）
+        // RK 在 ht 过后仍会继续发预测（马后炮消息，臂端必被"剩余时间"拒掉），只认击球前的。
+        // 也不取"最后一条"——其提前量 = 尾部消息间隙，随断流在 24~187ms 抖（0715 上午场实测）。
+        // 且只认 S1：S0 的 rel 是固定 target 占位（1.0/1.15，rel_src=target），不是预测；
+        // 臂端也只接受 stage=1。按臂端执行窗口选 S1 中提前量最接近 REF_LEAD_TARGET(300ms) 的那条。
+        const lead=ht[i]-ti;
+        if(lead>0 && Number(rkPredStage[i])===1){
+          const dev=Math.abs(lead-REF_LEAD_TARGET);
+          if(th.preRefT==null || dev<th.preLeadDev){
+            th.preStage=rkPredStage[i]; th.preRel_x=relx[i]; th.preRel_z=relz[i];
+            th.preRefT=ti; th.preLeadDev=dev;
+          }
+        }
       }
     };
     if(cur && Math.abs(ht[i]-cur.ht)<0.8 && ti-cur.lastT<2.0){
       upd(cur);
     } else {
-      const th={ht:ht[i], firstT:ti, lastT:ti, msgs:0, stage:null, rel_x:null, rel_y:null, rel_z:null, lastRelIdx:null};
+      const th={ht:ht[i], firstT:ti, lastT:ti, msgs:0, stage:null, rel_x:null, rel_y:null, rel_z:null, lastRelIdx:null, refT:null,
+                preStage:null, preRel_x:null, preRel_z:null, preRefT:null, preLeadDev:null};
       upd(th);
       out.push(th);
     }
@@ -784,11 +799,45 @@ const armFeedbackIn = (loRk, hiRk) => {
 // Δ相会 = 触球 − 真值球↔车 y 相会时刻（相会只取击打前下行穿越，反弹不污染）；
 // 真值取触球（未击打行取 ht）同一时刻；全表世界坐标系，FK z 按 armZOff 还原；
 // 脱拍行自动注"拍高/低了 ~Ncm"（来自 dz）。
+// 无臂端数据（bag 缺 /joint_states → ARM=null，0715 臂控未启动场次）时降级：
+// 北极星退化为 "RK 预测 ref（击球前提前量最接近 300ms 的一条 rel_x/rel_z，臂本应执行的目标）
+// ↔ PC 真值@ht" 差值，只依赖 RK pred + PC 观测，臂列全部省略。
 const hitTableHtml = () => {
-  if(!ARM || (!armHitMarks.length && !rkThrows.length)) return '';
   const fmt=(v,d)=>v==null?'—':Number(v).toFixed(d);
   const xz=(x,z)=>(x==null||z==null)?'—':`${Number(x).toFixed(3)}/${Number(z).toFixed(3)}`;
   const sgn=v=>`${v>=0?'+':''}${v.toFixed(0)}`;
+  if(!ARM){
+    const ths=rkThrows.filter(t=>(t.msgs||0)>=3).sort((a,b)=>a.ht-b.ht);
+    if(!ths.length) return '';
+    const degRows=ths.map((th,idx)=>{
+      const meetT=truthMeetAt(th.ht+rkOffset);
+      const tru=rkTruthAt(th.ht);
+      const dx=(isNum(th.preRel_x)&&tru)?(th.preRel_x-tru.x)*1000:null;
+      const dz=(isNum(th.preRel_z)&&tru)?(th.preRel_z-tru.z)*1000:null;
+      return `<tr><td>${idx+1}</td><td>${(th.ht+rkOffset).toFixed(2)}</td>`+
+        `<td>${meetT!=null?meetT.toFixed(2):'—'}</td>`+
+        `<td>${meetT!=null?sgn((th.ht+rkOffset-meetT)*1000):'—'}</td>`+
+        `<td>${xz(th.preRel_x,th.preRel_z)}</td>`+
+        `<td>${tru?xz(tru.x,tru.z):'—'}</td>`+
+        `<td>${(dx!=null&&dz!=null)?`${sgn(dx)}/${sgn(dz)}`:'—'}</td>`+
+        `<td>${isNum(th.preRefT)?Math.round((th.ht-th.preRefT)*1000):'—'}</td>`+
+        `<td>${th.preStage!=null?`S${th.preStage}`:'<span style="color:#fbbf24">无S1</span>'}×${th.msgs||0}</td></tr>`;
+    });
+    const degNotes=[
+      '无臂端数据（bag 缺 /joint_states，臂控未上线）：降级为 RK 预测 ref ↔ PC 真值对比',
+      '行 = RK 每次真实抛球（predict ≥3 条）；ht = RK 最终预测击球时刻（已加 RK offset 到报告轴）',
+      '相会t = 真值下球 rel_y 首次由正下穿 0（只取击打前下行穿越，防反弹污染）；Δht = ht − 相会t（预测时刻误差）',
+      'RK ref = 该抛击球前 S1 消息中提前量最接近 300ms 的 rel_x/rel_z（臂端执行窗口 ~300ms 且只接受 S1；S0 的 rel 是固定 target 占位不算 ref，ht 后的马后炮消息不算）',
+      '预测列"无S1" = 该抛击球前没有任何 S1 预测（臂端必然全拒），ref/dx/dz 无从谈起',
+      'dx/dz = RK ref − PC真值@ht（PC 四目真值在 ht 时刻转车体系）',
+      'ref提前 = ht − 该 ref 消息的计算时刻 ct（最终目标用的是提前多少 ms 的数据定的）',
+    ];
+    return `<div class="armTblWrap"><table class="armTbl"><thead><tr><th>#</th><th>ht(s)</th><th>相会t(s)</th><th>Δht(ms)</th>`+
+      `<th>RK ref x/z(m)</th><th>PC真值 x/z(m)</th><th>dx/dz(mm)</th><th>ref提前(ms)</th><th>预测</th></tr></thead>`+
+      `<tbody>${degRows.join('')}</tbody></table>`+
+      `<div style="font-size:11px;color:#a0a0c0;margin:2px 0 6px">${degNotes.join('；')}。</div></div>`;
+  }
+  if(!armHitMarks.length && !rkThrows.length) return '';
   const rows=[];
   const hits=armHitMarks.filter(h=>h.label==='hit');
   const realThrows=armAligned ? rkThrows.filter(t=>(t.msgs||0)>=3).sort((a,b)=>a.ht-b.ht) : [];
@@ -1028,7 +1077,7 @@ buildPlots[1] = () => {
   const el=id=>document.getElementById(id);
   const V={frame:el('mvFrameV'), tRk:el('mvTRk'), tPc:el('mvTPc'), phase:el('mvPhase'),
     pos:el('mvPos'), spd:el('mvSpd'), vxy:el('mvVxy'), yaw:el('mvYaw'), imuW:el('mvImuW'),
-    steer:el('mvSteer'), steerDir:el('mvSteerDir'), rem:el('mvRem'), tgt:el('mvTgt'), dist:el('mvDist')};
+    steer:el('mvSteer'), steerTgt:el('mvSteerTgt'), steerDir:el('mvSteerDir'), rem:el('mvRem'), tgt:el('mvTgt'), dist:el('mvDist')};
   if(!rows.length){ if(clock) clock.textContent='无 /bot_state 数据'; return; }
   // —— 分段 ——
   const hasPhase = rows.some(r=>r.phase!==null);
@@ -1068,6 +1117,7 @@ buildPlots[1] = () => {
     return out.sort((a,b)=>a.t-b.t);
   };
   const steerVelLut=mkLut(RK.steer_motor,'velocity');
+  const steerCmdLut=RK.steer_cmd?mkLut(RK.steer_cmd,'position'):[];  // 老 JSON 无 steer_cmd → 显示 —
   const imuWLut=mkLut(RK.imu,'yaw_speed');
   const lutAt=(lut,t,tol)=>{
     if(!lut.length) return null;
@@ -1181,6 +1231,16 @@ buildPlots[1] = () => {
     const w=lutAt(imuWLut,f.t,0.06);
     V.imuW.textContent=w===null?'—':`${w.toFixed(3)} rad/s`;
     V.steer.textContent=deg(f.steer);
+    // 目标 steer：/chassis_can/steer_cmd MIT 位置设定点。BRAKE_IN/AFTER_SWING 不发 steer 帧，
+    // 电机 MIT 自持上一帧设定点 → 显示最后一条并标"自持"。
+    const sc=lutAt(steerCmdLut,f.t,0.06);
+    if(sc!==null) V.steerTgt.textContent=deg(sc);
+    else{
+      let lo=0,hi=steerCmdLut.length;
+      while(lo<hi){const m=(lo+hi)>>1; if(steerCmdLut[m].t<=f.t) lo=m+1; else hi=m;}
+      const last=lo>0?steerCmdLut[lo-1]:null;
+      V.steerTgt.textContent=last?`${deg(last.v)} 自持(${(f.t-last.t).toFixed(2)}s 无指令)`:'—';
+    }
     let sv=lutAt(steerVelLut,f.t,0.06);
     if(sv===null && cur>0 && f.steer!==null){
       const p=seg.frames[cur-1];
@@ -1298,6 +1358,7 @@ buildPlots[1] = () => {
   if(note) note.innerHTML=
     `分段 = bot_state.phase 离开 WAIT（每抛 RK 下发目标后 RUN，含 BRAKE 两段），前后补 ${PAD_B}s 上下文，共 ${movements.length} 次移动。`+
     `<br>舵轮箭头方向 = yaw+steer，运动中按速度符号消歧（舵轮可反向驱动）；vx/vy 为世界系（与 dx/dt 中位差 0.02m/s）。`+
+    `<br>目标 steer = /chassis_can/steer_cmd 的 MIT 位置设定点（SteerController 每拍限速斜坡，非最终朝向 theta_des）；BRAKE 两段不发 steer 帧，电机自持上一设定点（标"自持"）。`+
     `<br>目标星标与右栏逐帧刷新（RUN 中目标会随预测更新移动）；带 * = 该帧目标未激活，沿用本段上一次下发值。`+
     `<br>剩余到位时间 = bot_state.remaining（仅 target_active 时有值）。快捷键：←/→ 逐帧，空格 播放/暂停。`;
   setMovement(0);
