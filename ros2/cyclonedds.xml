@@ -2,21 +2,16 @@
 <CycloneDDS>
   <Domain id="any">
     <General>
-      <!-- 固定绑定 192.168.50.0/24 LAN 网卡（本机 .230），避免 CycloneDDS 选到
-           Meta/VPN 虚拟网卡（198.18.x）导致发现不到 RK。 -->
       <Interfaces>
-        <NetworkInterface address="192.168.50.230" multicast="false" />
+        <NetworkInterface address="192.168.31.164" multicast="false" />
       </Interfaces>
-      <!-- 与臂/底盘 RK 保持一致：关闭多播，发现全靠下面的静态单播 peers。 -->
       <AllowMulticast>false</AllowMulticast>
     </General>
     <Discovery>
       <ParticipantIndex>auto</ParticipantIndex>
       <MaxAutoParticipantIndex>8</MaxAutoParticipantIndex>
       <Peers>
-        <!-- 臂 RK -->
-        <Peer Address="192.168.50.17" />
-        <!-- 底盘 RK -->
+        <Peer Address="192.168.31.23" />
         <Peer Address="192.168.50.143" />
       </Peers>
     </Discovery>

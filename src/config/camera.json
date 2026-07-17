@@ -1,4 +1,5 @@
 {
+    "trigger_mode": "line",
     "master_serial": "DA7403103",
     "slave_serials": ["DA8571029", "DA7403087", "DA8474746"],
     "fps": 35.0,

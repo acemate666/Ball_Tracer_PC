@@ -8,6 +8,10 @@ param(
     [ValidateSet('auto', 'ros2', 'clean')]
     [string]$PreferredEnv = 'auto',
     [int]$RosDomainId = 2,
+    [string]$CameraConfig = '',
+    [string]$CalibrationConfig = '',
+    [ValidateRange(0, 1)]
+    [int]$CameraReverse180 = 1,
     [switch]$ProbeOnly
 )
 
@@ -26,20 +30,35 @@ try {
 } catch {
 }
 
-if (-not (Test-Path Env:BALL_TRACER_CAMERA_REVERSE_180)) {
-    $env:BALL_TRACER_CAMERA_REVERSE_180 = '1'
-}
-if (-not (Test-Path Env:BALL_TRACER_SOFTWARE_ROTATE_180)) {
-    $env:BALL_TRACER_SOFTWARE_ROTATE_180 = '0'
-}
+$env:BALL_TRACER_CAMERA_REVERSE_180 = $CameraReverse180.ToString()
+$env:BALL_TRACER_CAMERA_REVERSE_X = $CameraReverse180.ToString()
+$env:BALL_TRACER_CAMERA_REVERSE_Y = $CameraReverse180.ToString()
+$env:BALL_TRACER_SOFTWARE_ROTATE_180 = '0'
 
 $script = Join-Path $PSScriptRoot "src\run_tracker.py"
+$configDir = Join-Path $PSScriptRoot "src\config"
+if ([string]::IsNullOrWhiteSpace($CameraConfig)) {
+    $CameraConfig = Join-Path $configDir "camera.json"
+}
+if ([string]::IsNullOrWhiteSpace($CalibrationConfig)) {
+    $CalibrationConfig = Join-Path $configDir "four_camera_calib.json"
+}
 $cleanPython = Join-Path $PSScriptRoot ".venv_clean\Scripts\python.exe"
 $ros2Python = Join-Path $PSScriptRoot ".venv_ros2\Scripts\python.exe"
 $ros2Activate = Join-Path $PSScriptRoot ".venv_ros2\Scripts\Activate.ps1"
 $ros2Setup = 'C:\dev\ros2_jazzy\local_setup.ps1'
 $ros2SitePackages = 'C:\dev\ros2_jazzy\Lib\site-packages'
+$ros2PixiRoot = 'C:\dev\ros2_jazzy\.pixi\envs\default'
+$ros2PixiLibraryBin = Join-Path $ros2PixiRoot 'Library\bin'
 $cycloneXml = Join-Path $PSScriptRoot "ros2\cyclonedds.xml"
+$mvsMvImport = 'C:\Program Files (x86)\MVS\Development\Samples\Python\MvImport'
+
+if (-not (Test-Path Env:MVS_MVIMPORT_DIR)) {
+    $env:MVS_MVIMPORT_DIR = $mvsMvImport
+}
+if (-not (Test-Path $env:MVS_MVIMPORT_DIR)) {
+    throw "MVS MvImport directory not found: $($env:MVS_MVIMPORT_DIR)"
+}
 
 function Add-UniqueEnvPrefix {
     param(
@@ -77,6 +96,8 @@ function Enable-TrackerRos2Networking {
         throw "CycloneDDS config not found: $cycloneXml"
     }
 
+    Add-UniqueEnvPrefix -Name 'PATH' -Value $ros2PixiLibraryBin
+    Add-UniqueEnvPrefix -Name 'PATH' -Value $ros2PixiRoot
     . $ros2Setup
     Add-UniqueEnvPrefix -Name 'PYTHONPATH' -Value $ros2SitePackages
     $env:ROS_DISTRO = 'jazzy'
@@ -204,8 +225,11 @@ if ($selection.Name -eq 'ros2') {
     Write-Host "Selected tracker env: clean (CPU fallback)"
 }
 
+Write-Host "Camera config: $CameraConfig"
+Write-Host "Calibration config: $CalibrationConfig"
+
 if ($ProbeOnly) {
-    return
+    exit 0
 }
 
 if ($selection.Name -eq 'ros2') {
@@ -219,6 +243,8 @@ if ($selection.Name -eq 'ros2') {
 }
 
 Write-Host "BALL_TRACER_CAMERA_REVERSE_180=$($env:BALL_TRACER_CAMERA_REVERSE_180)"
+Write-Host "BALL_TRACER_CAMERA_REVERSE_X=$($env:BALL_TRACER_CAMERA_REVERSE_X)"
+Write-Host "BALL_TRACER_CAMERA_REVERSE_Y=$($env:BALL_TRACER_CAMERA_REVERSE_Y)"
 Write-Host "BALL_TRACER_SOFTWARE_ROTATE_180=$($env:BALL_TRACER_SOFTWARE_ROTATE_180)"
 
 if (-not $ProbeOnly) {
@@ -228,7 +254,13 @@ if (-not $ProbeOnly) {
     Write-Host "Press Ctrl+C to stop; run_tracker.py will finish shutdown cleanly before exit."
 }
 
-$args = @($script, "--duration", $Duration.ToString(), "--ros2-mode", $Ros2Mode)
+$args = @(
+    $script,
+    "--duration", $Duration.ToString(),
+    "--ros2-mode", $Ros2Mode,
+    "--camera-config", $CameraConfig,
+    "--calib-config", $CalibrationConfig
+)
 if ($NoVideo) {
     $args += "--no-video"
 }

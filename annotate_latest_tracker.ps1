@@ -19,6 +19,14 @@ try {
 } catch {
 }
 
+$mvsMvImport = 'C:\Program Files (x86)\MVS\Development\Samples\Python\MvImport'
+if (-not (Test-Path Env:MVS_MVIMPORT_DIR)) {
+    $env:MVS_MVIMPORT_DIR = $mvsMvImport
+}
+if (-not (Test-Path $env:MVS_MVIMPORT_DIR)) {
+    throw "MVS MvImport directory not found: $($env:MVS_MVIMPORT_DIR)"
+}
+
 if ([string]::IsNullOrWhiteSpace($OutputDir)) {
     $OutputDir = Join-Path $PSScriptRoot "tracker_output"
 }

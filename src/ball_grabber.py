@@ -6,18 +6,18 @@
 
 硬件：
   - 相机型号：海康 MV-CS050-10GC (GigE Vision, 500万像素, BayerRG8)
-  - 主相机 DA7403103：free-run 35fps，Line1 输出 ExposureStartActive 信号
-  - 从相机 DA8571029 / DA7403087 / DA8474746：Line0 FallingEdge 硬触发（物理接线接收主相机信号）
-  - 当前默认配置下主相机也参与图像输出，共返回 4 路同步图像
+  - 16 楼配置使用主相机 Line 输出触发从相机
+  - 18 楼配置使用 GigE Action Command 同步触发四台相机
 
-相机参数 (config/camera.json)：
-  - 曝光：3000 μs | 增益：23.5 dB | 帧率：35 fps | GigE 丢包重传已开启
-  - 4 台相机默认均为全画幅 2048×1536
+相机参数：
+  - 16 楼使用 config/camera.json
+  - 18 楼使用 config/camera_18.json
+  - 曝光、增益、帧率和触发参数只在对应配置中维护
 
 时间同步：
   - 每台相机的 ImageGrabber 启动时校准 PC↔设备时钟偏移 (GevTimestampControlLatch)
-  - 后台线程周期性重校准（~0.5s 间隔），偏移跳变 >5ms 自动忽略
-  - 每帧计算 exposure_start_pc = dev_timestamp / 100MHz + offset (perf_counter 时间轴)
+  - 后台线程按相机配置周期性重校准，偏移跳变 >5ms 自动忽略
+  - 每帧按相机报告的 tick frequency 计算 exposure_start_pc (perf_counter 时间轴)
 
 同步取图流程 (SyncCapture.get_frames)：
   1. 各 ImageGrabber 后台线程持续取帧入队（bounded deque, max=10）
@@ -33,7 +33,7 @@
 模块结构：
   - open_camera()    打开单台相机并 StartGrabbing
   - close_camera()   停止取流、关闭设备、销毁句柄
-  - frame_to_numpy() Frame 原始数据 → numpy BGR/Mono（默认 180° 旋转）
+  - frame_to_numpy() Frame 原始数据 → numpy BGR/Mono（旋转由启动入口设置）
   - ImageGrabber     后台取帧线程（带时间偏移校准）
   - SyncCapture      多相机同步采集上下文管理器
   - SyncCapture.from_config()  从 config/camera.json 创建
@@ -55,11 +55,14 @@ import src.mvs_env as _env  # noqa: F401
 
 from MvCameraControl_class import MvCamera
 from CameraParams_header import (
+    MV_ACTION_CMD_INFO,
+    MV_ACTION_CMD_RESULT_LIST,
     MV_CC_DEVICE_INFO_LIST,
     MV_CC_DEVICE_INFO,
     MV_FRAME_OUT,
     MV_GIGE_DEVICE,
     MV_USB_DEVICE,
+    MVCC_INTVALUE_EX,
 )
 from PixelType_header import (
     PixelType_Gvsp_Mono8,
@@ -154,10 +157,17 @@ class Frame:
 
 
 # GevTimestampTickFrequency，MV-CS050-10GC 为 100 MHz
-_TICK_FREQ = 100_000_000
+def read_tick_frequency(cam: Any, serial: str) -> int:
+    val = MVCC_INTVALUE_EX()
+    ret = cam.MV_CC_GetIntValueEx("GevTimestampTickFrequency", val)
+    _check(ret, f"GevTimestampTickFrequency({serial})")
+    freq = int(val.nCurValue)
+    if freq <= 0:
+        raise RuntimeError(f"GevTimestampTickFrequency({serial}) returned {freq}")
+    return freq
 
 
-def calibrate_time_offset(cam: Any) -> float:
+def calibrate_time_offset(cam: Any, tick_frequency_hz: int) -> float:
     """
     校准 PC perf_counter 时间与相机设备时间的偏移量。
 
@@ -167,8 +177,6 @@ def calibrate_time_offset(cam: Any) -> float:
 
     为减少网络延迟误差，取 3 次中往返最短的一次。
     """
-    from CameraParams_header import MVCC_INTVALUE_EX
-
     best_offset = 0.0
     best_rtt = float("inf")
 
@@ -184,7 +192,7 @@ def calibrate_time_offset(cam: Any) -> float:
 
         rtt = t_after - t_before
         pc_time = (t_before + t_after) / 2.0
-        dev_time = int(val.nCurValue) / _TICK_FREQ
+        dev_time = int(val.nCurValue) / tick_frequency_hz
         offset = pc_time - dev_time
 
         if rtt < best_rtt:
@@ -286,6 +294,9 @@ def open_camera(
     *,
     trigger_source: Optional[str] = "Software",
     trigger_activation: str = "FallingEdge",
+    action_device_key: int = 1,
+    action_group_key: int = 1,
+    action_group_mask: int = 1,
     line_output: str = "",
     line_source: str = "",
     frame_rate: float = 0.0,
@@ -297,6 +308,7 @@ def open_camera(
     roi_height: int = 0,
     roi_width: int = 0,
     binning: int = 1,
+    gev_scpd: int = -1,
     reverse_x: Optional[bool] = None,
     reverse_y: Optional[bool] = None,
     _st_dev_list=None,
@@ -362,6 +374,8 @@ def open_camera(
                 cam.MV_GIGE_SetResend(True, 100, 50)
             except Exception:
                 pass
+            if int(gev_scpd) >= 0:
+                _check(cam.MV_CC_SetIntValueEx("GevSCPD", int(gev_scpd)), f"GevSCPD={gev_scpd}")
 
         # ── Binning（像素合并，降低分辨率但保持 FOV）──
         # 必须在 full_frame 之前设置，因为 binning 会改变 WidthMax/HeightMax
@@ -410,22 +424,27 @@ def open_camera(
         if trigger_source is None:
             # Free-run 连续采集（关闭触发模式）
             _check(cam.MV_CC_SetEnumValueByString("TriggerMode", "Off"), "TriggerMode=Off")
-            if frame_rate > 0:
-                try:
-                    cam.MV_CC_SetBoolValue("AcquisitionFrameRateEnable", True)
-                except Exception:
-                    pass
-                try:
-                    cam.MV_CC_SetFloatValue("AcquisitionFrameRate", float(frame_rate))
-                except Exception:
-                    pass
         else:
             # 触发模式（Software / Line0 等）
             _check(cam.MV_CC_SetEnumValueByString("TriggerMode", "On"), "TriggerMode")
             _check(cam.MV_CC_SetEnumValueByString("TriggerSource", trigger_source), f"TriggerSource={trigger_source}")
+            trigger_source_lower = trigger_source.lower()
+            if trigger_source_lower.startswith("action"):
+                _check(
+                    cam.MV_CC_SetIntValueEx("ActionDeviceKey", int(action_device_key)),
+                    f"ActionDeviceKey={action_device_key}",
+                )
+                _check(
+                    cam.MV_CC_SetIntValueEx("ActionGroupKey", int(action_group_key)),
+                    f"ActionGroupKey={action_group_key}",
+                )
+                _check(
+                    cam.MV_CC_SetIntValueEx("ActionGroupMask", int(action_group_mask)),
+                    f"ActionGroupMask={action_group_mask}",
+                )
 
             # 硬触发才需要设置触发沿 + 输入线配置
-            if trigger_source.lower() not in ("software", "triggersoftware"):
+            if trigger_source_lower not in ("software", "triggersoftware") and not trigger_source_lower.startswith("action"):
                 try:
                     cam.MV_CC_SetEnumValueByString("TriggerActivation", trigger_activation)
                 except Exception:
@@ -447,6 +466,10 @@ def open_camera(
                 pass
 
         # ── 主相机 Line 输出（参考 MVS SDK ParametrizeCamera_AreaScanIOSettings）──
+        if frame_rate > 0:
+            _check(cam.MV_CC_SetBoolValue("AcquisitionFrameRateEnable", True), "AcquisitionFrameRateEnable=True")
+            _check(cam.MV_CC_SetFloatValue("AcquisitionFrameRate", float(frame_rate)), f"AcquisitionFrameRate={frame_rate}")
+
         if line_output and line_source:
             try:
                 cam.MV_CC_SetEnumValueByString("LineSelector", line_output)
@@ -570,6 +593,7 @@ class ImageGrabber(threading.Thread):
         timeout_ms: int = 1000,
         recalib_every: int = 10,
         fps: float = 0.0,
+        tick_frequency_hz: int = 0,
     ):
         super().__init__(daemon=True, name=f"Grabber-{serial}")
         self._cam = cam
@@ -580,12 +604,13 @@ class ImageGrabber(threading.Thread):
         self._stop_event = threading.Event()
         self._recalib_every = recalib_every
         self._fps = float(fps)
+        self._tick_frequency_hz = int(tick_frequency_hz) if int(tick_frequency_hz) > 0 else read_tick_frequency(cam, serial)
         self._time_offset: float = 0.0       # PC perf_counter - dev_time（秒）
         self._calib_thread: Optional[threading.Thread] = None
 
     def run(self) -> None:
         # 初始校准（取帧前同步执行）
-        self._time_offset = calibrate_time_offset(self._cam)
+        self._time_offset = calibrate_time_offset(self._cam, self._tick_frequency_hz)
 
         # 启动后台校准线程
         if self._recalib_every > 0:
@@ -612,7 +637,7 @@ class ImageGrabber(threading.Thread):
                 dev_ts = (int(info.nDevTimeStampHigh) << 32) | int(info.nDevTimeStampLow)
 
                 # 计算 PC 时间轴上的曝光开始时刻（读取 offset 是原子操作，无需加锁）
-                exposure_start_pc = dev_ts / _TICK_FREQ + self._time_offset
+                exposure_start_pc = dev_ts / self._tick_frequency_hz + self._time_offset
 
                 frame = Frame(
                     data=data, width=w, height=h,
@@ -644,7 +669,7 @@ class ImageGrabber(threading.Thread):
             self._stop_event.wait(interval)
             if self._stop_event.is_set():
                 break
-            new_offset = calibrate_time_offset(self._cam)
+            new_offset = calibrate_time_offset(self._cam, self._tick_frequency_hz)
             # 平滑更新：如果新旧 offset 差异过大（>5ms），可能是测量异常，跳过
             if abs(new_offset - self._time_offset) < 0.005:
                 self._time_offset = new_offset
@@ -683,12 +708,59 @@ class ImageGrabber(threading.Thread):
 # ───────────────── 同步采集 ─────────────────
 
 
+class ActionTriggerLoop(threading.Thread):
+    def __init__(
+        self,
+        *,
+        stop_event: threading.Event,
+        fps: float,
+        device_key: int,
+        group_key: int,
+        group_mask: int,
+        broadcast_address: str,
+        timeout_ms: int,
+    ) -> None:
+        super().__init__(daemon=True, name="ActionTriggerLoop")
+        self._stop_event = stop_event
+        self._period = 1.0 / max(float(fps), 0.001)
+        self._device_key = int(device_key)
+        self._group_key = int(group_key)
+        self._group_mask = int(group_mask)
+        self._broadcast_address = str(broadcast_address)
+        self._timeout_ms = int(timeout_ms)
+
+    def run(self) -> None:
+        next_t = time.perf_counter()
+        while not self._stop_event.is_set():
+            now = time.perf_counter()
+            if now < next_t:
+                time.sleep(min(0.002, next_t - now))
+                continue
+
+            info = MV_ACTION_CMD_INFO()
+            results = MV_ACTION_CMD_RESULT_LIST()
+            info.nDeviceKey = self._device_key
+            info.nGroupKey = self._group_key
+            info.nGroupMask = self._group_mask
+            info.bActionTimeEnable = 0
+            info.nActionTime = 0
+            info.pBroadcastAddress = self._broadcast_address.encode("ascii")
+            info.nTimeOut = self._timeout_ms
+            info.bSpecialNetEnable = 0
+            info.nSpecialNetIP = 0
+            MvCamera.MV_GIGE_IssueActionCommand(info, results)
+
+            next_t += self._period
+            if now - next_t > 1.0:
+                next_t = now + self._period
+
+
 class SyncCapture:
     """
     多相机硬触发同步采集上下文管理器。
 
-    主相机 free-run + Line 输出 ExposureStartActive → 从相机 Line0 FallingEdge 硬触发。
-    每台从相机的 ROI 参数通过 slave_params 独立配置。
+    支持 Line 硬触发和 GigE Action Command 广播触发，由相机配置中的
+    trigger_mode 显式选择。
 
     推荐用法（从配置文件创建）::
 
@@ -703,27 +775,38 @@ class SyncCapture:
         master_serial: str,
         slave_serials: list[str],
         *,
+        trigger_mode: str,
         fps: float = 30.0,
         sync_threshold_ms: float = 200.0,
         master_line_output: str = "Line1",
         master_line_source: str = "ExposureStartActive",
         slave_trigger_source: str = "Line0",
         slave_trigger_activation: str = "FallingEdge",
+        master_min_bandwidth: bool = False,
+        acquisition_frame_rate: float = 30.0,
+        action_trigger_source: str = "Action1",
+        action_device_key: int = 1,
+        action_group_key: int = 1,
+        action_group_mask: int = 1,
+        action_broadcast_address: str = "255.255.255.255",
+        action_timeout_ms: int = 0,
+        gev_scpd: int = 0,
         recalib_every: int = 10,
         exposure_us: float = 0.0,
         gain_db: float = -1.0,
         pixel_format: str = "",
-        master_min_bandwidth: bool = False,
         slave_params: Optional[dict[str, dict]] = None,
     ):
         self._master = master_serial
         self._slaves = list(slave_serials)
         self._all_serials = [master_serial] + self._slaves
-        # 同步帧集合：master_min_bandwidth 时主机仅做触发源，不参与同步输出
-        if master_min_bandwidth:
-            self._sync_serials = list(slave_serials)
+        self._trigger_mode = str(trigger_mode).strip().lower()
+        if self._trigger_mode not in ("line", "action"):
+            raise ValueError(f"unsupported trigger_mode: {trigger_mode!r}")
+        if self._trigger_mode == "line" and master_min_bandwidth:
+            self._sync_serials = list(self._slaves)
         else:
-            self._sync_serials = [master_serial] + list(slave_serials)
+            self._sync_serials = list(self._all_serials)
         self._sync_set = set(self._sync_serials)
         self._fps = fps
         self._recalib_every = recalib_every
@@ -731,6 +814,7 @@ class SyncCapture:
 
         self._cameras: dict[str, Any] = {}
         self._grabbers: dict[str, ImageGrabber] = {}
+        self._action_trigger: Optional[ActionTriggerLoop] = None
         self._stop = threading.Event()
 
         MvCamera.MV_CC_Initialize()
@@ -740,37 +824,57 @@ class SyncCapture:
         _check(ret, "EnumDevices")
 
         try:
-            # 主相机 free-run + Line 输出触发信号
-            self._cameras[master_serial] = open_camera(
-                master_serial,
-                trigger_source=None,
-                frame_rate=fps,
-                full_frame=True,
-                line_output=master_line_output,
-                line_source=master_line_source,
-                exposure_us=exposure_us,
-                gain_db=gain_db,
-                pixel_format=pixel_format,
-                roi_height=16 if master_min_bandwidth else 0,
-                _st_dev_list=st_dev_list,
-            )
-            # 从机硬触发（每台相机独立 ROI 参数）
-            for sn in self._slaves:
-                params = (slave_params or {}).get(sn, {})
-                self._cameras[sn] = open_camera(
-                    sn,
-                    trigger_source=slave_trigger_source,
-                    trigger_activation=slave_trigger_activation,
+            if self._trigger_mode == "line":
+                self._cameras[master_serial] = open_camera(
+                    master_serial,
+                    trigger_source=None,
+                    frame_rate=fps,
                     full_frame=True,
+                    line_output=master_line_output,
+                    line_source=master_line_source,
                     exposure_us=exposure_us,
                     gain_db=gain_db,
                     pixel_format=pixel_format,
-                    roi_offset_y=params.get("roi_offset_y", 0),
-                    roi_height=params.get("roi_height", 0),
-                    roi_width=params.get("roi_width", 0),
-                    binning=params.get("binning", 1),
+                    roi_height=16 if master_min_bandwidth else 0,
                     _st_dev_list=st_dev_list,
                 )
+                for sn in self._slaves:
+                    params = (slave_params or {}).get(sn, {})
+                    self._cameras[sn] = open_camera(
+                        sn,
+                        trigger_source=slave_trigger_source,
+                        trigger_activation=slave_trigger_activation,
+                        full_frame=True,
+                        exposure_us=exposure_us,
+                        gain_db=gain_db,
+                        pixel_format=pixel_format,
+                        roi_offset_y=params.get("roi_offset_y", 0),
+                        roi_height=params.get("roi_height", 0),
+                        roi_width=params.get("roi_width", 0),
+                        binning=params.get("binning", 1),
+                        _st_dev_list=st_dev_list,
+                    )
+            else:
+                for sn in self._all_serials:
+                    params = (slave_params or {}).get(sn, {})
+                    self._cameras[sn] = open_camera(
+                        sn,
+                        trigger_source=action_trigger_source,
+                        action_device_key=action_device_key,
+                        action_group_key=action_group_key,
+                        action_group_mask=action_group_mask,
+                        frame_rate=acquisition_frame_rate,
+                        full_frame=True,
+                        exposure_us=exposure_us,
+                        gain_db=gain_db,
+                        pixel_format=pixel_format,
+                        roi_offset_y=params.get("roi_offset_y", 0),
+                        roi_height=params.get("roi_height", 0),
+                        roi_width=params.get("roi_width", 0),
+                        binning=params.get("binning", 1),
+                        gev_scpd=gev_scpd,
+                        _st_dev_list=st_dev_list,
+                    )
 
             # 启动 grabber
             for sn, cam in self._cameras.items():
@@ -779,6 +883,19 @@ class SyncCapture:
                                  fps=self._fps)
                 self._grabbers[sn] = g
                 g.start()
+
+            if self._trigger_mode == "action":
+                time.sleep(0.2)
+                self._action_trigger = ActionTriggerLoop(
+                    stop_event=self._stop,
+                    fps=self._fps,
+                    device_key=action_device_key,
+                    group_key=action_group_key,
+                    group_mask=action_group_mask,
+                    broadcast_address=action_broadcast_address,
+                    timeout_ms=action_timeout_ms,
+                )
+                self._action_trigger.start()
         except Exception:
             self.close()
             raise
@@ -787,7 +904,7 @@ class SyncCapture:
         """
         获取最新一组同步帧。
 
-        仅返回 sync_serials 中的相机帧（master_min_bandwidth 时不含主机）。
+        仅返回 sync_serials 中的相机帧（Line 模式可不含仅用作触发源的主相机）。
         用 exposure_start_pc 判断是否属于同一触发周期（阈值 10ms）。
 
         返回 {serial: Frame} 字典，或超时返回 None。
@@ -854,6 +971,9 @@ class SyncCapture:
     def close(self) -> None:
         """停止所有 grabber 并关闭所有相机。"""
         self._stop.set()
+        if self._action_trigger is not None:
+            self._action_trigger.join(timeout=1.0)
+            self._action_trigger = None
         for g in self._grabbers.values():
             g.stop()
         for g in self._grabbers.values():

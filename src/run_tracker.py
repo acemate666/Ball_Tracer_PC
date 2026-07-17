@@ -1451,6 +1451,7 @@ class ArchiveThread:
 
 
 def main() -> int:
+    config_dir = Path(__file__).resolve().parent / "config"
     parser = argparse.ArgumentParser(
         description="网球定位与实验视频保存 (Step 4.5)")
     parser.add_argument(
@@ -1478,6 +1479,16 @@ def main() -> int:
         "--full-res-video", action="store_true",
         help="保存每相机全分辨率视频（多个 mp4，无拼接、无 badge；编码慢、丢帧多，但保留原图细节供训练数据用）"
     )
+    parser.add_argument(
+        "--camera-config",
+        default=str(config_dir / "camera.json"),
+        help="相机采集配置",
+    )
+    parser.add_argument(
+        "--calib-config",
+        default=str(config_dir / "four_camera_calib.json"),
+        help="相机标定与外参配置",
+    )
     args = parser.parse_args()
     save_logs = not args.no_log
 
@@ -1489,8 +1500,7 @@ def main() -> int:
     json_path = output_dir / f"{run_id}.json"
 
     # ── 加载追踪配置 ──────────────────────────────────────────────────────
-    _config_dir = Path(__file__).resolve().parent / "config"
-    _tracker_config_path = _config_dir / "tracker.json"
+    _tracker_config_path = config_dir / "tracker.json"
     with open(_tracker_config_path, encoding="utf-8") as _f:
         tracker_cfg = json.load(_f)
 
@@ -1575,7 +1585,10 @@ def main() -> int:
     )
 
     print("[2/5] 初始化 BallLocalizer (四相机标定)...")
-    localizer = BallLocalizer(detector=detector)
+    localizer = BallLocalizer(
+        calib_config_path=args.calib_config,
+        detector=detector,
+    )
     calib_serials = list(localizer.serials)
     print(f"  标定相机: {calib_serials}")
 
@@ -1601,7 +1614,11 @@ def main() -> int:
         print("  静止过滤: disabled")
 
     print("[4/5] 初始化 CarLocalizer (AprilTag)...")
-    car_localizer = CarLocalizer() if car_loc_enabled else None
+    car_localizer = (
+        CarLocalizer(calib_config_path=args.calib_config)
+        if car_loc_enabled
+        else None
+    )
     if car_localizer is not None:
         print(f"  相机: {car_localizer.serials}")
         print(
@@ -1648,7 +1665,7 @@ def main() -> int:
 
     # ── 打开同步相机 ────────────────────────────────────────────────────
     print("[5/5] 打开同步相机...")
-    with SyncCapture.from_config() as cap:
+    with SyncCapture.from_config(args.camera_config) as cap:
         sync_sns = cap.sync_serials
         capture_fps = cap.fps
         print(f"  同步相机: {sync_sns}")
@@ -1658,7 +1675,7 @@ def main() -> int:
         missing = [sn for sn in calib_serials if sn not in sync_sns]
         extra = [sn for sn in sync_sns if sn not in calib_serials]
         if missing or extra:
-            print("*** 错误: 当前采集相机与 src/config/four_camera_calib.json 不一致 ***")
+            print(f"*** 错误: 当前采集相机与 {args.calib_config} 不一致 ***")
             print(f"  标定相机: {calib_serials}")
             print(f"  采集相机: {sync_sns}")
             if missing:

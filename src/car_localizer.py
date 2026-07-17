@@ -154,13 +154,9 @@ class CarLocalizer:
     # ── 检测 ──────────────────────────────────────────────────────────
 
     def detect(self, image: np.ndarray) -> list[CarDetection]:
-        """检测图像上 60% 区域中的所有 AprilTag (tag36h11)。"""
+        """检测整张图像中的所有 AprilTag (tag36h11)。"""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
-        h = gray.shape[0]
-        # Crop only: keep native pixels and detect on the lower 60% ROI.
-        y_offset = int(h * 0.4)
-        roi = gray[y_offset:]
-        corners_list, ids, _ = self._detector.detectMarkers(roi)
+        corners_list, ids, _ = self._detector.detectMarkers(gray)
 
         if ids is None:
             return []
@@ -168,7 +164,6 @@ class CarLocalizer:
         results = []
         for i, tag_id in enumerate(ids.ravel()):
             corners = corners_list[i].reshape(4, 2)
-            corners[:, 1] += y_offset
             cx = float(corners[:, 0].mean())
             cy = float(corners[:, 1].mean())
             results.append(CarDetection(

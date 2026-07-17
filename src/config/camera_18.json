@@ -1,0 +1,17 @@
+{
+  "trigger_mode": "action",
+  "master_serial": "DB0260414",
+  "slave_serials": ["DB0260373", "DB0260405", "DB0260378"],
+  "fps": 29.0,
+  "acquisition_frame_rate": 30.0,
+  "exposure_us": 9000.0,
+  "gain_db": 12.7,
+  "action_trigger_source": "Action1",
+  "action_device_key": 1,
+  "action_group_key": 1,
+  "action_group_mask": 1,
+  "action_broadcast_address": "255.255.255.255",
+  "action_timeout_ms": 0,
+  "gev_scpd": 0,
+  "recalib_every": 2100
+}
