@@ -523,6 +523,9 @@ const estimateOffset = () => {
 };
 // [[align-core-end]]
 const auto = RK ? estimateOffset() : {off:0, err:null, n:0};
+// 对齐取证钩子（0717 定型）：控制台 __dbgAlign.scoreOffset(off) 可复查任意 offset 的
+// 轨迹匹配质量（中位 |dy| / 样本数），怀疑错轴时先用它排除对齐问题再查预测。
+window.__dbgAlign={pcRows:()=>pcRows, rkMovY:()=>rkMovY, scoreOffset, auto:()=>auto};
 // 预置 offset（--rk-offset）：PC/RK 无共同球观测窗的场次（轨迹自动对齐结构性不可行）
 // 由外部锚（如车速互相关）离线求出后喂入，优先于 auto；Auto align 按钮仍可覆盖。
 const presetOff = isNum(D.rk_offset_preset) ? Number(D.rk_offset_preset) : null;
@@ -538,7 +541,15 @@ const alignWarnHtml = alignBad
     `——本页所有跨轴内容（北极星表 / RK 轨迹叠加 / Arm 对齐）不可靠。`+
     `常见原因：两侧共同球观测太少（热身场、RK 晚入网、PC 未见球）。`+
     `处置：RK 页手动 Apply offset，或用 --rk-offset 预置外部锚。</div>`
-  : '';
+  : (RK
+    // 对齐质量常显（0717 凌晨场教训：RK 预测 ht 对多弹跳球偏早 0.3~0.6s，Δt 一大用户
+    // 第一反应是"轴又没对齐"——把对齐证据亮在表上方，可信时表内偏差就该信为预测误差）。
+    ? `<div style="font-size:11px;color:#7fbf9f;margin:0 0 6px">PC↔RK 对齐 ✓ offset ${rkOffset.toFixed(3)}s`+
+      (presetOff!=null
+        ? `（--rk-offset 外部锚预置）`
+        : `（两侧球轨迹互验：中位 |dy| ${auto.err.toFixed(3)}m / ${auto.n} 点，门限 ≤0.25m）`)+
+      `——对齐可信时，表内 Δt/dx/dz 的偏差应解读为预测/执行误差而非错轴。</div>`
+    : '');
 const rkPredStage = RK ? ys(RK.pred,'stage') : [];
 const rkPredDurMs = (RK ? ys(RK.pred,'duration') : []).map(v=>isNum(v)?v*1000:null);
 // 分抛：按 ht_rel 聚类 RK 预测消息，取每抛最终 ht（击球时刻，RK 轴）+ 最后一条 ref 值
@@ -1724,11 +1735,11 @@ buildPlots[4] = () => {
     const tr=[];
     J.forEach((name,i)=>{
       const cs=seriesXY(cmds, r=>(r[field]&&r[field][i]!=null)?r[field][i]:null, 0.5);
-      tr.push(sv({x:cs.X, y:cs.Y,
+      tr.push(sv({x:cs.X, y:cs.Y, legendgroup:`${name} target`,
         name:`${name} target`, mode:'lines', line:{color:JC[i%JC.length],width:2},
         hovertemplate:`t=%{x:.3f}s<br>%{y:.4f}<extra>${name} target</extra>`}));
       const ss=seriesXY(states, r=>(r[field]&&r[field][i]!=null)?r[field][i]:null, 1.5);
-      tr.push(sv({x:ss.X, y:ss.Y,
+      tr.push(sv({x:ss.X, y:ss.Y, legendgroup:`${name} actual`,
         name:`${name} actual`, mode:'lines', line:{color:JC[i%JC.length],width:1,dash:'dot'},
         hovertemplate:`t=%{x:.3f}s<br>%{y:.4f}<extra>${name} actual</extra>`}));
     });
@@ -2152,10 +2163,19 @@ function tl(plotId,ctrlId){
   const plot=document.getElementById(plotId);
   const ctrl=document.getElementById(ctrlId);
   if(!plot||!ctrl||!plot.data) return;
-  ctrl.innerHTML=plot.data.map((trace,idx)=>{
-    const on=tv(trace);
-    const name=trace&&trace.name?trace.name:`trace ${idx+1}`;
-    return `<button type="button" class="lb${on?'':' off'}" data-plot="${plotId}" data-index="${idx}" aria-pressed="${on?'true':'false'}"><span class="ls" style="background:${tc(trace)}"></span><span>${name}</span></button>`;
+  // legendgroup 相同的 trace 合成一个按钮整组开关（Arm 图同一 joint 出现在多层 subplot）
+  const groups=[], byKey={};
+  plot.data.forEach((trace,idx)=>{
+    const key=trace&&trace.legendgroup?`g:${trace.legendgroup}`:`t:${idx}`;
+    if(byKey[key]==null){
+      byKey[key]=groups.length;
+      groups.push({idxs:[], name:trace&&trace.name?trace.name:`trace ${idx+1}`, trace});
+    }
+    groups[byKey[key]].idxs.push(idx);
+  });
+  ctrl.innerHTML=groups.map(g=>{
+    const on=g.idxs.some(i=>tv(plot.data[i]));
+    return `<button type="button" class="lb${on?'':' off'}" data-plot="${plotId}" data-indices="${g.idxs.join(',')}" aria-pressed="${on?'true':'false'}"><span class="ls" style="background:${tc(g.trace)}"></span><span>${g.name}</span></button>`;
   }).join('');
 }
 function wl(plotId,ctrlId){
@@ -2167,17 +2187,17 @@ function wl(plotId,ctrlId){
   ctrl.addEventListener('click',ev=>{
     const btn=ev.target.closest('.lb');
     if(!btn) return;
-    const idx=Number(btn.dataset.index);
-    const next=!tv(plot.data[idx]);
-    Plotly.restyle(plotId,{visible:next?true:'legendonly'},[idx]).then(()=>tl(plotId,ctrlId));
+    const idxs=btn.dataset.indices.split(',').map(Number);
+    const next=!idxs.some(i=>tv(plot.data[i]));
+    Plotly.restyle(plotId,{visible:next?true:'legendonly'},idxs).then(()=>tl(plotId,ctrlId));
   });
-  // 双击一个系列：只显示它；已是 solo 时再双击恢复全部
+  // 双击一个系列：只显示它（整组）；已是 solo 时再双击恢复全部
   ctrl.addEventListener('dblclick',ev=>{
     const btn=ev.target.closest('.lb');
     if(!btn) return;
-    const idx=Number(btn.dataset.index);
-    const alreadySolo=plot.data.every((t,j)=>tv(t)===(j===idx));
-    const vis=plot.data.map((t,j)=>(alreadySolo||j===idx)?true:'legendonly');
+    const idxs=new Set(btn.dataset.indices.split(',').map(Number));
+    const alreadySolo=plot.data.every((t,j)=>tv(t)===idxs.has(j));
+    const vis=plot.data.map((t,j)=>(alreadySolo||idxs.has(j))?true:'legendonly');
     Plotly.restyle(plotId,{visible:vis}).then(()=>tl(plotId,ctrlId));
   });
   plot.on('plotly_restyle',()=>tl(plotId,ctrlId));
