@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """从 tracker rosbag 提取机械臂数据为 {run_id}_arm.json。
 
-必须在 ROS2 环境中运行（经 ros2/run_ros2.bat 启动），依赖 rosbag2_py 与
-tennis-man arm_controller 的 compact_arm_kinematics.fk（TCP 正解，直接
-sys.path 引用，不在本项目重复实现）。
+必须在 ROS2 环境中运行（经 ros2/run_ros2.bat 启动），依赖 rosbag2_py。
+TCP 正解使用本文件内置的 FK，不依赖 tennis-man/arm_controller 源码路径。
 
 输出供 test_src/generate_curve3_html.py 的 Arm tab 使用：
   states   — /joint_states 实际关节位置/速度/力矩 + FK TCP
@@ -32,12 +31,162 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import statistics
-import sys
 from pathlib import Path
+from typing import Iterable
 
-DEFAULT_ARM_SRC = Path(r"D:\tennis-man\arm_controller\src")
+import numpy as np
+
+
+# Copied from arm_controller.compact_arm_kinematics at a266857.  Keep the
+# report extractor self-contained: generating an Arm JSON must not depend on a
+# neighbouring tennis-man checkout.
+SHORT_JOINT_NAMES = ("joint1", "joint2", "joint3", "joint4", "joint5", "joint6")
+ROOT_LINK = "/tennis_arm_j5j6_7_6/Geometry/base_link"
+
+
+def _pose(pos, quat_wxyz) -> np.ndarray:
+    w, x, y, z = quat_wxyz
+    n = math.sqrt(w * w + x * x + y * y + z * z)
+    w, x, y, z = w / n, x / n, y / n, z / n
+    out = np.eye(4)
+    out[:3, :3] = np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+            [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+        ]
+    )
+    out[:3, 3] = pos
+    return out
+
+
+_AXIS = {
+    "X": np.array([1.0, 0.0, 0.0]),
+    "Y": np.array([0.0, 1.0, 0.0]),
+    "Z": np.array([0.0, 0.0, 1.0]),
+}
+
+# physics:localPos/localRot/axis copied verbatim from the USD PhysicsRevoluteJoints.
+JOINTS = (
+    {
+        "name": "J1_joint",
+        "parent": ROOT_LINK,
+        "child": ROOT_LINK + "/J1_Link",
+        "axis": _AXIS["Y"],
+        "local0": _pose((0.0, 0.0, 0.4385), (-0.4999999, -0.5, 0.49999994, 0.5)),
+        "local1": _pose((0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0)),
+    },
+    {
+        "name": "J2_JOINT",
+        "parent": ROOT_LINK + "/J1_Link",
+        "child": ROOT_LINK + "/J1_Link/J2_Link",
+        "axis": _AXIS["Z"],
+        "local0": _pose((5e-05, 0.1719001, -0.07355), (0.0, -1.0, 0.0, 0.0)),
+        "local1": _pose((0.0, 0.0, 0.0), (0.0, -1.0, 0.0, 0.0)),
+    },
+    {
+        "name": "J3_joint",
+        "parent": ROOT_LINK + "/J1_Link/J2_Link",
+        "child": ROOT_LINK + "/J1_Link/J2_Link/J3_Link",
+        "axis": _AXIS["Z"],
+        "local0": _pose((-0.000125, 0.44997022, 0.02125), (0.0, -1.0, 0.0, 0.0)),
+        "local1": _pose((0.0, 0.0, 0.0), (0.0, -1.0, 0.0, 0.0)),
+    },
+    {
+        "name": "J4_JOINT",
+        "parent": ROOT_LINK + "/J1_Link/J2_Link/J3_Link",
+        "child": ROOT_LINK + "/J1_Link/J2_Link/J3_Link/J4_Link",
+        "axis": _AXIS["Y"],
+        "local0": _pose((0.0, 0.3, 0.08575), (0.70710677, 0.70710677, 0.0, 0.0)),
+        "local1": _pose((0.0, 0.0, 0.0), (0.0, 1.0, 0.0, 0.0)),
+    },
+    {
+        "name": "J5_JOINT",
+        "parent": ROOT_LINK + "/J1_Link/J2_Link/J3_Link/J4_Link",
+        "child": ROOT_LINK + "/J1_Link/J2_Link/J3_Link/J4_Link/J5_Link",
+        "axis": _AXIS["Y"],
+        "local0": _pose((0.0, 0.03973, 0.095), (0.4999999, 0.5, -0.49999994, -0.5)),
+        "local1": _pose((0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0)),
+    },
+    {
+        "name": "J6_JOINT",
+        "parent": ROOT_LINK + "/J1_Link/J2_Link/J3_Link/J4_Link/J5_Link",
+        "child": ROOT_LINK + "/J1_Link/J2_Link/J3_Link/J4_Link/J5_Link/J6_Link",
+        "axis": _AXIS["Z"],
+        "local0": _pose(
+            (0.00042069482, 0.047, 0.031753197),
+            (1.6081226e-16, 1.6155446e-15, -1.0, -1.6653345e-15),
+        ),
+        "local1": _pose((0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0)),
+    },
+)
+
+TOOL_AXIS_IN_LINK6 = np.array([0.0, 0.0, 1.0])
+
+# USD base_link -> hit convention: rotate +90 deg about Z so -Y_base becomes +X.
+BASE_ROT = np.array(
+    [
+        [0.0, -1.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+)
+
+
+def _axis_rotation(axis: np.ndarray, angle: float) -> np.ndarray:
+    axis = axis / np.linalg.norm(axis)
+    x, y, z = axis
+    c = math.cos(angle)
+    s = math.sin(angle)
+    t = 1.0 - c
+    out = np.eye(4)
+    out[:3, :3] = np.array(
+        [
+            [t * x * x + c, t * x * y - s * z, t * x * z + s * y],
+            [t * x * y + s * z, t * y * y + c, t * y * z - s * x],
+            [t * x * z - s * y, t * y * z + s * x, t * z * z + c],
+        ]
+    )
+    return out
+
+
+def _q6(q: Iterable[float]) -> np.ndarray:
+    q = np.asarray(tuple(q), dtype=float)
+    if q.shape == (5,):
+        q = np.concatenate((q, [0.0]))
+    if q.shape != (6,):
+        raise ValueError(f"expected 5 or 6 joint values, got shape {q.shape}")
+    return q
+
+
+def fk(q: Iterable[float], *, tcp_distance: float = 0.62) -> dict[str, np.ndarray]:
+    """Exact forward kinematics from the USD physics joints, in hit convention."""
+    q = _q6(q)
+    link_transforms = {ROOT_LINK: BASE_ROT.copy()}
+    joint_frames = {}
+
+    for angle, joint in zip(q, JOINTS):
+        joint_t = link_transforms[joint["parent"]] @ joint["local0"]
+        child_t = joint_t @ _axis_rotation(joint["axis"], angle) @ np.linalg.inv(joint["local1"])
+        joint_frames[joint["name"]] = joint_t
+        link_transforms[joint["child"]] = child_t
+
+    link6 = link_transforms[JOINTS[-1]["child"]]
+    handle_axis = link6[:3, :3] @ TOOL_AXIS_IN_LINK6
+    handle_axis = handle_axis / np.linalg.norm(handle_axis)
+    tcp = link6[:3, 3] + tcp_distance * handle_axis
+
+    return {
+        "q": q,
+        "tcp": tcp,
+        "handle_axis": handle_axis,
+        "joint_frames": joint_frames,
+        "link_transforms": link_transforms,
+    }
 
 EVENT_TOPICS = (
     "/tennis/status",
@@ -105,17 +254,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bag", type=Path, required=True, help="rosbag 目录（含 metadata.yaml）")
     parser.add_argument("--output", type=Path, required=True, help="输出 arm JSON 路径")
-    parser.add_argument(
-        "--arm-src", type=Path, default=DEFAULT_ARM_SRC,
-        help="tennis-man arm_controller 的 src 目录（提供 FK）",
-    )
     args = parser.parse_args()
-
-    if not (args.arm_src / "arm_controller").is_dir():
-        raise FileNotFoundError(f"arm_controller package not found under: {args.arm_src}")
-    sys.path.insert(0, str(args.arm_src))
-
-    from arm_controller.compact_arm_kinematics import SHORT_JOINT_NAMES, fk  # noqa: E402
 
     import rosbag2_py  # noqa: E402
     from rclpy.serialization import deserialize_message  # noqa: E402
@@ -399,7 +538,7 @@ def main() -> int:
         },
         "clock_sync": clock_sync,
         "bag_dir": str(args.bag.resolve()),
-        "fk_source": "arm_controller.compact_arm_kinematics.fk",
+        "fk_source": "extract_arm_bag.fk",
         "start_ns": start_ns,
         "duration_sec": round((end_ns - start_ns) / 1e9, 4),
         "joint_names": list(joint_names),
