@@ -542,7 +542,7 @@ const alignWarnHtml = alignBad
 const rkPredStage = RK ? ys(RK.pred,'stage') : [];
 const rkPredDurMs = (RK ? ys(RK.pred,'duration') : []).map(v=>isNum(v)?v*1000:null);
 // 分抛：按 ht_rel 聚类 RK 预测消息，取每抛最终 ht（击球时刻，RK 轴）+ 最后一条 ref 值
-const REF_LEAD_TARGET=0.3;  // 降级表选 ref 的目标提前量（s）：臂端执行需要 ~300ms 窗口（0715 用户定标）
+const REF_LEAD_TARGET=0.3;  // 北极星表选 ref/ht 的目标提前量（s）：臂端执行需要 ~300ms 窗口（0715 用户定标）
 const rkThrows = (()=>{
   if(!RK) return [];
   const t=ts(RK.pred), ht=ys(RK.pred,'ht_rel');
@@ -561,12 +561,13 @@ const rkThrows = (()=>{
         // 也不取"最后一条"——其提前量 = 尾部消息间隙，随断流在 24~187ms 抖（0715 上午场实测）。
         // 且只认 S1：S0 的 rel 是固定 target 占位（1.0/1.15，rel_src=target），不是预测；
         // 臂端也只接受 stage=1。按臂端执行窗口选 S1 中提前量最接近 REF_LEAD_TARGET(300ms) 的那条。
+        // 该条消息自带的 ht（preHt）即北极星表统一的 ht 列（0716 定稿：预测时刻准不准就看它）。
         const lead=ht[i]-ti;
         if(lead>0 && Number(rkPredStage[i])===1){
           const dev=Math.abs(lead-REF_LEAD_TARGET);
           if(th.preRefT==null || dev<th.preLeadDev){
             th.preStage=rkPredStage[i]; th.preRel_x=relx[i]; th.preRel_z=relz[i];
-            th.preRefT=ti; th.preLeadDev=dev;
+            th.preRefT=ti; th.preLeadDev=dev; th.preHt=ht[i];
           }
         }
       }
@@ -575,7 +576,7 @@ const rkThrows = (()=>{
       upd(cur);
     } else {
       const th={ht:ht[i], firstT:ti, lastT:ti, msgs:0, stage:null, rel_x:null, rel_y:null, rel_z:null, lastRelIdx:null, refT:null,
-                preStage:null, preRel_x:null, preRel_z:null, preRefT:null, preLeadDev:null};
+                preStage:null, preRel_x:null, preRel_z:null, preRefT:null, preLeadDev:null, preHt:null};
       upd(th);
       out.push(th);
     }
@@ -609,8 +610,10 @@ const rkTruthAt = tRk => {
 // PC 真值下"球与车在 y 向相会"的时刻（PC 报告轴）：ht 附近 ±0.6s 内
 // rel_y 首次由正下穿 0 的线性插值。只取第一次下行穿越 → 击打后反弹（y 反向）
 // 不会污染；要求来球速度 >1 m/s、穿越两侧观测间隔 ≤0.3s（遮挡断档过大不给）。
-const truthMeetAt = tPcApprox => {
-  const lo=tPcApprox-0.6, hi=tPcApprox+0.6;
+// cutHi（命中行传触球时刻）：穿越两点必须全在触球 20ms 之前——触球邻域的观测
+// 可能已被击打改道（与 PC真值入弧口径一致），近触球穿越一律交给外推降级。
+const truthMeetAt = (tPcApprox, cutHi) => {
+  const lo=tPcApprox-0.6, hi=Math.min(tPcApprox+0.6, cutHi!=null?cutHi-0.02:Infinity);
   let prev=null;
   for(const p of pcRows){
     if(p.t<lo) continue;
@@ -629,22 +632,79 @@ const truthMeetAt = tPcApprox => {
   }
   return null;
 };
-// 拟合真值：插值真值被观测断档卡住时的降级（仅球未被触碰的行：脱拍/未挥拍，调用方负责判定）。
-// 断档两侧属于同一段自由飞行弧 ⇒ 两侧观测可合法共拟：x/y 线性、z 重力约束抛物线
-// （z+g/2·τ² 对 τ 线性回归，等效固定 z̈=−9.81；0716 #2/#3/#8 实测残差 1–2mm）。
-// 单弧保障：窗口 ±0.75s 先在 z<0.12m 观测处截断（可见触地）；拟合后按 max|Δz|≤35mm、
-// max|Δx|≤50mm 门控，不过门则在最大"非跨触球"断档处截掉远离触球的一段重拟（触地本身
-// 藏在断档里的场景，0716 #8 教训），最多两次，再不过就放弃（真值宁缺毋滥）。
-// 两侧各 ≥1 点夹住触球（拒绝单侧外推），总点数 ≥6。
-// 返回车体系 {x,y,z,gap,err,resMax}（与 rkTruthAt 同口径，z 为世界高度）：
-//   gap = 跨触球断档宽度；resMax = max|拟合残差|；
-//   err = 拟合值在触球时刻的 1σ 位置误差 = LS 预测标准误 ⊕ 未建模气动项
-//         （阻力+马格努斯 ~1.5 m/s² 量级，×到最近观测时距²/2——触球通常离一侧观测仅
-//         十几 ms，此项近零；不含 rkOffset 对时误差，那份插值真值同样有，不属拟合特有）。
-const fitTruthAt = tPc => {
+// pc相会t 外推降级（0716 用户定稿）：命中行球常在触球前 2~16cm 被拍截住打回（0716 早场 6/10 行
+// 实测 minRy +0.022~+0.159m），rel_y 从未过 0——"相会"物理上没发生，直接插值必然给不出；
+// 穿越处断档 >0.3s 时同样缺失。此时用触球/断档前最后一段逼近观测（ry>0、间隔 ≤0.2s，
+// 取尾部 ≤8 点、≥3 点）对 rel_y(t) 线性最小二乘，解 ry=0 得"球本来会到达的时刻"：
+// 外推跨度 ≤0.35s 才给（来球 >1 m/s 时对应 <35cm，单弧内 y 近匀速，线性外推安全），
+// 黄标"±Mms(外推Nms)"注明 1σ 时刻误差与外推跨度。cutT = 触球时刻（命中行防击打后反弹
+// 观测混入外推段；无触球传 null）。
+const fitMeetAt = (tPcApprox, cutT) => {
+  const lo=tPcApprox-0.6, hi=Math.min(tPcApprox+0.6, cutT!=null?cutT-0.02:Infinity);
+  let run=[];
+  for(const p of pcRows){
+    if(p.t<lo) continue;
+    if(p.t>hi) break;
+    const c=carAt(p.t);
+    if(!c) continue;
+    const ry=relToCar(p,c).y;
+    if(ry<=0) break;                                   // 逼近段到穿越为止（直接插值已判过失败）
+    if(run.length && p.t-run[run.length-1].t>0.2) run=[];
+    run.push({t:p.t, ry});
+  }
+  if(run.length<3) return null;
+  const seg=run.slice(-8);
+  const n=seg.length, t0=seg[0].t;
+  let st=0,sv=0,stt=0,stv=0;
+  seg.forEach(q=>{ const u=q.t-t0; st+=u; sv+=q.ry; stt+=u*u; stv+=u*q.ry; });
+  const den=n*stt-st*st;
+  if(Math.abs(den)<1e-9) return null;
+  const b=(n*stv-st*sv)/den, a=(sv*stt-st*stv)/den;    // ry ≈ a + b·(t−t0)
+  if(b>=-1.0) return null;                             // 与直接判同门限：来球 y 速 >1 m/s
+  const tMeet=t0-a/b;
+  const last=seg[n-1], ext=tMeet-last.t;
+  if(ext<-0.02 || ext>0.35) return null;
+  // 1σ 时刻误差（与 fitTruthAt 同口径，除以来球速折成时间）：
+  // LS 均线在穿越点的预测标准误 ⊕ 未建模 y 减速（气动 ~1.5 m/s²）×外推跨度²/2，
+  // 下限取 max|残差|（对外宣称不低于模型对数据的实际解释能力）。实测量级 ±2~8ms。
+  const mean=st/n, sxx=stt-st*st/n;
+  let ss=0, rmax=0;
+  seg.forEach(q=>{ const r=a+b*(q.t-t0)-q.ry; ss+=r*r; rmax=Math.max(rmax,Math.abs(r)); });
+  const uStar=tMeet-t0;
+  const sePred=Math.sqrt(ss/Math.max(1,n-2)*(1/n+(uStar-mean)*(uStar-mean)/sxx));
+  const eModel=0.75*ext*ext;                           // ½·(~1.5 m/s²)·ext²（m）
+  const errT=Math.max(Math.sqrt(sePred*sePred+eModel*eModel), rmax)/(-b);
+  return {t:tMeet, ext:Math.max(ext,0), err:errT, lastRy:last.ry, n};
+};
+// pc相会t 统一入口：先直接插值（无标），缺了走外推（黄标，悬停给依据）。
+// cutDirect=true（命中行）：直接穿越也截到触球前——两点有一点落在触球邻域就不算直接，
+// 走外推；false/缺省（未挥拍/降级）：直接穿越不截（球未被碰时触球后观测干净合法）。
+const meetAt = (tPcApprox, cutT, cutDirect) => {
+  const direct=truthMeetAt(tPcApprox, cutDirect?cutT:null);
+  if(direct!=null) return {t:direct, tag:''};
+  const f=fitMeetAt(tPcApprox, cutT);
+  if(!f) return null;
+  return {t:f.t, tag:` <span style="color:#fbbf24" title="外推相会：真值球在触球/断档前未过 rel_y=0（最后观测距车 y 向还有 ${Math.round(f.lastRy*1000)}mm），由此前 ${f.n} 点 rel_y 线性外推 ${Math.round(f.ext*1000)}ms 得到的到达时刻；± 为 1σ 时刻误差 =（LS 预测标准误 ⊕ 未建模气动减速×跨度²/2，下限 max|残差|）÷ 来球速">±${Math.max(1,Math.round(f.err*1000))}ms(外推${Math.round(f.ext*1000)}ms)</span>`};
+};
+// 拟合真值：插值真值不可用/不可信时的降级。两种模式——
+// ① 双侧共拟（cutHi 不传；仅球未被触碰的行：脱拍/未挥拍，调用方负责判定）：
+//    断档两侧属于同一段自由飞行弧 ⇒ 两侧观测可合法共拟，跨断档内插，两侧各 ≥1 点夹住触球、总点数 ≥6；
+// ② 入弧单侧外推（cutHi = 触球前截止时刻，0716 用户定稿）：命中行触球后观测已被击打改道，
+//    跨击插值有 ~10mm 级 x/z 拐点偏差 ⇒ 只用触球前入弧观测拟合、外推到触球时刻
+//    （与 pc相会外推同哲学）；点数 ≥5、外推跨度 ≤0.35s 才给。
+// 共同：x/y 线性、z 重力约束抛物线（z+g/2·τ² 对 τ 线性回归，等效固定 z̈=−9.81；
+// 0716 #2/#3/#8 实测残差 1–2mm）。窗口 ±0.75s 先在 z<0.12m 观测处截断（可见触地）；
+// 拟合后按 max|Δz|≤35mm、max|Δx|≤50mm 门控，不过门则在最大"非跨触球"断档处截掉
+// 远离触球的一段重拟（触地本身藏在断档里的场景，0716 #8 教训），最多两次，再不过就放弃（宁缺毋滥）。
+// 返回车体系 {x,y,z,gap,err,resMax,dNear,oneSided}（与 rkTruthAt 同口径，z 为世界高度）：
+//   gap = 跨触球断档宽度（单侧模式 = 触球距最后观测）；resMax = max|拟合残差|；
+//   dNear = 触球距最近观测时距（误差主源）；err = 1σ 位置误差 = LS 预测标准误 ⊕ 未建模气动项
+//         （阻力+马格努斯 ~1.5 m/s² 量级，×dNear²/2），下限 max|残差|
+//         （不含 rkOffset 对时误差，那份插值真值同样有，不属拟合特有）。
+const fitTruthAt = (tPc, cutHi) => {
   const c=carAt(tPc);
   if(!c) return null;
-  let win=pcRows.filter(p=>Math.abs(p.t-tPc)<=0.75);
+  let win=pcRows.filter(p=>Math.abs(p.t-tPc)<=0.75 && (cutHi==null || p.t<=cutHi));
   let loT=-Infinity, hiT=Infinity;
   win.forEach(p=>{
     if(p.z<0.12){
@@ -662,7 +722,9 @@ const fitTruthAt = tPc => {
   };
   for(let attempt=0; attempt<3; attempt++){
     const pre=win.filter(p=>p.t<tPc), post=win.filter(p=>p.t>=tPc);
-    if(win.length<6 || !pre.length || !post.length) return null;
+    if(cutHi!=null){                                   // 入弧单侧外推：点数 ≥5、外推跨度 ≤0.35s
+      if(pre.length<5 || tPc-pre[pre.length-1].t>0.35) return null;
+    } else if(win.length<6 || !pre.length || !post.length) return null;
     const ts=win.map(p=>p.t-tPc);
     const fx=reg(ts,win.map(p=>p.x));
     const fy=reg(ts,win.map(p=>p.y));
@@ -675,7 +737,7 @@ const fitTruthAt = tPc => {
       xMax=Math.max(xMax,Math.abs(fx[0]+fx[1]*ts[i]-p.x));
     });
     if(zMax<=0.035 && xMax<=0.05){
-      const gap=post[0].t-pre[pre.length-1].t;
+      const gap=post.length ? post[0].t-pre[pre.length-1].t : tPc-pre[pre.length-1].t;
       const n=ts.length;
       let mean=0; ts.forEach(t=>mean+=t); mean/=n;
       let sxx=0; ts.forEach(t=>sxx+=(t-mean)*(t-mean));
@@ -686,14 +748,14 @@ const fitTruthAt = tPc => {
       };
       const seX=se(win.map((p,i)=>fx[0]+fx[1]*ts[i]-p.x));
       const seZ=se(win.map((p,i)=>zAt(ts[i])-p.z));
-      const dNear=Math.min(tPc-pre[pre.length-1].t, post[0].t-tPc);
+      const dNear=post.length ? Math.min(tPc-pre[pre.length-1].t, post[0].t-tPc) : tPc-pre[pre.length-1].t;
       const eModel=0.75*dNear*dNear;   // ½·(~1.5 m/s² 未建模气动)·d²
       const seMax=Math.max(seX,seZ);
       const resMax=Math.max(zMax,xMax);
       // 显示误差下限取 max|残差|：统计上均值估计可优于单点散布，但对外宣称
       // 不应低于模型对数据的实际解释能力（防"跨 0.3s 断档标 ±1mm"式过度自信）
       const err=Math.max(Math.sqrt(seMax*seMax+eModel*eModel), resMax);
-      return {...relToCar({x:fx[0],y:fy[0],z:zAt(0)},c), gap, err, resMax};
+      return {...relToCar({x:fx[0],y:fy[0],z:zAt(0)},c), gap, err, resMax, dNear, oneSided:cutHi!=null};
     }
     let gi=-1, gmax=0;
     for(let i=1;i<win.length;i++){
@@ -862,56 +924,78 @@ const armFeedbackIn = (loRk, hiRk) => {
   return {preds, accepts, rej:[...rej.entries()]};
 };
 // 每抛对比表：按场次数据自动选版式（0716 用户定稿）——
-// ① 有真实挥拍（armHitMarks 含 hit）→ 完整版（0713 版式）：
-//    # | ht acc | 触球t | Δht | 相会t | Δ相会 | 最后accepted x/z | PC真值 x/z | FK@触球 x/z
+// 时间列三版式统一（0716 定稿）只留三列：ht | pc相会t | Δt。
+//   ht = 击球前提前量最接近 300ms 的 S1 预测自带的 ht（preHt，与降级表 ref 同一条消息；
+//        ≈臂最后 accepted 的合同；无S1 时 ~ 前缀退回 RK 最终 ht）；
+//   pc相会t = PC 真值球↔车 y 相会时刻（直接穿越缺失时由触球前 rel_y 线性外推，黄标）；
+//   Δt = ht − pc相会t（预测时刻误差）。
+//   触球时刻（新调度≡ht_acc 代码恒等；旧调度 = accepted 到达+duration）不再单列，
+//   只作真值/FK/视觉/结果列的取样锚；旧 ht acc/触球t/Δht/Δ相会 列全部删除。
+// ① 有真实挥拍（armHitMarks 含 hit）→ 完整版：
+//    # | ht | pc相会t | Δt | 最后accepted x/z | PC真值 x/z | FK@触球 x/z
 //      | FK y | 视觉拍心 x/z | 视觉 y | dx | dz | 更新数 | 结果 | 备注
 // ② 臂在线但整场无挥拍 → 精简版（0713 用户定稿）：
-//    # | ht acc | 相会t | Δ相会 | 最后accepted x/z | PC真值 x/z | FK@触球 x/z | dx/dz | 结果 | 备注
+//    # | ht | pc相会t | Δt | 最后accepted x/z | PC真值 x/z | FK@触球 x/z | dx/dz | 结果 | 备注
 //    （全为未挥拍行，触球细分/视觉拍心列必为空，砍掉更干净）
 // ③ 无臂端数据（bag 缺 /joint_states → ARM=null，0715 臂控未启动场次）→ 降级：
 //    北极星退化为 "RK 预测 ref（击球前提前量最接近 300ms 的一条 rel_x/rel_z，臂本应执行的目标）
 //    ↔ PC 真值@ht" 差值，只依赖 RK pred + PC 观测，臂列全部省略。
 // 共同语义：行 = RK 上每一次真实抛球（predict ≥3 条），与臂端击打按 |done−ht|<0.5s 配对；
-// 触球 = 计划触球时刻（新调度≡ht_acc 代码恒等；旧调度 = accepted 到达+duration，同在 RK 轴）；
-// Δ相会 = 触球 − 真值球↔车 y 相会时刻（相会只取击打前下行穿越，反弹不污染）；
-// 真值取触球（未击打行取 ht）同一时刻；FK z 按 armZOff 还原世界高度。
+// 真值取触球（未击打行取 RK 最终 ht）同一时刻；命中行 PC真值 = 入弧单侧外推为主
+// （触球后观测已被击打改道，跨击插值仅退路），脱拍/未挥拍行 = 两侧插值/双侧共拟；
+// 凡外推/拟合值黄标"±误差(外推/断档 跨度)"（0716 用户原则：标注外推了多久、误差多大）；
+// FK z 按 armZOff 还原世界高度。
 const hitTableHtml = () => {
   const fmt=(v,d)=>v==null?'—':Number(v).toFixed(d);
   const xz=(x,z)=>(x==null||z==null)?'—':`${Number(x).toFixed(3)}/${Number(z).toFixed(3)}`;
   const sgn=v=>`${v>=0?'+':''}${v.toFixed(0)}`;
-  // 拟合真值黄标：±N = 跨触球断档宽度；悬停给 rel_y（触球时刻球距车 y 向还有多远）
-  const fitTag = f => ` <span style="color:#fbbf24" title="拟合真值（单弧内 x/y 线性 + z 重力约束）；±为 1σ 位置误差（LS 预测标准误 ⊕ 未建模气动×最近观测时距²/2）；跨触球断档 ${Math.round(f.gap*1000)}ms，max|残差| ${Math.round(f.resMax*1000)}mm；rel_y=${f.y>=0?'+':''}${f.y.toFixed(3)}m">拟±${Math.max(1,Math.round(f.err*1000))}mm</span>`;
-  const fitNote = 'PC真值黄标"拟±Nmm" = 触球两侧观测断档超插值门限（0.12s）时的单弧拟合降级：x/y 线性 + z 重力约束抛物线、两侧观测共拟（max|Δz|≤35mm 门控，触地藏断档里则自动截窗）；仅球确认未被打回的行（脱拍/未挥拍）；±N 为拟合值 1σ 位置误差（不含 rkOffset 对时误差，插值真值同样有），跨越断档宽度/最大残差/rel_y 看悬停';
+  // ht 列三版式统一取值链：preHt（击球前 ~300ms 的 S1 预测）→ htAcc（臂最后 accepted 合同）
+  // → RK 最终 ht（~ 前缀标降级）；返回 {pc: 报告轴时刻, cell: 单元格文本}
+  const htPcCell=(th,htAcc)=>{
+    const rk=th.preHt!=null?th.preHt:(htAcc!=null?htAcc:th.ht);
+    const pc=rk+rkOffset;
+    return {pc, cell:(th.preHt!=null||htAcc!=null)?pc.toFixed(2):`~${pc.toFixed(2)}`};
+  };
+  // 拟合/外推真值黄标"±Nmm(外推Mms)"或"±Nmm(断档Mms)"：N = 1σ 位置误差；
+  // 命中行入弧单侧外推标外推跨度，脱拍/未挥拍双侧共拟标跨触球断档宽；残差/rel_y 看悬停
+  const fitTag = f => f.oneSided
+    ? ` <span style="color:#fbbf24" title="入弧外推真值（单弧 x/y 线性 + z 重力约束，只用触球前观测，外推 ${Math.round(f.dNear*1000)}ms 至触球——触球后观测已被击打改道不可用）；± 为 1σ 位置误差（LS 预测标准误 ⊕ 未建模气动×外推²/2，下限 max|残差| ${Math.round(f.resMax*1000)}mm）；rel_y=${f.y>=0?'+':''}${f.y.toFixed(3)}m">±${Math.max(1,Math.round(f.err*1000))}mm(外推${Math.round(f.dNear*1000)}ms)</span>`
+    : ` <span style="color:#fbbf24" title="拟合真值（单弧 x/y 线性 + z 重力约束，两侧观测跨断档共拟内插）；± 为 1σ 位置误差（LS 预测标准误 ⊕ 未建模气动×最近观测时距 ${Math.round(f.dNear*1000)}ms 的平方/2，下限 max|残差| ${Math.round(f.resMax*1000)}mm）；跨触球断档 ${Math.round(f.gap*1000)}ms；rel_y=${f.y>=0?'+':''}${f.y.toFixed(3)}m">±${Math.max(1,Math.round(f.err*1000))}mm(断档${Math.round(f.gap*1000)}ms)</span>`;
+  const interpTag = ` <span style="color:#fbbf24" title="跨击插值：入弧外推不可得（触球前观测不足），退回击打拐点两侧观测线性插值——x/z 受击打瞬间速度突变影响，额外 ~10mm 量级偏差">跨击插值</span>`;
+  const fitNote = 'PC真值黄标"±Nmm(外推Mms/断档Mms)" = 非直接插值真值：命中行触球后观测已被击打改道，一律只用触球前入弧观测单弧拟合、外推 M ms 至触球（入弧点不足时退回跨击插值，黄标注明）；脱拍/未挥拍行两侧断档超插值门限（0.12s）时双侧共拟、跨 M ms 断档内插；±N 为 1σ 位置误差（LS 预测标准误 ⊕ 未建模气动，下限 max|残差|；不含 rkOffset 对时误差，插值真值同样有）；细节看悬停';
   if(!ARM){
     const ths=rkThrows.filter(t=>(t.msgs||0)>=3).sort((a,b)=>a.ht-b.ht);
     if(!ths.length) return '';
     const degRows=ths.map((th,idx)=>{
-      const meetT=truthMeetAt(th.ht+rkOffset);
+      // cutT=ht：无臂数据不知球有没有被打——若实际有挥拍（臂控在跑只是没录 bag），
+      // 反弹观测会混进外推段被斜率门拦成 '—'；按 RK ht（本应触球时刻）截掉即可两头兼顾。
+      const meet=meetAt(th.ht+rkOffset, th.ht+rkOffset);
       const tru=rkTruthAt(th.ht);
       const fitTru=(!tru && strikeAfter(th.ht+rkOffset).hit===false) ? fitTruthAt(th.ht+rkOffset) : null;
       const truEff=tru||fitTru;
       const dx=(isNum(th.preRel_x)&&truEff)?(th.preRel_x-truEff.x)*1000:null;
       const dz=(isNum(th.preRel_z)&&truEff)?(th.preRel_z-truEff.z)*1000:null;
-      return `<tr><td>${idx+1}</td><td>${(th.ht+rkOffset).toFixed(2)}</td>`+
-        `<td>${meetT!=null?meetT.toFixed(2):'—'}</td>`+
-        `<td>${meetT!=null?sgn((th.ht+rkOffset-meetT)*1000):'—'}</td>`+
+      const htc=htPcCell(th,null);
+      return `<tr><td>${idx+1}</td><td>${htc.cell}</td>`+
+        `<td>${meet?meet.t.toFixed(2)+meet.tag:'—'}</td>`+
+        `<td>${meet?sgn((htc.pc-meet.t)*1000):'—'}</td>`+
         `<td>${xz(th.preRel_x,th.preRel_z)}</td>`+
         `<td>${tru?xz(tru.x,tru.z):(fitTru?xz(fitTru.x,fitTru.z)+fitTag(fitTru):'—')}</td>`+
         `<td>${(dx!=null&&dz!=null)?`${sgn(dx)}/${sgn(dz)}`:'—'}</td>`+
-        `<td>${isNum(th.preRefT)?Math.round((th.ht-th.preRefT)*1000):'—'}</td>`+
+        `<td>${isNum(th.preRefT)?Math.round((th.preHt-th.preRefT)*1000):'—'}</td>`+
         `<td>${th.preStage!=null?`S${th.preStage}`:'<span style="color:#fbbf24">无S1</span>'}×${th.msgs||0}</td></tr>`;
     });
     const degNotes=[
       '无臂端数据（bag 缺 /joint_states，臂控未上线）：降级为 RK 预测 ref ↔ PC 真值对比',
-      '行 = RK 每次真实抛球（predict ≥3 条）；ht = RK 最终预测击球时刻（已加 RK offset 到报告轴）',
-      '相会t = 真值下球 rel_y 首次由正下穿 0（只取击打前下行穿越，防反弹污染）；Δht = ht − 相会t（预测时刻误差）',
+      '行 = RK 每次真实抛球（predict ≥3 条）；ht = 击球前提前量最接近 300ms 的 S1 预测的 ht（与 ref 同一条消息；无S1 时 ~ 前缀退回 RK 最终 ht；已加 RK offset 到报告轴）',
+      'pc相会t = PC 真值下球 rel_y 首次由正下穿 0（只取击打前下行穿越，防反弹污染）；穿越缺失（被截住/断档）时黄标"±Mms(外推Nms)" = 由此前 rel_y 线性外推 N ms 的到达时刻、±M 为 1σ 时刻误差（拟合标准误⊕未建模气动，÷来球速折时间，实测 ±2~8ms）；Δt = ht − pc相会t（预测时刻误差，正=预测偏晚）',
       'RK ref = 该抛击球前 S1 消息中提前量最接近 300ms 的 rel_x/rel_z（臂端执行窗口 ~300ms 且只接受 S1；S0 的 rel 是固定 target 占位不算 ref，ht 后的马后炮消息不算）',
       '预测列"无S1" = 该抛击球前没有任何 S1 预测（臂端必然全拒），ref/dx/dz 无从谈起',
       'dx/dz = RK ref − PC真值@ht（PC 四目真值在 ht 时刻转车体系）',
       'ref提前 = ht − 该 ref 消息的计算时刻 ct（最终目标用的是提前多少 ms 的数据定的）',
       fitNote,
     ];
-    return `<div class="armTblWrap"><table class="armTbl"><thead><tr><th>#</th><th>ht(s)</th><th>相会t(s)</th><th>Δht(ms)</th>`+
+    return `<div class="armTblWrap"><table class="armTbl"><thead><tr><th>#</th><th>ht(s)</th><th>pc相会t(s)</th><th>Δt(ms)</th>`+
       `<th>RK ref x/z(m)</th><th>PC真值 x/z(m)</th><th>dx/dz(mm)</th><th>ref提前(ms)</th><th>预测</th></tr></thead>`+
       `<tbody>${degRows.join('')}</tbody></table>`+
       `<div style="font-size:11px;color:#a0a0c0;margin:2px 0 6px">${degNotes.join('；')}。</div></div>`;
@@ -930,94 +1014,56 @@ const hitTableHtml = () => {
     if(best) usedHit.add(best);
     return best;
   };
-  // ② 精简版（0713 定稿版式）：臂在线但整场无挥拍时使用
+  // ② 精简版（0713 定稿版式）：臂在线但整场无挥拍时使用。该版式只在 hits 为空时被选中
+  // （见文末版式选择），全为未挥拍行——不含命中分支，FK@触球/dx/dz 列结构性恒空。
   const simpleTable = () => {
   const rows=[];
   realThrows.forEach((th,idx)=>{
-    const k=idx+1;
-    const h=hitFor(th);
     const winLo=(isNum(th.firstT)?th.firstT:th.ht-3)-0.2;
     const winHi=Math.max(isNum(th.lastT)?th.lastT:th.ht, th.ht)+0.5;
     const fb=armFeedbackIn(winLo, winHi);
-    const meetT=truthMeetAt(th.ht+rkOffset);   // 真值球↔车 y 相会（PC 轴）
-    if(h){
-      const doneRk=h.done;
-      const htAcc=(h.wht!=null && RK && isNum(RK.t0)) ? h.wht-RK.t0 : null;  // 最后 accepted 的 ht（RK 轴）
-      // 触球锚点：新调度触球≡ht_acc（代码恒等，零桥）；旧调度只能用 bag 映射的 done。
-      const contactRk=(armNewSched && htAcc!=null) ? htAcc : doneRk;
-      const contactPc=contactRk+rkOffset;
-      const tru=rkTruthAt(contactRk);
-      const tcp=tcpAt(h.done);   // FK：done 与 states 同轴（RK 单调钟），无桥
-      const tgtX=h.wx!=null?h.wx:h.tx;
-      const tgtZ=h.wz!=null?h.wz:(armZOff!=null&&h.tz!=null?h.tz-armZOff:h.tz);
-      const tcpW=tcp?[tcp[0],tcp[2]-(armZOff!=null?armZOff:0)]:null;
-      const sk=strikeAfter(contactPc);
-      const skColor=sk.hit===true?'#2dd4bf':(sk.hit===false?'#f87171':'#a0a0c0');
-      const dx=(tcpW&&tru)?(tcpW[0]-tru.x)*1000:null;
-      const dz=(tcpW&&tru)?(tcpW[1]-tru.z)*1000:null;
-      const note=(sk.hit===false && dz!=null && Math.abs(dz)>=30)
-        ? `拍${dz>0?'高':'低'}了 ~${Math.round(Math.abs(dz)/10)}cm` : '';
-      rows.push(`<tr><td>${k}</td><td>${htAcc!=null?(htAcc+rkOffset).toFixed(2):`~${(th.ht+rkOffset).toFixed(2)}`}</td>`+
-        `<td>${meetT!=null?meetT.toFixed(2):'—'}</td>`+
-        `<td>${meetT!=null?sgn((contactPc-meetT)*1000):'—'}</td>`+
-        `<td>${xz(tgtX,tgtZ)}</td>`+
-        `<td>${tru?xz(tru.x,tru.z):'—'}</td>`+
-        `<td>${tcpW?xz(tcpW[0],tcpW[1]):'—'}</td>`+
-        `<td>${dx!=null?`${sgn(dx)}/${sgn(dz)}`:'—'}</td>`+
-        `<td style="color:${skColor}">${sk.verdict}</td><td>${note}</td></tr>`);
-    } else {
-      const tru=rkTruthAt(th.ht);
-      const fitTru=(!tru && strikeAfter(th.ht+rkOffset).hit===false) ? fitTruthAt(th.ht+rkOffset) : null;
-      let reason;
-      if(!fb) reason='无臂端 bag';
-      else if(!fb.preds) reason='臂端未收到预测';
-      else if(fb.accepts) reason=`accepted ${fb.accepts} 条但无挥拍（异常）`;
-      else {
-        const xr=fb.rej.find(([kk])=>/^x 低于下限/.test(kk));
-        const other=fb.rej.filter(([kk])=>kk!=='stage≠1');
-        if(xr){
-          const mm=/^x ([\-0-9.]+)m is below min ([\-0-9.]+)m/.exec(xr[1].last);
-          const lim=mm?mm[2]:'?', lastX=mm?mm[1]:null;
-          reason=(lastX!=null && isNum(th.rel_x) && Number(th.rel_x)>=Number(lim))
-            ? `ref ${fmt(th.rel_x,3)} 低于下限（最后 x=${lastX}）`
-            : `ref ${fmt(th.rel_x,3)} 低于 x 下限 ${lim}`;
-        } else if(other.length){
-          reason=other.map(([kk,r])=>`${kk}×${r.n}`).join('；');
-        } else {
-          reason='全程 stage≠1（未见 S1）';
-        }
+    const meet=meetAt(th.ht+rkOffset, null);   // pc相会（未挥拍：无触球截断，断档才外推）
+    const tru=rkTruthAt(th.ht);
+    const fitTru=(!tru && strikeAfter(th.ht+rkOffset).hit===false) ? fitTruthAt(th.ht+rkOffset) : null;
+    let reason;
+    if(!fb) reason='无臂端 bag';
+    else if(!fb.preds) reason='臂端未收到预测';
+    else if(fb.accepts) reason=`accepted ${fb.accepts} 条但无挥拍（异常）`;
+    else {
+      const xr=fb.rej.find(([kk])=>/^x 低于下限/.test(kk));
+      const other=fb.rej.filter(([kk])=>kk!=='stage≠1');
+      if(xr){
+        const mm=/^x ([\-0-9.]+)m is below min ([\-0-9.]+)m/.exec(xr[1].last);
+        const lim=mm?mm[2]:'?', lastX=mm?mm[1]:null;
+        reason=(lastX!=null && isNum(th.rel_x) && Number(th.rel_x)>=Number(lim))
+          ? `ref ${fmt(th.rel_x,3)} 低于下限（最后 x=${lastX}）`
+          : `ref ${fmt(th.rel_x,3)} 低于 x 下限 ${lim}`;
+      } else if(other.length){
+        reason=other.map(([kk,r])=>`${kk}×${r.n}`).join('；');
+      } else {
+        reason='全程 stage≠1（未见 S1）';
       }
-      rows.push(`<tr><td>${k}</td><td>~${(th.ht+rkOffset).toFixed(2)}</td>`+
-        `<td>${meetT!=null?meetT.toFixed(2):'—'}</td><td>—</td>`+
-        `<td>—(未接受)</td>`+
-        `<td>${tru?xz(tru.x,tru.z):(fitTru?xz(fitTru.x,fitTru.z)+fitTag(fitTru):'—')}</td>`+
-        `<td>—</td><td>—</td>`+
-        `<td>未挥拍</td><td style="color:#fbbf24">${reason}</td></tr>`);
     }
+    const htc=htPcCell(th,null);
+    rows.push(`<tr><td>${idx+1}</td><td>${htc.cell}</td>`+
+      `<td>${meet?meet.t.toFixed(2)+meet.tag:'—'}</td>`+
+      `<td>${meet?sgn((htc.pc-meet.t)*1000):'—'}</td>`+
+      `<td>—(未接受)</td>`+
+      `<td>${tru?xz(tru.x,tru.z):(fitTru?xz(fitTru.x,fitTru.z)+fitTag(fitTru):'—')}</td>`+
+      `<td>—</td><td>—</td>`+
+      `<td>未挥拍</td><td style="color:#fbbf24">${reason}</td></tr>`);
   });
-  // 未对齐（v2 旧文件或缺 RK 数据）时退回：只列臂端击打本身
-  if(!armAligned){
-    hits.forEach((h,i)=>{
-      const tcp=tcpAt(h.done);
-      const tgtX=h.wx!=null?h.wx:h.tx, tgtZ=h.wz!=null?h.wz:h.tz;
-      rows.push(`<tr><td>${i+1}</td><td>—</td><td>—</td><td>—</td>`+
-        `<td>${xz(tgtX,tgtZ)}</td><td>—</td>`+
-        `<td>${tcp?xz(tcp[0],tcp[2]):'—'}</td><td>—</td>`+
-        `<td>—</td><td>未对齐（需 v3 提取 + RK 数据）</td></tr>`);
-    });
-  }
   if(!rows.length) return '';
-  const strayHits=armAligned?hits.filter(h=>!usedHit.has(h)).length:0;
   const notes=[
-    `行 = RK 每次真实抛球（predict ≥3 条）${strayHits?`，另 ${strayHits} 次空挥未列`:''}`,
-    'ht acc = 最后 accepted 消息的 ht（未挥拍行 ~ 为 RK 最终 ht）',
-    armNewSched ? '新调度：触球≡ht acc（代码恒等，零桥）' : '旧调度：触球 = accepted 到达 + duration（到达时刻在 RK 轴，含 ~ms 传输抖动）',
-    '相会t = 真值下球 rel_y 首次由正下穿 0（只取击打前下行穿越，防反弹污染）；Δ相会 = 触球 − 相会t',
+    '行 = RK 每次真实抛球（predict ≥3 条）',
+    'ht = 击球前提前量最接近 300ms 的 S1 预测的 ht（臂端执行窗口 ~300ms 定标，≈最后 accepted 的合同；无S1 时 ~ 前缀退回 RK 最终 ht）',
+    'pc相会t = PC 真值下球 rel_y 首次由正下穿 0（只取击打前下行穿越，防反弹污染）；穿越缺失（被截住/断档）时黄标"±Mms(外推Nms)" = 由此前 rel_y 线性外推 N ms 的到达时刻、±M 为 1σ 时刻误差（拟合标准误⊕未建模气动，÷来球速折时间，实测 ±2~8ms）；Δt = ht − pc相会t（预测时刻误差，正=预测偏晚）',
+    armNewSched ? '触球（真值/FK 取样锚，不单列）：新调度≡最后 accepted 的 ht（代码恒等，零桥）' : '触球（真值/FK 取样锚，不单列）= accepted 到达 + duration（到达时刻在 RK 轴，含 ~ms 传输抖动）',
     `dx/dz = FK@触球 − PC真值@触球（世界系${armZOff!=null?`，FK z 已按 accepted−rel 中位 ${armZOff.toFixed(3)} 还原`:''}）`,
     '结果 = 触球后 0.8s 球 y 是否反向（地面反弹不改 y 向）',
     fitNote,
   ];
-  return `<div class="armTblWrap"><table class="armTbl"><thead><tr><th>#</th><th>ht acc(s)</th><th>相会t(s)</th><th>Δ相会(ms)</th>`+
+  return `<div class="armTblWrap"><table class="armTbl"><thead><tr><th>#</th><th>ht(s)</th><th>pc相会t(s)</th><th>Δt(ms)</th>`+
     `<th>最后accepted x/z(m)</th><th>PC真值 x/z(m)</th><th>FK@触球 x/z(m)</th><th>dx/dz(mm)</th><th>结果</th><th>备注</th></tr></thead>`+
     `<tbody>${rows.join('')}</tbody></table>`+
     `<div style="font-size:11px;color:#a0a0c0;margin:2px 0 6px">${notes.join('；')}。</div></div>`;
@@ -1034,42 +1080,49 @@ const hitTableHtml = () => {
     const winLo=(isNum(th.firstT)?th.firstT:th.ht-3)-0.2;
     const winHi=Math.max(isNum(th.lastT)?th.lastT:th.ht, th.ht)+0.5;
     const fb=armFeedbackIn(winLo, winHi);
-    const meetT=truthMeetAt(th.ht+rkOffset);   // 真值球↔车 y 相会（PC 轴）
     if(h){
       const doneRk=h.done;
       const htAcc=(h.wht!=null && RK && isNum(RK.t0)) ? h.wht-RK.t0 : null;  // 最后 accepted 的 ht（RK 轴）
       // 触球锚点：新调度触球≡ht_acc（代码恒等，零桥）；旧调度只能用 bag 映射的 done。
       const contactRk=(armNewSched && htAcc!=null) ? htAcc : doneRk;
       const contactPc=contactRk+rkOffset;
-      const tru=rkTruthAt(contactRk);
+      const meet=meetAt(th.ht+rkOffset, contactPc, true);   // pc相会（命中行：直接穿越/外推段都截到触球前）
       const tcp=tcpAt(h.done);   // FK：done 与 states 同轴（RK 单调钟），无桥
       const tgtX=h.wx!=null?h.wx:h.tx;
       const tgtZ=h.wz!=null?h.wz:(armZOff!=null&&h.tz!=null?h.tz-armZOff:h.tz);
       const tcpW=tcp?[tcp[0],tcp[2]-(armZOff!=null?armZOff:0)]:null;
       const vis=racketRelAt(contactPc);
       const sk=strikeAfter(contactPc);
-      // 脱拍（球未被打回）且插值真值被断档卡住 → 单弧拟合降级；命中行不降级（触球后观测已被击打污染）
-      const fitTru=(!tru && sk.hit===false) ? fitTruthAt(contactPc) : null;
-      const truEff=tru||fitTru;
+      // PC真值@触球：命中行触球后观测已被击打改道，跨击插值有 ~10mm 级拐点偏差 →
+      // 入弧单侧外推为主（与 pc相会同哲学），跨击插值仅退路（黄标注明）；
+      // 脱拍行球未被碰 → 两侧插值为主、断档时双侧共拟兜底（原逻辑）。
+      let truC=null, truTag='';
+      if(sk.hit===false){
+        truC=rkTruthAt(contactRk);
+        if(!truC){ const f=fitTruthAt(contactPc); if(f){ truC=f; truTag=fitTag(f); } }
+      } else {
+        const f=fitTruthAt(contactPc, contactPc-0.02);
+        if(f){ truC=f; truTag=fitTag(f); }
+        else { truC=rkTruthAt(contactRk); if(truC) truTag=interpTag; }
+      }
       const skColor=sk.hit===true?'#2dd4bf':(sk.hit===false?'#f87171':'#a0a0c0');
       const lateRej=fb?fb.rej.filter(([kk])=>kk!=='stage≠1'):[];
       const note=lateRej.length?('部分更新被拒：'+lateRej.map(([kk,r])=>`${kk}×${r.n}`).join('；')):'';
-      const dHt=htAcc!=null?((doneRk-htAcc)*1000).toFixed(0):null;
-      rows.push(`<tr><td>${k}</td><td>${htAcc!=null?(htAcc+rkOffset).toFixed(2):`~${(th.ht+rkOffset).toFixed(2)}`}</td>`+
-        `<td>${(contactPc).toFixed(2)}</td>`+
-        `<td>${dHt==null?'—':(armNewSched?`<span style="color:#64748b">(${dHt})</span>`:dHt)}</td>`+
-        `<td>${meetT!=null?meetT.toFixed(2):'—'}</td>`+
-        `<td>${meetT!=null?((contactPc-meetT)*1000).toFixed(0):'—'}</td>`+
+      const htc=htPcCell(th,htAcc);
+      rows.push(`<tr><td>${k}</td><td>${htc.cell}</td>`+
+        `<td>${meet?meet.t.toFixed(2)+meet.tag:'—'}</td>`+
+        `<td>${meet?sgn((htc.pc-meet.t)*1000):'—'}</td>`+
         `<td>${fmt(tgtX,3)} / ${fmt(tgtZ,3)}</td>`+
-        `<td>${tru?`${tru.x.toFixed(3)} / ${tru.z.toFixed(3)}`:(fitTru?`${fitTru.x.toFixed(3)} / ${fitTru.z.toFixed(3)}${fitTag(fitTru)}`:'—')}</td>`+
+        `<td>${truC?`${truC.x.toFixed(3)} / ${truC.z.toFixed(3)}${truTag}`:'—'}</td>`+
         `<td>${tcpW?`${tcpW[0].toFixed(3)} / ${tcpW[1].toFixed(3)}`:'—'}</td>`+
         `<td>${tcp?tcp[1].toFixed(3):'—'}</td>`+
         `<td>${cellVis(vis)}</td>`+
         `<td>${vis?vis.y.toFixed(3):'—'}</td>`+
-        `<td>${tcpW&&truEff?((tcpW[0]-truEff.x)*1000).toFixed(0):'—'}</td>`+
-        `<td>${tcpW&&truEff?((tcpW[1]-truEff.z)*1000).toFixed(0):'—'}</td>`+
+        `<td>${tcpW&&truC?((tcpW[0]-truC.x)*1000).toFixed(0):'—'}</td>`+
+        `<td>${tcpW&&truC?((tcpW[1]-truC.z)*1000).toFixed(0):'—'}</td>`+
         `<td>${h.n}</td><td style="color:${skColor}">${sk.verdict}</td><td>${note}</td></tr>`);
     } else {
+      const meet=meetAt(th.ht+rkOffset, null);   // pc相会（未挥拍：无触球截断，断档才外推）
       const tru=rkTruthAt(th.ht);
       const fitTru=(!tru && strikeAfter(th.ht+rkOffset).hit===false) ? fitTruthAt(th.ht+rkOffset) : null;
       const vis=racketRelAt(th.ht+rkOffset);
@@ -1084,9 +1137,10 @@ const hitTableHtml = () => {
         if(xr) reason+=`（最后一条：${xr[1].last}）`;
       }
       reason=`RK 最终 ref ${fmt(th.rel_x,3)}/${fmt(th.rel_z,3)}；`+reason;
-      rows.push(`<tr><td>${k}</td><td>~${(th.ht+rkOffset).toFixed(2)}</td>`+
-        `<td>—</td><td>—</td>`+
-        `<td>${meetT!=null?meetT.toFixed(2):'—'}</td><td>—</td>`+
+      const htc=htPcCell(th,null);
+      rows.push(`<tr><td>${k}</td><td>${htc.cell}</td>`+
+        `<td>${meet?meet.t.toFixed(2)+meet.tag:'—'}</td>`+
+        `<td>${meet?sgn((htc.pc-meet.t)*1000):'—'}</td>`+
         `<td>—</td>`+
         `<td>${tru?`${tru.x.toFixed(3)} / ${tru.z.toFixed(3)}`:(fitTru?`${fitTru.x.toFixed(3)} / ${fitTru.z.toFixed(3)}${fitTag(fitTru)}`:'—')}</td>`+
         `<td>—</td><td>—</td>`+
@@ -1101,10 +1155,10 @@ const hitTableHtml = () => {
     hits.forEach((h,i)=>{
       const tcp=tcpAt(h.done);
       const tgtX=h.wx!=null?h.wx:h.tx, tgtZ=h.wz!=null?h.wz:h.tz;
-      rows.push(`<tr><td>${i+1}</td><td>—</td><td>${(h.done+armDispOff()).toFixed(2)}</td><td>—</td><td>—</td><td>—</td>`+
+      rows.push(`<tr><td>${i+1}</td><td>—</td><td>—</td><td>—</td>`+
         `<td>${fmt(tgtX,3)} / ${fmt(tgtZ,3)}</td><td>—</td>`+
         `<td>${tcp?`${tcp[0].toFixed(3)} / ${tcp[2].toFixed(3)}`:'—'}</td><td>${tcp?tcp[1].toFixed(3):'—'}</td>`+
-        `<td>—</td><td>—</td><td>—</td><td>—</td><td>${h.n}</td><td>—</td><td>无 RK 时间桥</td></tr>`);
+        `<td>—</td><td>—</td><td>—</td><td>—</td><td>${h.n}</td><td>—</td><td>无 RK 时间桥（挥拍完成 ${(h.done+armDispOff()).toFixed(2)}s）</td></tr>`);
     });
   }
   if(!rows.length) return '';
@@ -1114,23 +1168,22 @@ const hitTableHtml = () => {
     : 'FK z 未还原（无 accepted↔rel 配对样本），仍为臂系';
   const strayNote = strayHits?`另有 ${strayHits} 次臂端挥拍无对应 RK 抛球（启动前空挥/手动测试，未列入）；`:'';
   const schedNote = armNewSched
-    ? '检测到<b>新调度</b>（effective duration 回执）：触球≡最后 accepted 的 ht（代码恒等），触球t/真值/视觉/结果全部锚 ht_acc+rkOffset（零桥）；Δht 列变灰色括号 = 调度执行残差诊断（含事件接收抖动，非臂违约）'
-    : '旧调度（触球 = accepted 到达 + duration）：到达时刻在 RK 轴（含 ~ms 传输抖动），Δht = 臂对最后 accepted ht 的真实违约';
+    ? '检测到<b>新调度</b>（effective duration 回执）：触球≡最后 accepted 的 ht（代码恒等，零桥），真值/视觉/结果全部锚 ht_acc+rkOffset'
+    : '旧调度：触球 = accepted 到达 + duration，即 HitTrajectory 恰好到达击球位姿的"计划触球时刻"（随挥再 2×hit_t，非动作结束；到达时刻在 RK 轴，含 ~ms 传输抖动）';
   const tsNote = armAligned
     ? `臂数据时间轴 = RK 单调钟（header.stamp 常数换算，与 RK 轨迹/ct/ht 同钟${ARM.clock_sync&&ARM.clock_sync.migrated_from_v2?'；v2 迁移文件，ht 锚定':''}）；全表只经 rkOffset 一个桥`
     : '臂数据时间轴未对齐（旧版 v2 提取或缺 RK 数据）——请用新版 extract_arm_bag.py 重提取';
-  return `<div class="armTblWrap"><table class="armTbl"><thead><tr><th>#</th><th>ht acc(s)</th><th>触球t(s)</th><th>Δht(ms)</th>`+
-    `<th>相会t(s)</th><th>Δ相会(ms)</th>`+
+  return `<div class="armTblWrap"><table class="armTbl"><thead><tr><th>#</th><th>ht(s)</th><th>pc相会t(s)</th><th>Δt(ms)</th>`+
     `<th>最后accepted x/z(m,世界系)</th><th>PC真值 x/z(m)</th><th>FK@触球 x/z(m,世界系)</th><th>FK y(m)</th><th>视觉拍心 x/z(m)</th><th>视觉 y(m)</th><th>dx(mm)</th><th>dz(mm)</th><th>更新数</th><th>结果</th><th>备注</th></tr></thead>`+
     `<tbody>${rows.join('')}</tbody></table>`+
     `<div style="font-size:11px;color:#a0a0c0;margin:2px 0 6px">行 = RK 每次真实抛球（predict ≥3 条）；`+
-    `<b>ht acc</b> = 最后一条被 accepted 消息里的 ht（臂的履约合同；未挥拍行以 ~ 前缀显示 RK 最终 ht）；`+
-    `${schedNote}；`+
-    `<b>Δht</b> = bag映射触球 − ht acc（旧调度=臂违约；新调度=桥残差诊断）；`+
-    `<b>相会t / Δ相会</b> = PC 真值下球相对车 y 首次由正下穿 0 的时刻（只取击打前的下行穿越，反弹不污染；来球速 >1m/s、断档 ≤0.3s 才判）与触球对它的偏差——物理准时性；`+
+    `<b>ht</b> = 击球前提前量最接近 300ms 的 S1 预测的 ht（臂端执行窗口 ~300ms 定标，≈最后 accepted 的合同；无S1 行以 ~ 前缀退回 RK 最终 ht）；`+
+    `<b>pc相会t</b> = PC 真值下球相对车 y 首次由正下穿 0 的时刻（只取击打前的下行穿越，反弹不污染；来球速 >1m/s、断档 ≤0.3s 才判直接穿越；命中行穿越两点还须全在触球 20ms 前——触球邻域观测可能已被击打改道，与 PC真值同口径剔除，故命中行几乎总为外推标）；`+
+    `黄标"±Mms(外推Nms)" = 球在触球前未过 0（拍在车前把球截住，相会物理上没发生）或穿越处断档时，由触球/断档前 rel_y 线性外推 N ms 的到达时刻，±M 为 1σ 时刻误差（拟合标准误⊕未建模气动，÷来球速折时间，实测 ±2~8ms；悬停看依据）；`+
+    `<b>Δt</b> = ht − pc相会t（预测时刻误差，正=预测偏晚）；`+
+    `触球时刻不再单列，仅作真值/FK/视觉/结果列的取样锚——${schedNote}；`+
     `结果 = 触球后 0.8s 内球 y 是否反向（被拍打回；地面反弹不改 y 向）；${strayNote}${zOffNote}；${tsNote}；`+
-    `触球t = accepted 到达 + duration，即 HitTrajectory 恰好到达击球位姿的"计划触球时刻"（随挥再 2×hit_t，非动作结束）；`+
-    `dx/dz = FK@触球 − PC真值@触球（同为世界系）；FK y 为臂基座系前向（正=车前）；未击打行的真值/视觉拍心取 ht 时刻；`+
+    `dx/dz = FK@触球 − PC真值@触球（同为世界系）；FK y 为臂基座系前向（正=车前）；未击打行的真值/视觉拍心取 RK 最终 ht 时刻；`+
     `视觉拍心 = annotate 离线三角测量拍心（世界系→车体系，与 FK 同口径），黄色 ±ms 为观测稀疏时的插值/最近点间隔；`+
     `${fitNote}。</div></div>`;
   };
