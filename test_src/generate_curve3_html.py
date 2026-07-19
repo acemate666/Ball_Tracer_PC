@@ -244,14 +244,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 </div>
 <div id="p5" class="pnl on">
   <div class="cc">
-    <div class="rkCtl"><span>RK offset(s)</span><input id="rkOff" type="number" step="0.001" value="0"><button type="button" class="zb" id="rkApply">Apply</button><button type="button" class="zb" id="rkAuto">Auto align</button><span id="rkInfo"></span></div>
+    <div class="rkCtl"><span>RK offset(s)</span><input id="rkOff" type="number" step="0.0001" value="0"><button type="button" class="zb" id="rkApply">Apply</button><button type="button" class="zb" id="rkAuto">Auto align</button><span id="rkInfo"></span></div>
     <div class="armEv" id="hitTbl0" style="padding:0 0 4px"></div>
     <div class="lc" id="l5"></div><div class="zt"><span class="ztl">X zoom / click plot + wheel</span><button type="button" class="zb" data-plot="c5" data-action="out">X-</button><button type="button" class="zb on" data-plot="c5" data-action="reset">Reset</button><button type="button" class="zb" data-plot="c5" data-action="in">X+</button><span id="c5r" class="zr">1.00x</span></div><div class="zx"><div id="c5" class="cb"></div></div>
   </div>
 </div>
 <div id="p6" class="pnl">
   <div class="cc">
-    <div class="rkCtl"><span>RK offset(s)</span><input id="rkSigOff" type="number" step="0.001" value="0"><button type="button" class="zb" id="rkSigApply">Apply</button><button type="button" class="zb" id="rkSigAuto">Auto align</button><span id="rkSigInfo"></span></div>
+    <div class="rkCtl"><span>RK offset(s)</span><input id="rkSigOff" type="number" step="0.0001" value="0"><button type="button" class="zb" id="rkSigApply">Apply</button><button type="button" class="zb" id="rkSigAuto">Auto align</button><span id="rkSigInfo"></span></div>
     <div class="lc" id="l6"></div><div class="zt"><span class="ztl">X zoom / click plot + wheel</span><button type="button" class="zb" data-plot="c6" data-action="out">X-</button><button type="button" class="zb on" data-plot="c6" data-action="reset">Reset</button><button type="button" class="zb" data-plot="c6" data-action="in">X+</button><span id="c6r" class="zr">1.00x</span></div><div class="zx"><div id="c6" class="cb"></div></div>
   </div>
 </div>
@@ -315,7 +315,7 @@ const frameSeries = frames
   .filter(f => f && isNum(f.exposure_pc))
   .map(f => ({
     ...f,
-    rel_s: isNum(f.elapsed_s) ? f.elapsed_s : relTime(f.exposure_pc),
+    rel_s: relTime(f.exposure_pc),
     video_frame_idx: Number.isInteger(f.video_frame_idx) ? f.video_frame_idx : null,
   }));
 const frameByIdx = new Map(frameSeries.filter(f => Number.isInteger(f.idx)).map(f => [f.idx, f]));
@@ -468,42 +468,79 @@ const interpPcVal = (rows,t,key,maxGap) => {
   const s=interpRow(rows,t,maxGap);
   return (s && isNum(s.a[key]) && isNum(s.b[key])) ? lerp(s.a[key],s.b[key],s.f) : null;
 };
-// 时间对齐：只用 RK 球在运动的段（|dy/dt|>1.5 m/s），对 PC 观测插值比 y、取中位差。
-// 旧的 Z 最近邻 MAE 会被 RK 锁死球/躺地球段拖进假极小（0712 场实测差 21s），已替换。
-const rkMovY = (()=>{
+const median = values => {
+  const sorted=[...values].sort((a,b)=>a-b);
+  return sorted[sorted.length>>1];
+};
+const pcFlights = (()=>{
+  const groups=[];
+  let rows=[];
+  const flush=()=>{
+    if(rows.length>=5 && rows[rows.length-1].t-rows[0].t>=0.2){
+      const zs=rows.map(row=>row.z).filter(isNum);
+      if(zs.length>=5 && Math.max(...zs)-Math.min(...zs)>=0.25) groups.push(rows);
+    }
+    rows=[];
+  };
+  for(const row of pcRows){
+    if(rows.length && row.t-rows[rows.length-1].t>0.5) flush();
+    rows.push(row);
+  }
+  flush();
+  return groups;
+})();
+// Align only the ball height shape. Remove the median z bias at every candidate
+// per visible flight, then weight flights equally so a long track cannot dominate.
+const rkMovZ = (()=>{
   if(!RK) return [];
-  const rows=pairs(RK.world,'y');
+  const rows=pairs(RK.world,'z');
   const out=[];
   for(let i=1;i<rows.length;i++){
     const dt=rows[i].t-rows[i-1].t;
-    if(dt>0&&dt<0.2&&Math.abs(rows[i].v-rows[i-1].v)/dt>1.5) out.push(rows[i]);
+    if(dt>0&&dt<0.2&&Math.abs(rows[i].v-rows[i-1].v)/dt>0.4) out.push(rows[i]);
   }
   return out;
 })();
-const scoreOffset = off => {
-  if(rkMovY.length<30 || pcRows.length<10) return null;
-  const step=Math.max(1,Math.floor(rkMovY.length/400));
-  const ds=[];
-  for(let i=0;i<rkMovY.length;i+=step){
-    const v=interpPcVal(pcRows, rkMovY[i].t+off, 'y', 0.08);
+const scoreOffset = (off, full=false) => {
+  if(rkMovZ.length<30 || pcFlights.length<3) return null;
+  const step=full ? 1 : Math.max(1,Math.floor(rkMovZ.length/400));
+  const matches=pcFlights.map(()=>({dz:[], first:null, last:null}));
+  let flightIdx=0;
+  for(let i=0;i<rkMovZ.length;i+=step){
+    const t=rkMovZ[i].t+off;
+    while(flightIdx<pcFlights.length && t>pcFlights[flightIdx][pcFlights[flightIdx].length-1].t) flightIdx+=1;
+    if(flightIdx>=pcFlights.length) break;
+    const flight=pcFlights[flightIdx];
+    if(t<flight[0].t) continue;
+    const v=interpPcVal(flight, t, 'z', 0.08);
     if(v==null) continue;
-    ds.push(Math.abs(v-rkMovY[i].v));
+    const match=matches[flightIdx];
+    match.dz.push(v-rkMovZ[i].v);
+    if(match.first==null) match.first=t;
+    match.last=t;
   }
-  if(ds.length<15) return null;
-  ds.sort((a,b)=>a-b);
-  return {err:ds[ds.length>>1], n:ds.length};
+  const flightErrs=[];
+  let n=0;
+  for(const match of matches){
+    if(match.dz.length<5 || match.last-match.first<0.2) continue;
+    const bias=median(match.dz);
+    flightErrs.push(median(match.dz.map(value=>Math.abs(value-bias))));
+    n+=match.dz.length;
+  }
+  if(flightErrs.length<3) return null;
+  return {err:median(flightErrs), n, flights:flightErrs.length};
 };
 // 混叠防护（0712 晚场教训）：抛球间隔相似时，轨迹匹配错位整数个抛也能出深谷；
 // 且当 PC 观测只覆盖部分时段时，假谷只用到少量重叠样本反而 err 更低。
-// 对策：全范围扫描收集所有候选，先按参与样本数 n ≥ 0.6×n_max 门控，再取 err 最小。
+// Guard by matched flight count rather than raw frame count, then minimize z-shape error.
 // 扫描界由数据重叠推导（0716 上午场教训：RK 节点晚入网 70s+，t0=全 bag 最小 payload
 // 把 RK 相对轴锚偏，真实 offset=+62s 溢出旧 ±60s 硬编码界，自动对齐落假谷、全报告错轴）：
 // off 须使 RK 运动段映射后与 PC 观测段有交集 → off ∈ [pc首-rk末, pc末-rk首]。
 // 粗扫步长自适应封顶 ~18k 次（谷宽由插值门限 0.08s 定，粗步 ≤0.1s 仍稳落谷内），谷邻域再细扫。
 const estimateOffset = () => {
-  if(rkMovY.length<30 || pcRows.length<10) return {off:0, err:null, n:0};
-  const lo=Math.floor(pcRows[0].t - rkMovY[rkMovY.length-1].t) - 1;
-  const hi=Math.ceil(pcRows[pcRows.length-1].t - rkMovY[0].t) + 1;
+  if(rkMovZ.length<30 || pcFlights.length<3) return {off:0, err:null, n:0};
+  const lo=Math.floor(pcRows[0].t - rkMovZ[rkMovZ.length-1].t) - 1;
+  const hi=Math.ceil(pcRows[pcRows.length-1].t - rkMovZ[0].t) + 1;
   const coarse=Math.max(0.02, (hi-lo)/18000);
   const cands=[];
   for(let off=lo; off<=hi+1e-4; off+=coarse){
@@ -511,43 +548,44 @@ const estimateOffset = () => {
     if(s) cands.push({off, ...s});
   }
   if(!cands.length) return {off:0, err:null, n:0};
-  const nMax=cands.reduce((m,c)=>Math.max(m,c.n),0);
-  const ok=cands.filter(c=>c.n>=0.6*nMax);
+  const flightMax=cands.reduce((m,c)=>Math.max(m,c.flights),0);
+  const minFlights=Math.max(3,Math.ceil(0.6*flightMax));
+  const ok=cands.filter(c=>c.flights>=minFlights);
   let best=ok.reduce((a,b)=>b.err<a.err?b:a, ok[0]);
   const win=coarse*2.5;
-  for(let off=best.off-win; off<=best.off+win+1e-4; off+=0.002){
-    const s=scoreOffset(off);
-    if(s && s.n>=0.6*nMax && s.err<best.err) best={off, ...s};
+  for(let off=best.off-win; off<=best.off+win+1e-4; off+=0.0002){
+    const s=scoreOffset(off,true);
+    if(s && s.flights>=minFlights && s.err<best.err) best={off, ...s};
   }
   return best;
 };
 // [[align-core-end]]
 const auto = RK ? estimateOffset() : {off:0, err:null, n:0};
 // 对齐取证钩子（0717 定型）：控制台 __dbgAlign.scoreOffset(off) 可复查任意 offset 的
-// 轨迹匹配质量（中位 |dy| / 样本数），怀疑错轴时先用它排除对齐问题再查预测。
-window.__dbgAlign={pcRows:()=>pcRows, rkMovY:()=>rkMovY, scoreOffset, auto:()=>auto};
+// z-shape match quality after removing the fixed height bias at each offset.
+window.__dbgAlign={pcRows:()=>pcRows, rkMovZ:()=>rkMovZ, scoreOffset, auto:()=>auto};
 // 预置 offset（--rk-offset）：PC/RK 无共同球观测窗的场次（轨迹自动对齐结构性不可行）
 // 由外部锚（如车速互相关）离线求出后喂入，优先于 auto；Auto align 按钮仍可覆盖。
 const presetOff = isNum(D.rk_offset_preset) ? Number(D.rk_offset_preset) : null;
-let rkOffset = Math.round((presetOff!=null ? presetOff : auto.off)*1000)/1000;
+let rkOffset = Math.round((presetOff!=null ? presetOff : auto.off)*10000)/10000;
 window.__rkOffset = rkOffset;
 // 对齐质量门（0716 早场教训：自动对齐落假谷时报告安静生成，全表错轴像"数据坏了"）：
-// 好场中位 |dy| ~0.07m，假谷实测 0.6~10m；n 是最优候选参与样本数，热身场仅 15。
+// Good z-shape matches are below about 0.08m; n is the participating sample count.
 // 有 preset 时不告警（正是自动对齐不可行场次的正解，rkOffset 已取 preset）。
-const alignBad = !!RK && presetOff==null && (auto.err==null || auto.err>0.25 || auto.n<30);
+const alignBad = !!RK && presetOff==null && (auto.err==null || auto.err>0.08 || auto.n<30);
 const alignWarnHtml = alignBad
   ? `<div style="border:1px solid #e94560;background:rgba(233,69,96,0.12);color:#e94560;font-weight:600;border-radius:8px;padding:8px 12px;margin:0 0 10px">`+
-    `⚠ PC↔RK 自动对齐不可信（中位 |dy| ${auto.err==null?'n/a':auto.err.toFixed(3)+'m'} / ${auto.n} 点；门限 ≤0.25m 且 ≥30 点）`+
+    `⚠ PC↔RK 自动对齐不可信（中位 z 形状误差 ${auto.err==null?'n/a':auto.err.toFixed(3)+'m'} / ${auto.n} 点；门限 ≤0.08m 且 ≥30 点）`+
     `——本页所有跨轴内容（北极星表 / RK 轨迹叠加 / Arm 对齐）不可靠。`+
     `常见原因：两侧共同球观测太少（热身场、RK 晚入网、PC 未见球）。`+
     `处置：RK 页手动 Apply offset，或用 --rk-offset 预置外部锚。</div>`
   : (RK
     // 对齐质量常显（0717 凌晨场教训：RK 预测 ht 对多弹跳球偏早 0.3~0.6s，Δt 一大用户
     // 第一反应是"轴又没对齐"——把对齐证据亮在表上方，可信时表内偏差就该信为预测误差）。
-    ? `<div style="font-size:11px;color:#7fbf9f;margin:0 0 6px">PC↔RK 对齐 ✓ offset ${rkOffset.toFixed(3)}s`+
+    ? `<div style="font-size:11px;color:#7fbf9f;margin:0 0 6px">PC↔RK 对齐 ✓ offset ${rkOffset.toFixed(4)}s`+
       (presetOff!=null
         ? `（--rk-offset 外部锚预置）`
-        : `（两侧球轨迹互验：中位 |dy| ${auto.err.toFixed(3)}m / ${auto.n} 点，门限 ≤0.25m）`)+
+        : `（两侧球 z 形状互验：中位误差 ${auto.err.toFixed(3)}m / ${auto.n} 点，门限 ≤0.08m）`)+
       `——对齐可信时，表内 Δt/dx/dz 的偏差应解读为预测/执行误差而非错轴。</div>`
     : '');
 const rkPredStage = RK ? ys(RK.pred,'stage') : [];
@@ -1791,7 +1829,7 @@ buildPlots[4] = () => {
     });
     document.getElementById('armEv').innerHTML =
       (aligned
-        ? `Axis: PC report time（臂数据与 RK 同钟同轴，display = RK t + rkOffset ${(Number(window.__rkOffset)||0).toFixed(3)}s） &nbsp; `
+        ? `Axis: PC report time（臂数据与 RK 同钟同轴，display = RK t + rkOffset ${(Number(window.__rkOffset)||0).toFixed(4)}s） &nbsp; `
         : 'Axis: arm data time（未对齐：需 v3 _arm.json + RK 数据） &nbsp; ') +
       (ARM.fk_source ? `FK: ${escA(ARM.fk_source)} &nbsp; ` : '') +
       (marks.length ? '| ' + marks.join(' &nbsp;|&nbsp; ') : '| no accepted commands') +
@@ -1841,9 +1879,9 @@ buildPlots[5] = () => {
   const setInfo = () => {
     window.__rkOffset = rkOffset;  // Arm tab 同轴显示要用
     const errText = auto.err==null ? 'n/a' : `${auto.err.toFixed(3)}m / ${auto.n} pts`;
-    const srcText = presetOff!=null ? `preset ${presetOff.toFixed(3)}s; ` : '';
+    const srcText = presetOff!=null ? `preset ${presetOff.toFixed(4)}s; ` : '';
     info.innerHTML = (alignBad ? '<span style="color:#e94560;font-weight:700">⚠ 对齐不可信</span> ' : '')
-      + `display t = RK t + ${rkOffset.toFixed(3)}s; ${srcText}auto traj |dy| ${errText}`;
+      + `display t = RK t + ${rkOffset.toFixed(4)}s; ${srcText}auto z-shape ${errText}`;
   };
   const tr = (series,key,name,axis,color,mode='markers',extra={}) => g2({
     x:shifted(ts(series)), y:ys(series,key), name, mode,
@@ -2081,7 +2119,7 @@ buildPlots[5] = () => {
     renderTable0();
     return Promise.all(jobs);
   };
-  if(input) input.value = rkOffset.toFixed(3);
+  if(input) input.value = rkOffset.toFixed(4);
   setInfo();
   renderTable0();
   Plotly.newPlot('c5', traceData(), layout(), PLOT_CONFIG).then(()=>{wl('c5','l5');wz('c5');});
@@ -2093,8 +2131,8 @@ buildPlots[5] = () => {
   });
   const autoBtn = document.getElementById('rkAuto');
   if(autoBtn) autoBtn.addEventListener('click',()=>{
-    rkOffset=Math.round(auto.off*1000)/1000;
-    if(input) input.value=rkOffset.toFixed(3);
+    rkOffset=Math.round(auto.off*10000)/10000;
+    if(input) input.value=rkOffset.toFixed(4);
     redraw();
   });
 
@@ -2120,7 +2158,7 @@ buildPlots[5] = () => {
   const sigInput = document.getElementById('rkSigOff');
   const sigInfo = document.getElementById('rkSigInfo');
   const syncSignalControls = () => {
-    if(sigInput) sigInput.value = rkOffset.toFixed(3);
+    if(sigInput) sigInput.value = rkOffset.toFixed(4);
     if(sigInfo) sigInfo.innerHTML = info.innerHTML;
   };
   syncSignalControls();
@@ -2128,13 +2166,13 @@ buildPlots[5] = () => {
   if(sigApply) sigApply.addEventListener('click',()=>{
     const v=Number(sigInput.value);
     rkOffset=isNum(v) ? v : 0;
-    if(input) input.value=rkOffset.toFixed(3);
+    if(input) input.value=rkOffset.toFixed(4);
     redraw().then(syncSignalControls);
   });
   const sigAuto = document.getElementById('rkSigAuto');
   if(sigAuto) sigAuto.addEventListener('click',()=>{
-    rkOffset=Math.round(auto.off*1000)/1000;
-    if(input) input.value=rkOffset.toFixed(3);
+    rkOffset=Math.round(auto.off*10000)/10000;
+    if(input) input.value=rkOffset.toFixed(4);
     redraw().then(syncSignalControls);
   });
 
