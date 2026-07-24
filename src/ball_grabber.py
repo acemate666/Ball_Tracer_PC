@@ -259,6 +259,48 @@ def frame_to_numpy(frame: Frame, *, rotate_180: Optional[bool] = None):
     raise RuntimeError(f"不支持的像素格式 0x{pt:08X}，请在 MVS Client 中切换为 Mono8 或 BayerXX8")
 
 
+def frame_bayer_roi_to_numpy(
+    frame: Frame,
+    *,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    resize_to: int,
+):
+    """直接从 Bayer 原始帧裁剪 ROI，解码并缩放为 YOLO 输入。"""
+    import cv2
+    import numpy as np
+
+    if _ENV_SOFTWARE_ROTATE_180:
+        raise RuntimeError("Bayer ROI fast path requires camera-side orientation")
+
+    bayer_codes = {
+        PixelType_Gvsp_BayerRG8: cv2.COLOR_BayerBG2BGR,
+        PixelType_Gvsp_BayerBG8: cv2.COLOR_BayerRG2BGR,
+        PixelType_Gvsp_BayerGR8: cv2.COLOR_BayerGB2BGR,
+        PixelType_Gvsp_BayerGB8: cv2.COLOR_BayerGR2BGR,
+    }
+    if frame.pixel_type not in bayer_codes:
+        raise RuntimeError(
+            f"YOLO ROI fast path requires Bayer8, got 0x{frame.pixel_type:08X}"
+        )
+
+    x0 = x & ~1
+    y0 = y & ~1
+    dx = x - x0
+    dy = y - y0
+    raw = np.frombuffer(
+        frame.data,
+        dtype=np.uint8,
+        count=frame.width * frame.height,
+    ).reshape(frame.height, frame.width)
+    raw_roi = raw[y0:y + height, x0:x + width]
+    bgr_roi = cv2.cvtColor(raw_roi, bayer_codes[frame.pixel_type])
+    bgr_roi = bgr_roi[dy:dy + height, dx:dx + width]
+    return cv2.resize(bgr_roi, (resize_to, resize_to))
+
+
 # ───────────────── 设备枚举 ─────────────────
 
 

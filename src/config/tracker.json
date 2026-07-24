@@ -1,6 +1,6 @@
 {
     "tile_size": 1280,
-    "tile_resize": 512,
+    "tile_resize": 416,
     "track_timeout_s": 0.3,
     "search_hold_frames": 4,
     "min_cameras_for_3d": 2,

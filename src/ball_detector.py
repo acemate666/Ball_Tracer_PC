@@ -204,13 +204,41 @@ class BallDetector:
         if fixed_batch is None or self._onnx_session is not None:
             return self._predict(images, conf)
 
+        predictor = getattr(self._model, "predictor", None)
         results = []
         for start in range(0, len(images), fixed_batch):
             chunk = list(images[start:start + fixed_batch])
             actual_n = len(chunk)
             while len(chunk) < fixed_batch:
                 chunk.append(chunk[-1])
-            chunk_results = self._predict(chunk, conf)
+            exact_engine_input = (
+                predictor is not None
+                and self._engine_imgsz is not None
+                and all(
+                    image.ndim == 3
+                    and image.shape == (
+                        self._engine_imgsz,
+                        self._engine_imgsz,
+                        3,
+                    )
+                    for image in chunk
+                )
+            )
+            if exact_engine_input:
+                import torch
+
+                batch = np.ascontiguousarray(
+                    np.stack(chunk)[..., ::-1].transpose((0, 3, 1, 2))
+                )
+                tensor = torch.from_numpy(batch).to(predictor.device)
+                tensor = tensor.half() if predictor.model.fp16 else tensor.float()
+                tensor.div_(255.0)
+                predictor.args.conf = conf
+                predictions = predictor.inference(tensor)
+                chunk_results = predictor.postprocess(predictions, tensor, chunk)
+            else:
+                chunk_results = self._predict(chunk, conf)
+                predictor = getattr(self._model, "predictor", None)
             results.extend(chunk_results[:actual_n])
         return results
 

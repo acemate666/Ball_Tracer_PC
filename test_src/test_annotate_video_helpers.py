@@ -6,6 +6,7 @@ from test_src.annotate_video import (
     build_video_frame_mapping,
     clear_car_results,
     describe_car_loc_status,
+    draw_racket_detections,
     extract_fullres_panels,
     guess_tracker_video_path,
     split_stitched_panels,
@@ -90,6 +91,39 @@ def test_apply_racket_results_serializes_frame_fields():
         "y2": 220.9,
         "confidence": 0.91,
     }
+
+
+def test_draw_racket_detections_only_draws_keypoints_and_center(monkeypatch):
+    import cv2
+    import numpy as np
+
+    calls = {"rectangle": [], "text": [], "circle": [], "marker": []}
+    monkeypatch.setattr(cv2, "rectangle", lambda *args, **kwargs: calls["rectangle"].append((args, kwargs)))
+    monkeypatch.setattr(cv2, "putText", lambda *args, **kwargs: calls["text"].append((args, kwargs)))
+    monkeypatch.setattr(cv2, "circle", lambda *args, **kwargs: calls["circle"].append((args, kwargs)))
+    monkeypatch.setattr(cv2, "drawMarker", lambda *args, **kwargs: calls["marker"].append((args, kwargs)))
+
+    draw_racket_detections(
+        np.zeros((240, 320, 3), dtype=np.uint8),
+        [{
+            "accepted": False,
+            "bbox": {"x1": 80, "y1": 100, "x2": 160, "y2": 180, "confidence": 0.9},
+            "keypoints": [
+                {"id": 0, "x": 100, "y": 120, "score": 50, "valid": True, "used_for_center": True},
+                {"id": 4, "x": 140, "y": 160, "score": 30, "valid": False, "used_for_center": False},
+            ],
+            "x": 120,
+            "y": 140,
+        }],
+        x_offset=10,
+        y_offset=20,
+        scale=0.5,
+    )
+
+    assert calls["rectangle"] == []
+    assert calls["text"] == []
+    assert len(calls["circle"]) == 2
+    assert len(calls["marker"]) == 1
 
 
 def test_guess_tracker_video_path_prefers_json_artifact_path(tmp_path):

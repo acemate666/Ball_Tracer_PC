@@ -4,7 +4,7 @@
 
 在原有球框/球 3D/curve3 标注之外，还会在离线阶段调用 ArmCalibration 同款的
 `yolo_model/racket.onnx + yolo_model/racket_pose.onnx`，只使用关键点 0-3 的几何中心
-做球拍 2D/3D 定位，并将结果补充回 JSON。
+做球拍 2D/3D 定位，并将结果补充回 JSON；视频画面只绘制球拍关键点与几何中心。
 
 用法：
   python test_src/annotate_video.py --input tracker_output/tracker_20260311_193455.json
@@ -726,33 +726,9 @@ def draw_racket_detections(
     y_offset: int,
     scale: float,
 ) -> None:
-    """Draw ArmCalibration-style racket bbox, keypoints, and center."""
+    """Draw only racket keypoints and their face-center marker."""
     for det in detections:
-        bbox = det.get("bbox")
-        if not bbox:
-            continue
-
         accepted = bool(det.get("accepted", False))
-        draw_color = RACKET_BOX_COLOR if accepted else (0, 165, 255)
-        x1 = int(bbox["x1"] * scale) + x_offset
-        y1 = int(bbox["y1"] * scale) + y_offset
-        x2 = int(bbox["x2"] * scale) + x_offset
-        y2 = int(bbox["y2"] * scale) + y_offset
-        cv2.rectangle(out, (x1, y1), (x2, y2), draw_color, 2)
-
-        score_text = f"R {bbox.get('confidence', det.get('conf', 0.0)):.2f}"
-        if not accepted and det.get("failure_reason"):
-            score_text += f" {det['failure_reason']}"
-        cv2.putText(
-            out,
-            score_text,
-            (x1, max(y_offset + 20, y1 - 5)),
-            FONT,
-            0.9,
-            draw_color,
-            2,
-            )        
-
         for keypoint in det.get("keypoints", []):
             kp_x = int(keypoint["x"] * scale) + x_offset
             kp_y = int(keypoint["y"] * scale) + y_offset
@@ -761,23 +737,14 @@ def draw_racket_detections(
             else:
                 kp_color = (255, 200, 0)
             cv2.circle(out, (kp_x, kp_y), 5, kp_color, -1)
-            cv2.putText(
-                out,
-                f"{keypoint['id']}:{keypoint['score']:.1f}",
-                (kp_x + 6, kp_y - 6),
-                FONT,
-                0.45,
-                kp_color,
-                1,
-            )
 
-        if accepted and "x" in det and "y" in det:
+        if "x" in det and "y" in det:
             cx = int(det["x"] * scale) + x_offset
             cy = int(det["y"] * scale) + y_offset
             cv2.drawMarker(
                 out,
                 (cx, cy),
-                (0, 0, 255),
+                (0, 0, 255) if accepted else (0, 165, 255),
                 markerType=cv2.MARKER_CROSS,
                 markerSize=22,
                 thickness=2,

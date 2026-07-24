@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-1000x1000 分片管理器 — 每台相机独立的 YOLO 检测区域管理。
+YOLO 分片管理器 — 每台相机独立选择检测区域。
 
 裁剪 1000x1000 切片后压缩到 640x640 送入 YOLO，检测坐标按缩放比例还原到切片坐标
 再加上切片偏移得到全图坐标。
@@ -22,8 +22,7 @@
     tile_mgr = TileManager({"cam0": (2048, 1536)})
 
     # 每帧
-    crop_640, tile = tile_mgr.get_tile("cam0", image, current_time)
-    dets = detector.detect(crop_640)
+    tile = tile_mgr.select_tile("cam0", 2048, 1536, current_time)
     dets_full = [TileManager.map_detection_to_full(d, tile) for d in dets]
 
     # YOLO 检测到球但 3D 定位失败
@@ -37,9 +36,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-
-import cv2
-import numpy as np
 
 from .ball_detector import BallDetection
 
@@ -75,7 +71,7 @@ class _CameraState:
 
 
 class TileManager:
-    """每台相机独立的 1000x1000 分片管理器（压缩 640x640 送 YOLO）。"""
+    """每台相机独立的 YOLO 分片区域状态机。"""
 
     RESIZE_TO = 640
 
@@ -122,32 +118,31 @@ class TileManager:
                 ))
         return tiles
 
-    def get_tile(
-        self, sn: str, image: np.ndarray, current_time: float
-    ) -> tuple[np.ndarray, TileRect]:
-        """
-        返回当前帧该相机应使用的切片（已压缩到 640x640）。
-
-        Returns:
-            (压缩后的 640x640 图像, 切片区域（全图坐标）)
-        """
+    def select_tile(
+        self,
+        sn: str,
+        image_width: int,
+        image_height: int,
+        current_time: float,
+    ) -> TileRect:
+        """返回当前帧该相机应使用的全图切片区域。"""
         state = self._states[sn]
-        h, w = image.shape[:2]
 
         if state.mode == _TileMode.TRACK:
             if current_time - state.track_time >= self._track_timeout:
                 state.mode = _TileMode.SEARCH
             else:
-                tile = self._center_tile(
-                    int(state.track_x), int(state.track_y), w, h
+                return self._center_tile(
+                    int(state.track_x),
+                    int(state.track_y),
+                    image_width,
+                    image_height,
                 )
-                return self._crop_and_resize(image, tile), tile
 
         if state.mode == _TileMode.HOLD:
             if state.hold_remaining > 0:
                 state.hold_remaining -= 1
-                tile = state.hold_tile
-                return self._crop_and_resize(image, tile), tile
+                return state.hold_tile
             else:
                 state.mode = _TileMode.SEARCH
 
@@ -155,7 +150,7 @@ class TileManager:
         idx = state.search_idx % len(state.search_tiles)
         tile = state.search_tiles[idx]
         state.search_idx += 1
-        return self._crop_and_resize(image, tile), tile
+        return tile
 
     def on_2d_detected(self, sn: str, tile: TileRect) -> None:
         """YOLO 检测到球但 3D 定位失败时调用 -- 进入持续模式。"""
@@ -188,12 +183,6 @@ class TileManager:
             w=min(ts, img_w - x),
             h=min(ts, img_h - y),
         )
-
-    def _crop_and_resize(
-        self, image: np.ndarray, tile: TileRect
-    ) -> np.ndarray:
-        crop = image[tile.y:tile.y + tile.h, tile.x:tile.x + tile.w]
-        return cv2.resize(crop, (self._resize_to, self._resize_to))
 
     @staticmethod
     def map_detection_to_full(

@@ -1,22 +1,18 @@
 from __future__ import annotations
 
-import numpy as np
-
 from src.ball_detector import BallDetection
 from src.tile_manager import TileManager, TileRect
 
 
-def test_tile_manager_uses_configured_resize():
-    image = np.zeros((1536, 2048, 3), dtype=np.uint8)
+def test_tile_manager_selects_search_tile():
     tile_mgr = TileManager(
         {"cam0": (2048, 1536)},
         tile_size=1280,
         resize_to=512,
     )
 
-    crop, tile = tile_mgr.get_tile("cam0", image, current_time=0.0)
+    tile = tile_mgr.select_tile("cam0", 2048, 1536, current_time=0.0)
 
-    assert crop.shape == (512, 512, 3)
     assert tile == TileRect(x=0, y=0, w=1280, h=1280)
 
 

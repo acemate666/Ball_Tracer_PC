@@ -17,8 +17,8 @@
 
 性能设计：
   - YOLO 推理在 1000x1000 切片上运行（跟踪模式：追踪球位置；搜索模式：轮询预定义区域）
-  - 图像缩放和编码在后台线程完成
-  - 主线程只做：取帧 → Bayer解码 → 分片 → YOLO → 三角测量 → curve4 → 入队
+  - YOLO 主线只解码 Bayer ROI；全图解码、AprilTag 和视频写入在后台流水线完成
+  - 主线程只做：取帧 → ROI 解码/缩放 → YOLO → 三角测量 → curve4 → 入队
 
 用法：
   python run_tracker.py [--duration 60] [--no-video] [--output-dir tracker_output]
@@ -75,6 +75,7 @@ from src import (
     CarLoc,
     StationaryObjectFilter,
 )
+from src.ball_grabber import frame_bayer_roi_to_numpy
 from src.curve4 import (
     BallObservation,
     Curve4Tracker,
@@ -217,6 +218,16 @@ class WriteJob:
     exposure_perf: float                       # perf_counter 时间
     elapsed_s: float | None
     frame_idx: int
+
+
+@dataclass
+class FullFrameJob:
+    """全图解码线的工作包；原始 Bayer 帧不经过 YOLO 主线。"""
+    frames: dict
+    frame_idx: int
+    exposure_pc: float
+    elapsed_s: float | None
+    car_loc_sampled: bool
 
 
 @dataclass
@@ -1841,9 +1852,9 @@ def main() -> int:
                     f"hw_accel={'on' if writer_thread.hw_accel_requested else 'off'})"
                 )
 
-        # ── 并行解码线程池 ──
+        # ── YOLO 原始 Bayer ROI 解码线程池 ──
         from concurrent.futures import ThreadPoolExecutor
-        _decode_pool = ThreadPoolExecutor(max_workers=len(cam_serials))
+        _tile_decode_pool = ThreadPoolExecutor(max_workers=len(cam_serials))
 
         # ── 归档线程（线3）：视频以外的 JSON/log 构造 ──
         archive_thread = ArchiveThread(
@@ -1885,6 +1896,73 @@ def main() -> int:
                 target=_car_worker, name="CarLocWorker", daemon=True,
             )
             _car_thread.start()
+
+        # ── 全图线：与 YOLO 并行解码，再交给 AprilTag / 视频线程 ──
+        _full_job_queue: queue.Queue[FullFrameJob | None] | None = None
+        _full_thread: threading.Thread | None = None
+        _full_decode_time_sum = 0.0
+        _full_decode_count = 0
+        _full_queue_max_size = 0
+        _full_drop_count = 0
+        if writer_thread is not None or car_localizer is not None:
+            _full_job_queue = queue.Queue(maxsize=2)
+
+            def _full_frame_worker():
+                nonlocal _full_decode_time_sum, _full_decode_count
+                nonlocal car_loc_dropped_frames
+                with ThreadPoolExecutor(max_workers=len(cam_serials)) as pool:
+                    while True:
+                        job = _full_job_queue.get()
+                        if job is None:
+                            break
+                        t0 = time.perf_counter()
+                        sns = [sn for sn in cam_serials if sn in job.frames]
+                        futures = {
+                            sn: pool.submit(frame_to_numpy, job.frames[sn])
+                            for sn in sns
+                        }
+                        images = {
+                            sn: future.result()
+                            for sn, future in futures.items()
+                        }
+                        _full_decode_time_sum += time.perf_counter() - t0
+                        _full_decode_count += 1
+
+                        if job.car_loc_sampled:
+                            assert _car_job_queue is not None
+                            stale = _car_submit_latest(
+                                _car_job_queue,
+                                CarLocJob(
+                                    frame_idx=job.frame_idx,
+                                    exposure_pc=job.exposure_pc,
+                                    elapsed_s=job.elapsed_s,
+                                    images=images,
+                                ),
+                            )
+                            if stale is not None:
+                                car_loc_dropped_frames += 1
+                                archive_thread.submit(CarLocEvent(
+                                    frame_idx=stale.frame_idx,
+                                    exposure_pc=stale.exposure_pc,
+                                    elapsed_s=stale.elapsed_s,
+                                    status="dropped",
+                                ))
+
+                        if writer_thread is not None:
+                            writer_thread.submit(WriteJob(
+                                images=images,
+                                serials=cam_serials,
+                                exposure_perf=job.exposure_pc,
+                                elapsed_s=job.elapsed_s,
+                                frame_idx=job.frame_idx,
+                            ))
+
+            _full_thread = threading.Thread(
+                target=_full_frame_worker,
+                name="FullFrameWorker",
+                daemon=True,
+            )
+            _full_thread.start()
 
         # ── 信号处理（确保被终止时也能保存数据）──
         _shutdown = threading.Event()
@@ -1929,14 +2007,6 @@ def main() -> int:
                     continue
                 _t_capture_sum += _t_capture_done - _t_loop0
 
-                # ── Bayer 解码（全分辨率，并行）──
-                _t0 = time.perf_counter()
-                _decode_sns = [sn for sn in cam_serials if sn in frames]
-                _decode_futs = {sn: _decode_pool.submit(frame_to_numpy, frames[sn]) for sn in _decode_sns}
-                images = {sn: fut.result() for sn, fut in _decode_futs.items()}
-                _t1 = time.perf_counter()
-                _t_decode_sum += _t1 - _t0
-
                 exp_starts = [
                     frames[sn].exposure_start_pc
                     for sn in cam_serials if sn in frames
@@ -1946,44 +2016,72 @@ def main() -> int:
                     first_frame_exposure_pc = exposure_pc
                 frame_elapsed_s = exposure_pc - first_frame_exposure_pc
 
-                # ── 车辆定位立即派发（线2，和 YOLO 并行；不复制图像）──
+                # ── 标记本帧是否需要后台车辆定位 ──
                 car_loc_sampled = (
                     car_localizer is not None
                     and (frame_idx % car_loc_sample_every_frames) == 0
                 )
                 if car_loc_sampled:
                     car_loc_sampled_frames += 1
-                    stale = _car_submit_latest(
-                        _car_job_queue,
-                        CarLocJob(
-                            frame_idx=frame_idx,
-                            exposure_pc=exposure_pc,
-                            elapsed_s=frame_elapsed_s,
-                            images=images,
-                        ),
-                    )
-                    if stale is not None:
-                        car_loc_dropped_frames += 1
-                        archive_thread.submit(CarLocEvent(
-                            frame_idx=stale.frame_idx,
-                            exposure_pc=stale.exposure_pc,
-                            elapsed_s=stale.elapsed_s,
-                            status="dropped",
-                        ))
 
-                # ── YOLO 分片检测（线1）──
-                img_sns = [sn for sn in cam_serials if sn in images]
+                # ── YOLO 线：原始 Bayer 先裁 ROI，再解码/缩放 ──
+                img_sns = [sn for sn in cam_serials if sn in frames]
                 ball_detect_sns = [
                     sn for sn in img_sns
                     if sn not in ball_detection_disabled_serials
                 ]
                 frame_tiles: dict[str, TileRect] = {}
-                tile_imgs = []
+                _t0 = time.perf_counter()
+                tile_futures = {}
                 for sn in ball_detect_sns:
-                    crop, tile_rect = tile_mgr.get_tile(
-                        sn, images[sn], exposure_pc)
-                    tile_imgs.append(crop)
+                    frame = frames[sn]
+                    tile_rect = tile_mgr.select_tile(
+                        sn,
+                        frame.width,
+                        frame.height,
+                        exposure_pc,
+                    )
                     frame_tiles[sn] = tile_rect
+                    tile_futures[sn] = _tile_decode_pool.submit(
+                        frame_bayer_roi_to_numpy,
+                        frame,
+                        x=tile_rect.x,
+                        y=tile_rect.y,
+                        width=tile_rect.w,
+                        height=tile_rect.h,
+                        resize_to=tile_mgr.resize_to,
+                    )
+                tile_imgs = [tile_futures[sn].result() for sn in ball_detect_sns]
+                _t1 = time.perf_counter()
+                _t_decode_sum += _t1 - _t0
+
+                # 全图线与 GPU 推理并行，不进入 YOLO 关键路径。
+                if _full_job_queue is not None and (
+                    writer_thread is not None or car_loc_sampled
+                ):
+                    full_job = FullFrameJob(
+                        frames=frames,
+                        frame_idx=frame_idx,
+                        exposure_pc=exposure_pc,
+                        elapsed_s=frame_elapsed_s,
+                        car_loc_sampled=car_loc_sampled,
+                    )
+                    try:
+                        _full_job_queue.put_nowait(full_job)
+                        _full_queue_max_size = max(
+                            _full_queue_max_size,
+                            _full_job_queue.qsize(),
+                        )
+                    except queue.Full:
+                        _full_drop_count += 1
+                        if car_loc_sampled:
+                            car_loc_dropped_frames += 1
+                            archive_thread.submit(CarLocEvent(
+                                frame_idx=frame_idx,
+                                exposure_pc=exposure_pc,
+                                elapsed_s=frame_elapsed_s,
+                                status="dropped",
+                            ))
 
                 det_results = _yolo_detect_n(
                     detector, tile_imgs, engine_batch)
@@ -2069,16 +2167,6 @@ def main() -> int:
                         "duration": round(p.ht - p.ct, 4),
                     })
 
-                # ── 投递视频写入线程（线3，非阻塞，图像传引用不复制）──
-                if writer_thread is not None:
-                    writer_thread.submit(WriteJob(
-                        images=images,
-                        serials=cam_serials,
-                        exposure_perf=exposure_pc,
-                        elapsed_s=frame_elapsed_s,
-                        frame_idx=frame_idx,
-                    ))
-
                 # ── 投递归档线程（线3，非阻塞，只传业务数据）──
                 archive_thread.submit(ArchiveJob(
                     frame_idx=frame_idx,
@@ -2113,8 +2201,9 @@ def main() -> int:
                         f"({fps:.1f} fps)  "
                         f"state={tracker_result.state.value}  "
                         f"avg: cap={_t_capture_sum/n*1000:.1f}ms "
-                        f"decode={_t_decode_sum/n*1000:.1f}ms "
+                        f"tile={_t_decode_sum/n*1000:.1f}ms "
                         f"yolo={_t_yolo_sum/n*1000:.1f}ms "
+                        f"full={_full_decode_time_sum/max(_full_decode_count, 1)*1000:.1f}ms "
                         f"other={_t_other_sum/n*1000:.1f}ms"
                         f"{writer_note}"
                     )
@@ -2124,7 +2213,17 @@ def main() -> int:
 
         # ── 清理 ──
         processing_elapsed = time.perf_counter() - t_start
-        # 先关 car_loc（确保把最后的 CarLocEvent 送到归档线程）
+        _tile_decode_pool.shutdown(wait=True)
+        # 先排空全图解码线，再关闭 car_loc / 视频消费者。
+        if _full_job_queue is not None:
+            _full_job_queue.put(None)
+        if _full_thread is not None:
+            _full_thread.join(timeout=10.0)
+            if _full_thread.is_alive():
+                raise RuntimeError(
+                    "full-frame worker did not finish before shutdown"
+                )
+        # 关闭 car_loc（确保把最后的 CarLocEvent 送到归档线程）
         if _car_job_queue is not None:
             _car_job_queue.put(None)
         if _car_thread is not None:
@@ -2139,7 +2238,7 @@ def main() -> int:
         writer_stats: dict[str, float | int | bool] = {"enabled": False}
         if writer_thread is not None:
             print("  等待视频写入完成...")
-            drop_count = writer_thread.stop()
+            drop_count = writer_thread.stop() + _full_drop_count
             written_frame_indices = writer_thread.written_frame_indices()
             writer_stats = writer_thread.stats()
         # 最后关归档线程
@@ -2177,6 +2276,10 @@ def main() -> int:
     timing_summary = {
         "capture_avg": round(_t_capture_sum / n_timing * 1000.0, 1),
         "decode_avg": round(_t_decode_sum / n_timing * 1000.0, 1),
+        "full_decode_avg": round(
+            _full_decode_time_sum / max(_full_decode_count, 1) * 1000.0,
+            1,
+        ),
         "yolo_avg": round(_t_yolo_sum / n_timing * 1000.0, 1),
         "other_avg": round(_t_other_sum / n_timing * 1000.0, 1),
     }
@@ -2356,9 +2459,16 @@ def main() -> int:
     print(
         "  时序(ms):   "
         f"cap={timing_summary['capture_avg']:.1f}  "
-        f"decode={timing_summary['decode_avg']:.1f}  "
+        f"tile={timing_summary['decode_avg']:.1f}  "
         f"yolo={timing_summary['yolo_avg']:.1f}  "
+        f"full={timing_summary['full_decode_avg']:.1f}(async)  "
         f"other={timing_summary['other_avg']:.1f}"
+    )
+    print(
+        "  全图异步线: "
+        f"decoded={_full_decode_count}  "
+        f"dropped={_full_drop_count}  "
+        f"qmax={_full_queue_max_size}"
     )
     print(
         "  YOLO批量:   "
