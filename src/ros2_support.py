@@ -4,12 +4,12 @@ import os
 import sys
 from pathlib import Path
 
-TRACKER_PC_IP = os.environ.get("BALL_TRACER_PC_IP", "192.168.50.230")
+TRACKER_PC_IP = os.environ.get("BALL_TRACER_PC_IP", "192.168.50.153")
 # 一台车一个 RK IP（车上静态配置，换路由器/换楼层都不变，2026-08-18 定）。
 # 旧的 ARM_RK_IP/CHASSIS_RK_IP 两个字段其实是两台车各自的 IP，概念已废。
 CAR_RK_IPS = {
     "v03": "192.168.50.143",
-    "v04": "192.168.50.68",
+    "v04": "192.168.50.208",
 }
 # run_tracker.ps1 按 -Car 设置；没设时列出两台车（本值只用于启动打印，
 # 实际 DDS 发现走 CYCLONEDDS_URI 指到的 xml 里的 Peers）

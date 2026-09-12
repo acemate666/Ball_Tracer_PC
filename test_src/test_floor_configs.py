@@ -26,14 +26,14 @@ class SiteConfigTest(unittest.TestCase):
         self.assertEqual(camera_serials, set(calib["cameras"]))
 
     def test_ros2_addresses(self) -> None:
-        # 2026-08-18 换路由器后 PC 一律绑 192.168.50.230（Wi-Fi，路由器保留），
-        # Peers 是两台车各自唯一的 IP（v03=.143 / v04=.68，车上静态配置）。
-        car_ips = {"192.168.50.143", "192.168.50.68"}
+        # 18F PC 当前绑定 192.168.50.153（Wi-Fi）。
+        # Peers 是两台车各自唯一的 IP（v03=.143 / v04=.208，车上静态配置）。
+        car_ips = {"192.168.50.143", "192.168.50.208"}
         for filename in ("cyclonedds_18.xml",):
             root = ET.parse(ROS2_DIR / filename).getroot()
             self.assertEqual(
                 root.find("./Domain/General/Interfaces/NetworkInterface").attrib["address"],
-                "192.168.50.230",
+                "192.168.50.153",
             )
             peers = {
                 peer.attrib["Address"]

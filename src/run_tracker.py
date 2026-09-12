@@ -451,6 +451,10 @@ class RosbagRecorderProcess:
                     "--stop-file",
                     str(self.stop_file),
                 ],
+                env={
+                    **os.environ,
+                    "CYCLONEDDS_URI": _ros_runtime_config()["cyclone_uri"],
+                },
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
             )
             print(f"  rosbag 录制进程已启动 (PID={self._proc.pid}) -> {self.bag_dir}")
@@ -460,6 +464,9 @@ class RosbagRecorderProcess:
 
     def was_started(self) -> bool:
         return self._proc is not None
+
+    def is_running(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
 
     def close(self, *, timeout_sec: float = 10.0) -> None:
         if self._proc is None:
@@ -2701,6 +2708,9 @@ def main() -> int:
 
         try:
             while not _shutdown.is_set() and time.perf_counter() - t_start < args.duration:
+                if _rosbag_proc is not None and not _rosbag_proc.is_running():
+                    print("ERROR: rosbag recorder stopped; ending capture. Check recorder/IMU errors above.")
+                    break
                 # 检测停止文件
                 if _stop_file.exists():
                     print("检测到停止文件，优雅退出...")

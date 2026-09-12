@@ -9,10 +9,50 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import contextlib
+import json
 import time
 from pathlib import Path
 
 import rosbag2_py
+
+
+async def record_imu_until_stopped(stop_file: Path, address: str) -> None:
+    import rclpy
+    from std_msgs.msg import String
+    from racket_imu import TOPIC, stream_racket_imu
+
+    rclpy.init()
+    node = rclpy.create_node("racket_imu_recorder")
+    publisher = node.create_publisher(String, TOPIC, 200)
+    task = None
+    try:
+        # Start BLE only once the bag recorder has discovered the topic.
+        deadline = time.perf_counter() + 5
+        while publisher.get_subscription_count() == 0:
+            if stop_file.exists():
+                return
+            if time.perf_counter() >= deadline:
+                raise RuntimeError("Rosbag recorder did not subscribe to /racket/imu")
+            await asyncio.sleep(0.05)
+        task = asyncio.create_task(stream_racket_imu(
+            address, lambda sample: publisher.publish(String(data=json.dumps(sample))),
+        ))
+        while not stop_file.exists():
+            if task.done():
+                task.result()
+                raise RuntimeError("Racket IMU stream stopped unexpectedly")
+            await asyncio.sleep(0.05)
+    finally:
+        try:
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        finally:
+            node.destroy_node()
+            rclpy.shutdown()
 
 
 def main() -> int:
@@ -26,6 +66,8 @@ def main() -> int:
         help="该文件出现时停止录制并退出",
     )
     args = parser.parse_args()
+    config = json.loads((Path(__file__).parent / "config" / "tracker.json").read_text(encoding="utf-8"))
+    imu = config["racket_imu"]
 
     storage_options = rosbag2_py.StorageOptions(uri=str(args.output))
     record_options = rosbag2_py.RecordOptions()
@@ -38,8 +80,11 @@ def main() -> int:
     recorder.start_spin()
     recorder.record()
     try:
-        while not args.stop_file.exists():
-            time.sleep(0.2)
+        if imu["enabled"]:
+            asyncio.run(record_imu_until_stopped(args.stop_file, imu["address"]))
+        else:
+            while not args.stop_file.exists():
+                time.sleep(0.2)
     except KeyboardInterrupt:
         pass
     finally:

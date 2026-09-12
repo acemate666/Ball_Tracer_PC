@@ -18,6 +18,10 @@
         "radius_px": 2.0,
         "min_occurrences": 6
     },
+    "racket_imu": {
+        "enabled": true,
+        "address": "F4:69:A2:72:B4:23"
+    },
     "racket_impact": {
         "enabled": true,
         "control_usage": "record_only",

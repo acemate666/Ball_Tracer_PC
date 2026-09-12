@@ -67,10 +67,10 @@ $mvsMvImport = 'C:\Program Files (x86)\MVS\Development\Samples\Python\MvImport'
 
 # 18F 是唯一在用的场地（2026-09-06 用户定案，16F 已停用、相机不会再变）：相机
 # DB026xxx + action 广播触发、标定 four_camera_calib_18.json、DDS cyclonedds_18.xml、
-# PC 走 Wi-Fi 的 192.168.50.230。没有第二套了，直接写死；别再引入 -Floor 这种
+# PC 走 Wi-Fi 的 192.168.50.153。没有第二套了，直接写死；别再引入 -Floor 这种
 # 「一个开关选一整套」的分支，它上一次的作用就是让人猜错默认值。
 # 车的 RK IP 不写在这里：一台车一个 IP（车上静态配置），跟着 -Car 走，见 $carRkIps。
-$trackerPcIp      = '192.168.50.230'
+$trackerPcIp      = '192.168.50.153'
 $cycloneXmlName   = 'cyclonedds_18.xml'
 $cameraConfigName = 'camera_18.json'
 $calibConfigName  = 'four_camera_calib_18.json'
@@ -90,7 +90,7 @@ function Get-LocalIPv4Addresses {
 # 以前配置里的 ArmRkIp/ChassisRkIp 两个字段其实就是两台车各自的 IP，概念已废。
 $carRkIps = @{
     'v03' = '192.168.50.143'
-    'v04' = '192.168.50.68'
+    'v04' = '192.168.50.208'
 }
 
 $localIps = Get-LocalIPv4Addresses

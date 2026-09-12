@@ -13,12 +13,13 @@
 
 ## 总览
 
-当前 PC 侧发布 2 个 topic：
+当前 PC 侧 topic：
 
 | Topic | ROS 类型 | 实际载荷 | QoS | 说明 |
 | --- | --- | --- | --- | --- |
 | `/pc_car_loc` | `std_msgs/msg/String` | JSON 字符串 | `BEST_EFFORT`, depth=1 | 小车定位结果 |
 | `/racket_vz` | `std_msgs/msg/String` | JSON 字符串 | `RELIABLE`, depth=4 | 球员拍头竖直速度，每抛一条（见 §2） |
+| `/racket/imu` | `std_msgs/msg/String` | JSON 字符串 | `RELIABLE`, depth=200 | 拍柄 IMU 原始蓝牙通知，随 bag 录制 |
 
 说明：
 - `/predict_hit_pos` 现由 **RK 车载 bot_center 发布**（PC 只在 rosbag 里记录它）；
@@ -28,6 +29,24 @@
   （WinRKTimeSync 应答）随 newarm2 线于 2026-07-16 废弃删除。两轴对时不再有
   运行时组件：RK 全站自带 CLOCK_MONOTONIC 时间，报告端固定 `scale=1`，每场只拟合
   `PC t = RK t + bias`。
+
+## 拍柄 IMU 录制 `/racket/imu`
+
+`src/config/tracker.json` 的 `racket_imu.enabled=true` 时，随现有 rosbag
+录制进程启动，停止 tracker 时一起断开。`--no-log` 不启动 IMU。
+`address` 指定蓝牙地址，当前为 `WT901BLE68` / `F4:69:A2:72:B4:23`。
+WitMotion 上位机需要先断开设备。ROS2 录制环境依赖 `bleak==3.0.1`。
+
+- 类型：`std_msgs/msg/String`，JSON；QoS：RELIABLE，depth=200。
+- `recv_pc`：PC 收到蓝牙通知时的 `time.perf_counter()` 秒，**不是设备采样时间**。
+- `address`：本条数据来源设备的蓝牙地址。
+- `notification_index`：从 0 开始的通知序号，用于检查 bag 是否漏记通知。
+- `raw_hex`：一次 BLE 通知的完整原始字节，十六进制字符串；不拆包、不丢弃设备时间字段。
+  本机实测当前设备发送 `55 E0` 批量数据，一次通知 176 字节。
+
+本阶段只录原始数据，不解码姿态/加速度、不计算速度，不配置设备量程/输出频率。
+不把包内设备日历时间转换到 PC 时间轴。未发现设备或连续 2 秒无数据会报错并关闭 bag；
+tracker 检测到录制进程退出后停止采集、保存已有结果。
 
 ## 通用约定
 
