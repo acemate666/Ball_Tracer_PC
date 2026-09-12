@@ -73,3 +73,7 @@ tmp/
 arm_controller_data/
 manual_triangulation/*
 .pytest_tmp_*/
+
+# -- cloud sync runtime logs (not source) --
+sync_log*.txt
+sync_err.txt
