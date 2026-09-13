@@ -514,6 +514,8 @@ def main() -> int:
                 rel_z=payload.get("rel_z"),
                 car_pred_x=payload.get("car_pred_x"),
                 car_pred_y=payload.get("car_pred_y"),
+                arm_pred_x=payload.get("arm_pred_x"),
+                arm_pred_y=payload.get("arm_pred_y"),
                 n_bounce_fit=payload.get("n_bounce_fit"),
                 rvz=payload.get("rvz"),
                 cor_xy_eff=payload.get("cor_xy_eff"),

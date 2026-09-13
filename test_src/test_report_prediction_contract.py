@@ -58,6 +58,44 @@ def _embedded_report_data(html_path: Path) -> dict:
     return json.loads(match.group(1))
 
 
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+@pytest.mark.parametrize("runtime_coefficients", [None, (0.0, 0.0), (0.36441583352036017, 1.1528285465425736)])
+def test_report_collision_coefficients_come_only_from_recorded_arm_config(
+        tmp_path, runtime_coefficients):
+    tracker = tmp_path / "tracker.json"
+    tracker.write_text(json.dumps({
+        "config": {"return_e_eff": 0.44}, "summary": {}, "frames": [],
+    }), encoding="utf-8")
+    rk = tmp_path / "rk.json"
+    announcement = {} if runtime_coefficients is None else {
+        "arm": {"params": {
+            "return_collision_en": runtime_coefficients[0],
+            "return_collision_kt": runtime_coefficients[1],
+        }},
+    }
+    rk.write_text(json.dumps({"config_announce": announcement}), encoding="utf-8")
+    html = tmp_path / "report.html"
+    generated = subprocess.run(
+        [sys.executable, str(SRC), "--input", str(tracker), "--rk-tracking-json", str(rk),
+         "--output", str(html), "--no-tables"],
+        capture_output=True, text=True, encoding="utf-8", timeout=30,
+    )
+    assert generated.returncode == 0, generated.stderr
+    snapshot = tmp_path / "snapshot.json"
+    rendered = subprocess.run(
+        [NODE, str(SRC.with_name("report_page_snapshot.js")), str(html), str(snapshot)],
+        capture_output=True, text=True, encoding="utf-8", timeout=30,
+    )
+    assert rendered.returncode == 0, rendered.stderr
+    page = json.loads(snapshot.read_text(encoding="utf-8"))
+    assert page["error"] is None
+    assert page["tabErrors"] == []
+    expected_en = "-" if runtime_coefficients is None else format(runtime_coefficients[0], ".17g")
+    expected_kt = "-" if runtime_coefficients is None else format(runtime_coefficients[1], ".17g")
+    assert f'Arm collision e_n（末次公告）: <span class="v">{expected_en}</span>' in page["captured"]["st"]
+    assert f'Arm collision k_t（末次公告）: <span class="v">{expected_kt}</span>' in page["captured"]["st"]
+
+
 def test_racket_impact_sidecar_requires_explicit_v3_provenance(tmp_path):
     tracker = tmp_path / "tracker_demo.json"
     tracker.write_text(
@@ -783,6 +821,53 @@ def test_arm_point_world_contract_uses_yaw_and_ground_height(tmp_path):
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_arm_origin_translation_and_target_truth_preserve_historical_origin(tmp_path):
+    """臂座前移只平移一次；新目标真值转臂心，历史真值不动，缺变换字段则留空。"""
+    script = (
+        "const isNum=v=>typeof v==='number'&&Number.isFinite(v);\n"
+        + _core("arm-point-world-core-begin", "arm-point-world-core-end")
+        + "\nconst truth={x:1,y:2,z:3,err:.02};\n"
+          "const legacy=pcTruthForTarget(truth,{armOrigin:false},90,.045);\n"
+          "const arm=pcTruthForTarget(truth,{armOrigin:true},90,.045);\n"
+          "const zeroYaw=carRelativePointToArm([1,2,3],0,.045);\n"
+          "const missingYaw=pcTruthForTarget(truth,{armOrigin:true},null,.045);\n"
+          "const missingOffset=pcTruthForTarget(truth,{armOrigin:true},0,null);\n"
+          "const tcpArm=armPointWorld([1,.2,1.2],90,-.17);\n"
+          "const visualCar=[tcpArm[0]-.045,tcpArm[1],tcpArm[2]];\n"
+          "const visualArm=carRelativePointToArm(visualCar,90,.045);\n"
+          "console.log(JSON.stringify({legacy,unchanged:legacy===truth,arm,zeroYaw,"
+          "missingYaw,missingOffset,visualError:visualArm.map((v,k)=>v-tcpArm[k])}));\n"
+    )
+    result = _run_node(tmp_path, script)
+    assert result["unchanged"] is True
+    assert result["legacy"] == {"x": 1, "y": 2, "z": 3, "err": 0.02}
+    assert result["arm"]["origin"] == "arm"
+    assert [result["arm"][k] for k in ("x", "y", "z")] == pytest.approx([1.045, 2, 3])
+    assert result["arm"]["err"] == 0.02
+    assert result["zeroYaw"] == pytest.approx([1, 1.955, 3])
+    assert result["visualError"] == pytest.approx([0, 0, 0], abs=1e-15)
+    assert "originError" in result["missingYaw"]
+    assert "originError" in result["missingOffset"]
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+@pytest.mark.parametrize("arm_xy", [None, [0.0, 0.045]])
+def test_accepted_target_origin_comes_from_explicit_arm_fields(tmp_path, arm_xy):
+    event = _pred_event(9.95, 10.510)
+    if arm_xy is not None:
+        payload = json.loads(event["text"])
+        payload.update(arm_pred_x=arm_xy[0], arm_pred_y=arm_xy[1])
+        event["text"] = json.dumps(payload)
+    events = [event, _status_event(
+        10.0, "accepted hit x=1.0000 z=1.0360 duration=0.5000 hit_time=0.2500")]
+    result = _run_node(tmp_path, _swing_ht_harness(json.dumps(events)))[0]
+    assert result["armOrigin"] is (arm_xy is not None)
+    assert result["wx"] == 1.0  # 原始实际消费目标不被报告重新扣45mm。
+    if arm_xy is not None:
+        assert result["armPredX"] == arm_xy[0]
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
 def test_swing_ht_replan_skipped_when_remaining_too_short(tmp_path):
     """新触球距触发点 <60ms 时控制器放弃重定相：finalHt/finalDone 退回最后一条 accepted。"""
     events = [
@@ -1067,8 +1152,10 @@ def test_main_pc_truth_columns_anchor_pre300ht_and_finalht():
     assert "const pre300HtPcSample=pre300Ht!=null?pcSampleTimeForThrow(th,pre300Ht):null;" in source
     assert "const truthFin=finalHtPcSample!=null?pcTruthAt(finalHtPcSample):null;" in source
     assert "const truthPre=pre300HtPcSample!=null?pcTruthAt(pre300HtPcSample):null;" in source
-    assert "pcTruthCell(truthPre,true,pre300HtPcSample)" in source
-    assert "pcTruthCell(truthFin,true,finalHtPcSample)" in source
+    assert "const originTruthFin=pcTruthForTarget(truthFin,fin," in source
+    assert "const originTruthPre=pcTruthForTarget(truthPre,pre," in source
+    assert "pcTruthCell(originTruthPre,true,pre300HtPcSample)" in source
+    assert "pcTruthCell(originTruthFin,true,finalHtPcSample)" in source
     assert "PC真值@Pre300HT+zPhase<br>x/y/z(cm)<br>(y为球接触面)</th>" in source
     assert "PC真值@FinalHT+zPhase<br>x/y/z(cm)<br>(y为球接触面)</th>" in source
     # 旧锚（末次 target 对应预测 HT / 臂最后更新HT / accepted HT）与随之撤下的列不得残留在主表
@@ -1081,20 +1168,20 @@ def test_main_pc_truth_columns_anchor_pre300ht_and_finalht():
     assert "const pcTruthCell = (f,withY=false,tPc=null) => {" in source
     assert "const R_BALL=0.033;" in source
     assert "const yValue=f.y-R_BALL;" in source
-    assert "y=(球心world_y−R球3.3cm)−车体中心world_y" in source
+    assert "原点随对应消息，有 arm_pred_x/y 为臂中心，历史未含字段为车心" in source
     assert "y 均显示球接触面" in source
     assert "if(!f) return pcTruthMissCell(tPc);" in source
     assert "PC 小车定位在该时刻缺失" in source
     assert "PC 球观测不足" in source
     # Arm Accepted 分表仍评估 accepted 消息自身的预测质量，锚它自己的 ht
-    assert "const truth=accHtPcSample!=null?pcTruthAt(accHtPcSample):null;" in source
+    assert "const truth=pcTruthForTarget(accHtPcSample!=null?pcTruthAt(accHtPcSample):null," in source
     assert "<td>'+pcTruthCell(truth,false,accHtPcSample)+'</td>" in source
     # 0803 起已删列（开始触球/球×车相交/旧 preHt）不应残留；Pre300HT 是 0904 新口径，变量名不含旧 preHt
     for gone in ("touchT", "pcMeetTrueAt", "TOUCH_DWELL_LEAD_S", "开始触球", "球×车相交", "preHt", "hitTableHtml"):
         assert gone not in source, gone
     assert "y:fy[0]-c.y" in source
     assert "x:fx[0]-c.x" in source
-    coord_note = "PC真值采用世界坐标轴，不随车体 yaw 旋转。x = 拟合球心 world_x − 同时刻插值车体中心 world_x"
+    coord_note = "PC真值采用世界坐标轴，不随车体 yaw 旋转。原点跟随对应目标"
     assert source.index('id="p5"') < source.index(coord_note) < source.index('id="rk300Tbl"')
 
 
@@ -1540,6 +1627,8 @@ def test_rk_plot_uses_predict_hit_car_position_and_removes_old_traces():
 
     assert 'car_pred_x=payload.get("car_pred_x")' in extractor
     assert 'car_pred_y=payload.get("car_pred_y")' in extractor
+    assert 'arm_pred_x=payload.get("arm_pred_x")' in extractor
+    assert 'arm_pred_y=payload.get("arm_pred_y")' in extractor
     assert 'rvz=payload.get("rvz")' in extractor
     assert 'cor_xy_eff=payload.get("cor_xy_eff")' in extractor
     assert 'cor_eff=payload.get("cor_eff")' in extractor
