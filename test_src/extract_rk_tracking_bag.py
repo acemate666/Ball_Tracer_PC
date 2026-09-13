@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 from pathlib import Path
 
 
@@ -33,13 +34,131 @@ CONFIG_TOPICS = {
 }
 
 _TENNIS_BALL_RADIUS_M = 0.033
+_FINAL_HIT_PLAN_FINGERPRINT_RE = re.compile(
+    r"world3d_effective_v3_arm_center_sweetspot:[0-9a-f]{16}\Z"
+)
 _GRAVITY_MPS2 = 9.8
 _STAGE1_LAMBDA_MIN = 0.02
 _STAGE1_LAMBDA_MAX = 0.40
 
 
 def _finite(value) -> bool:
-    return isinstance(value, (int, float)) and math.isfinite(value)
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def _valid_final_hit_plan_physics(payload: dict) -> bool:
+    """Verify the redundant world-frame fields in FinalHitPlan/v1."""
+    tolerance = 1e-4
+    normal_tolerance = 1e-5
+    yaw = payload["face_normal_yaw_world"]
+    pitch = payload["face_pitch"]
+    horizontal_normal = (-math.sin(yaw), math.cos(yaw))
+
+    relative_error = math.sqrt(
+        (payload["contact_x"] - payload["arm_center_x"] - payload["contact_rel_x"]) ** 2
+        + (payload["contact_y"] - payload["arm_center_y"] - payload["contact_rel_y"]) ** 2
+        + (payload["contact_z"] - payload["contact_rel_z"]) ** 2
+    )
+    if relative_error > tolerance:
+        return False
+
+    offset_x = -payload["arm_forward_offset_m"] * math.sin(payload["car_yaw_at_ht"])
+    offset_y = payload["arm_forward_offset_m"] * math.cos(payload["car_yaw_at_ht"])
+    arm_position_error = math.hypot(
+        payload["arm_center_x"] - payload["car_center_x"] - offset_x,
+        payload["arm_center_y"] - payload["car_center_y"] - offset_y,
+    )
+    arm_velocity_error = math.hypot(
+        payload["arm_center_vx"]
+        - payload["car_center_vx"]
+        + payload["car_yaw_rate_at_ht"] * offset_y,
+        payload["arm_center_vy"]
+        - payload["car_center_vy"]
+        - payload["car_yaw_rate_at_ht"] * offset_x,
+    )
+    if arm_position_error > tolerance or arm_velocity_error > tolerance:
+        return False
+
+    contact_plane = (
+        horizontal_normal[0] * payload["contact_rel_x"]
+        + horizontal_normal[1] * payload["contact_rel_y"]
+    )
+    if abs(contact_plane - payload["tennis_ball_radius_m"]) > tolerance:
+        return False
+
+    target_error = math.sqrt(
+        (
+            payload["arm_target_rel_x"]
+            - payload["contact_rel_x"]
+            + payload["tennis_ball_radius_m"] * horizontal_normal[0]
+            - payload["arm_target_x_bias_m"]
+        ) ** 2
+        + (
+            payload["arm_target_rel_y"]
+            - payload["contact_rel_y"]
+            + payload["tennis_ball_radius_m"] * horizontal_normal[1]
+        ) ** 2
+        + (
+            payload["arm_target_rel_z"]
+            - payload["contact_rel_z"]
+            - payload["arm_target_z_bias_m"]
+        ) ** 2
+    )
+    if target_error > tolerance:
+        return False
+
+    expected_normal = (
+        horizontal_normal[0] * math.cos(pitch),
+        horizontal_normal[1] * math.cos(pitch),
+        math.sin(pitch),
+    )
+    normal_error = math.sqrt(
+        sum(
+            (payload[key] - expected) ** 2
+            for key, expected in zip(
+                ("face_normal_nx", "face_normal_ny", "face_normal_nz"),
+                expected_normal,
+            )
+        )
+    )
+    if normal_error > normal_tolerance:
+        return False
+
+    expected_racket_xy = (
+        payload["arm_center_vx"]
+        - payload["car_yaw_rate_at_ht"] * payload["arm_target_rel_y"]
+        + payload["compensated_speed"] * horizontal_normal[0],
+        payload["arm_center_vy"]
+        + payload["car_yaw_rate_at_ht"] * payload["arm_target_rel_x"]
+        + payload["compensated_speed"] * horizontal_normal[1],
+    )
+    if math.hypot(
+        payload["racket_contact_vx"] - expected_racket_xy[0],
+        payload["racket_contact_vy"] - expected_racket_xy[1],
+    ) > tolerance:
+        return False
+
+    incoming = tuple(payload[f"incoming_v{axis}"] for axis in "xyz")
+    racket = tuple(payload[f"racket_contact_v{axis}"] for axis in "xyz")
+    normal = tuple(payload[f"face_normal_n{axis}"] for axis in "xyz")
+    relative = tuple(vin - vr for vin, vr in zip(incoming, racket))
+    relative_normal = sum(value * axis for value, axis in zip(relative, normal))
+    replay = tuple(
+        vr
+        + payload["collision_kt"] * (value - relative_normal * axis)
+        - payload["collision_en"] * relative_normal * axis
+        for vr, value, axis in zip(racket, relative, normal)
+    )
+    return math.sqrt(
+        sum(
+            (payload[f"outgoing_v{axis}"] - expected) ** 2
+            for axis, expected in zip("xyz", replay)
+        )
+    ) <= tolerance
 
 
 def _topic_key(topic: str) -> str:
@@ -78,6 +197,8 @@ def _report_prediction_payload(payload: dict) -> dict | None:
         "incoming_vx", "incoming_vy", "incoming_vz",
         "arm_center_x", "arm_center_y", "arm_center_vx", "arm_center_vy",
         "car_center_x", "car_center_y", "car_center_vx", "car_center_vy",
+        "arm_forward_offset_m", "tennis_ball_radius_m",
+        "arm_target_x_bias_m", "arm_target_z_bias_m",
         "car_yaw_at_ht", "car_yaw_rate_at_ht",
         "face_normal_yaw_world", "face_pitch",
         "face_normal_nx", "face_normal_ny", "face_normal_nz",
@@ -92,10 +213,10 @@ def _report_prediction_payload(payload: dict) -> dict | None:
         or not isinstance(payload.get("plan_id"), str)
         or not payload["plan_id"]
         or not isinstance(payload.get("model_fingerprint"), str)
-        or not payload["model_fingerprint"]
+        or _FINAL_HIT_PLAN_FINGERPRINT_RE.fullmatch(payload["model_fingerprint"]) is None
         or not isinstance(payload.get("revision"), int)
         or isinstance(payload["revision"], bool)
-        or payload["revision"] < 0
+        or payload["revision"] < 1
         or not isinstance(payload.get("n_points"), int)
         or isinstance(payload["n_points"], bool)
         or payload["n_points"] < 1
@@ -104,7 +225,14 @@ def _report_prediction_payload(payload: dict) -> dict | None:
         or not 1 <= payload["solve_iterations"] <= 4
         or not payload["source_ct"] <= payload["generated_at"] < payload["contact_ht"]
         or payload["solve_ms"] < 0
+        or payload["arm_forward_offset_m"] < 0
+        or payload["tennis_ball_radius_m"] <= 0
+        or payload["compensated_speed"] <= 0
+        or payload["collision_en"] < 0
+        or payload["collision_kt"] < 0
     ):
+        return None
+    if not _valid_final_hit_plan_physics(payload):
         return None
     return {
         **payload,

@@ -1869,6 +1869,7 @@ const SWING_HT_UPDATE_MIN_REMAINING_SEC=0.060;
 // （0809 103849 场）。截断已修，但解析失败仍要显式暴露，见 armDataWarnHtml。
 // [[final-hit-plan-parse-core-begin]]
 const FINAL_HIT_PLAN_CONTRACT='final_hit_plan/v1';
+const FINAL_HIT_PLAN_FINGERPRINT_RE=/^world3d_effective_v3_arm_center_sweetspot:[0-9a-f]{16}$/;
 const FINAL_HIT_PLAN_FINITE_FIELDS=[
   'source_ct','generated_at','contact_ht','n_points',
   'contact_rel_x','contact_rel_y','contact_rel_z',
@@ -1876,6 +1877,7 @@ const FINAL_HIT_PLAN_FINITE_FIELDS=[
   'contact_x','contact_y','contact_z','incoming_vx','incoming_vy','incoming_vz',
   'arm_center_x','arm_center_y','arm_center_vx','arm_center_vy',
   'car_center_x','car_center_y','car_center_vx','car_center_vy',
+  'arm_forward_offset_m','tennis_ball_radius_m','arm_target_x_bias_m','arm_target_z_bias_m',
   'racket_contact_vx','racket_contact_vy','racket_contact_vz',
   'car_yaw_at_ht','car_yaw_rate_at_ht','face_normal_yaw_world','face_pitch',
   'face_normal_nx','face_normal_ny','face_normal_nz',
@@ -1904,7 +1906,7 @@ const armPreds = (()=>{
         if(p.kind==='preaim_hint'){
           armPreaimCount+=1;
           const bad=p.contract!=='preaim_hint/v1'||typeof p.hint_id!=='string'||!p.hint_id
-            ||!Number.isInteger(p.revision)||p.revision<0
+            ||!Number.isInteger(p.revision)||p.revision<1
             ||!['source_ct','generated_at','estimate_ht','n_points',
                 'estimate_rel_x','estimate_rel_y','estimate_rel_z',
                 'car_yaw_estimate','face_normal_yaw_seed'].every(k=>isNum(p[k]))
@@ -1920,8 +1922,9 @@ const armPreds = (()=>{
         const missing=[];
         if(p.contract!==FINAL_HIT_PLAN_CONTRACT) missing.push('contract='+String(p.contract));
         if(typeof p.plan_id!=='string'||!p.plan_id) missing.push('plan_id');
-        if(!Number.isInteger(p.revision)||p.revision<0) missing.push('revision');
-        if(typeof p.model_fingerprint!=='string'||!p.model_fingerprint) missing.push('model_fingerprint');
+        if(!Number.isInteger(p.revision)||p.revision<1) missing.push('revision');
+        if(typeof p.model_fingerprint!=='string'||!FINAL_HIT_PLAN_FINGERPRINT_RE.test(p.model_fingerprint))
+          missing.push('model_fingerprint');
         FINAL_HIT_PLAN_FINITE_FIELDS.forEach(k=>{ if(!isNum(p[k])) missing.push(k); });
         if(isNum(p.source_ct)&&isNum(p.contact_ht)&&!(p.source_ct<p.contact_ht)) missing.push('source_ct<contact_ht');
         if(isNum(p.generated_at)&&isNum(p.source_ct)&&p.generated_at<p.source_ct) missing.push('generated_at>=source_ct');
@@ -1930,6 +1933,11 @@ const armPreds = (()=>{
           missing.push('solve_iterations[1,4]');
         if(isNum(p.solve_ms)&&p.solve_ms<0) missing.push('solve_ms>=0');
         if(isNum(p.n_points)&&(!Number.isInteger(p.n_points)||p.n_points<1)) missing.push('n_points');
+        if(isNum(p.arm_forward_offset_m)&&p.arm_forward_offset_m<0) missing.push('arm_forward_offset_m>=0');
+        if(isNum(p.tennis_ball_radius_m)&&p.tennis_ball_radius_m<=0) missing.push('tennis_ball_radius_m>0');
+        if(isNum(p.compensated_speed)&&p.compensated_speed<=0) missing.push('compensated_speed>0');
+        if(isNum(p.collision_en)&&p.collision_en<0) missing.push('collision_en>=0');
+        if(isNum(p.collision_kt)&&p.collision_kt<0) missing.push('collision_kt>=0');
         if(['contact_x','contact_y','contact_z','arm_center_x','arm_center_y',
             'contact_rel_x','contact_rel_y','contact_rel_z'].every(k=>isNum(p[k]))){
           const relErr=Math.hypot(
@@ -1941,11 +1949,17 @@ const armPreds = (()=>{
         if(['arm_center_x','arm_center_y','arm_center_vx','arm_center_vy',
             'car_center_x','car_center_y','car_center_vx','car_center_vy',
             'car_yaw_at_ht','car_yaw_rate_at_ht'].every(k=>isNum(p[k]))){
-          const rx=-0.045*Math.sin(p.car_yaw_at_ht), ry=0.045*Math.cos(p.car_yaw_at_ht);
+          const rx=-p.arm_forward_offset_m*Math.sin(p.car_yaw_at_ht);
+          const ry= p.arm_forward_offset_m*Math.cos(p.car_yaw_at_ht);
           const armErr=Math.hypot(p.arm_center_x-(p.car_center_x+rx),p.arm_center_y-(p.car_center_y+ry));
           const armVErr=Math.hypot(p.arm_center_vx-(p.car_center_vx-p.car_yaw_rate_at_ht*ry),
                                    p.arm_center_vy-(p.car_center_vy+p.car_yaw_rate_at_ht*rx));
-          if(armErr>1e-4||armVErr>1e-4) missing.push('car→arm 4.5cm刚体变换一致性');
+          if(armErr>1e-4||armVErr>1e-4) missing.push('car→arm刚体变换一致性');
+        }
+        if(['contact_rel_x','contact_rel_y','face_normal_yaw_world','tennis_ball_radius_m'].every(k=>isNum(p[k]))){
+          const nhx=-Math.sin(p.face_normal_yaw_world), nhy=Math.cos(p.face_normal_yaw_world);
+          const plane=nhx*p.contact_rel_x+nhy*p.contact_rel_y;
+          if(Math.abs(plane-p.tennis_ball_radius_m)>1e-4) missing.push('水平触球平面一致性');
         }
         if(['face_normal_nx','face_normal_ny','face_normal_nz','face_normal_yaw_world','face_pitch'].every(k=>isNum(p[k]))){
           const nNorm=Math.hypot(p.face_normal_nx,p.face_normal_ny,p.face_normal_nz);
@@ -1954,6 +1968,24 @@ const armPreds = (()=>{
           const wrap=a=>Math.atan2(Math.sin(a),Math.cos(a));
           if(Math.abs(nNorm-1)>1e-5||Math.abs(wrap(yaw-p.face_normal_yaw_world))>1e-5
              ||Math.abs(pitch-p.face_pitch)>1e-5) missing.push('拍面法向/yaw/pitch一致性');
+        }
+        if(['contact_rel_x','contact_rel_y','contact_rel_z','arm_target_rel_x','arm_target_rel_y',
+            'arm_target_rel_z','face_normal_yaw_world','tennis_ball_radius_m',
+            'arm_target_x_bias_m','arm_target_z_bias_m'].every(k=>isNum(p[k]))){
+          const sn=Math.sin(p.face_normal_yaw_world), cs=Math.cos(p.face_normal_yaw_world);
+          const targetErr=Math.hypot(
+            p.arm_target_rel_x-(p.contact_rel_x+p.tennis_ball_radius_m*sn+p.arm_target_x_bias_m),
+            p.arm_target_rel_y-(p.contact_rel_y-p.tennis_ball_radius_m*cs),
+            p.arm_target_rel_z-(p.contact_rel_z+p.arm_target_z_bias_m));
+          if(targetErr>1e-4) missing.push('球心→拍心执行点一致性');
+        }
+        if(['arm_center_vx','arm_center_vy','car_yaw_rate_at_ht','arm_target_rel_x','arm_target_rel_y',
+            'compensated_speed','face_normal_yaw_world','racket_contact_vx','racket_contact_vy'].every(k=>isNum(p[k]))){
+          const nhx=-Math.sin(p.face_normal_yaw_world), nhy=Math.cos(p.face_normal_yaw_world);
+          const expectedVx=p.arm_center_vx-p.car_yaw_rate_at_ht*p.arm_target_rel_y+p.compensated_speed*nhx;
+          const expectedVy=p.arm_center_vy+p.car_yaw_rate_at_ht*p.arm_target_rel_x+p.compensated_speed*nhy;
+          if(Math.hypot(p.racket_contact_vx-expectedVx,p.racket_contact_vy-expectedVy)>1e-4)
+            missing.push('拍心世界水平速度一致性');
         }
         if(['incoming_vx','incoming_vy','incoming_vz','racket_contact_vx','racket_contact_vy','racket_contact_vz',
             'face_normal_nx','face_normal_ny','face_normal_nz','collision_en','collision_kt',
