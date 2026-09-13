@@ -2053,12 +2053,14 @@ const _armHit = (()=>{
            label:'hit', n:1, lates:[], hitT,
            // 挥拍计划量（老场次没有这些字段就是 null，列显示 —）：
            //   pitch=     0805 起的可变拍面仰角目标（°，臂系≡世界系）
-           //   speed=     0808 起恒带的计划触球拍速（m/s，拍心），已过各级钳位
+           //   speed=     共享三维碰撞反解的补偿后接触拍速目标（m/s，臂局部 J1 切向）
            //   speed_req= 钳位改动了拍速时补的原始指令值；shortened= 引拍被夹掉的 rad
            //   face_yaw=  臂端锁面目标（rad，臂系）
             tgtPitch:statusNum(e.text,'pitch'), tgtSpeed:statusNum(e.text,'speed'),
              tgtSpeedReq:statusNum(e.text,'speed_req'), shortened:statusNum(e.text,'shortened'),
              tgtFaceYaw:statusNum(e.text,'face_yaw'),
+             tgtApexZ:statusNum(e.text,'apex_z'),
+             tgtNetClearance:statusNum(e.text,'net_clearance'),
              tgtOutYaw:statusNum(e.text,'out_yaw'),
              tgtOutPitch:statusNum(e.text,'out_pitch'),
              tgtOutSpeed:statusNum(e.text,'out_speed'),
@@ -3720,21 +3722,22 @@ const rk300TableHtml = () => {
       :(accepted&&isNum(accepted.tgtPitch)?accepted.tgtPitch:null);
     const tgtFaceYawRad=isNum(doneNum('face_yaw'))?doneNum('face_yaw')
       :(accepted&&isNum(accepted.tgtFaceYaw)?accepted.tgtFaceYaw:null);
+    const tgtApexZ=accepted&&isNum(accepted.tgtApexZ)?accepted.tgtApexZ:null;
+    const tgtNetClearance=accepted&&isNum(accepted.tgtNetClearance)?accepted.tgtNetClearance:null;
     const tgtYawExtraDeg=aimPred&&isNum(aimPred.yawExtra)?aimPred.yawExtra*180/Math.PI:null;
     const tgtYawWorldDeg=tgtYawExtraDeg!=null?-tgtYawExtraDeg
       :(tgtFaceYawRad!=null&&aimPred&&isNum(aimPred.carYaw)?(tgtFaceYawRad-aimPred.carYaw)*180/Math.PI:null);
-    const tgtCell=(tgtSpeed!=null||tgtPitch!=null||tgtYawWorldDeg!=null)
+    const tgtCell=(tgtSpeed!=null||tgtPitch!=null||tgtYawWorldDeg!=null||tgtApexZ!=null||tgtNetClearance!=null)
       ? '<span title="'+tableEsc('目标三量来源='+(done?'RL FinalHT 目标（rl_swing done 状态的 speed_req/face_yaw/pitch）':'最后一条 accepted 状态的计划量')
           +'；speed='+(tgtSpeed!=null?tgtSpeed.toFixed(2)+'m/s':'—')
-          +(done?'（上游 speed 指令或拍速预测器解，RL 观测里的 speed_req）'
-            :('（arm_controller 过完各级钳位后的计划触球拍速，口径 2·|行程|/hit_time·x，只算 J1'
-              +(accepted&&isNum(accepted.tgtSpeedReq)?('；speed_req='+accepted.tgtSpeedReq.toFixed(2)+'m/s=上游原始指令，本拍被钳位'):'')
-              +(accepted&&isNum(accepted.shortened)?('；shortened='+accepted.shortened.toFixed(4)+'rad=引拍被夹掉的角度'):'')+'）'))
+          +'（共享三维碰撞模型反解的补偿后接触拍速目标，机械臂局部 J1 切向；碰撞前叠加同 payload 的底盘世界速度）'
           +'；yaw='+(tgtYawWorldDeg!=null?tableSigned(tgtYawWorldDeg)+'°':'—')
           +'=世界系拍面目标 yaw = face_yaw(臂系) − car_yaw = −δ'
           +(tgtYawExtraDeg!=null?'（δ=payload hit_yaw_extra='+tgtYawExtraDeg.toFixed(2)+'°，击球整体多转）':'')
           +(tgtFaceYawRad!=null?'；face_yaw(臂系锁面目标)='+(tgtFaceYawRad*180/Math.PI).toFixed(2)+'°':'')
           +'；pitch='+(tgtPitch!=null?tgtPitch.toFixed(2)+'°':'—')+'=目标拍面仰角（臂系≡世界系，可直接减右列实测 pitch）'
+          +(tgtApexZ!=null?('；apex_z='+tgtApexZ.toFixed(3)+'m=规划出球实际最高点（上限 2.700m，pitch 超过 28° 时自适应降低）'):'')
+          +(tgtNetClearance!=null?('；net_clearance='+tgtNetClearance.toFixed(3)+'m=球底相对 0.914m 网高的过网净空（要求 ≥0.100m）'):'')
           +htSrcNote)+'">'
           +(tgtSpeed!=null?tgtSpeed.toFixed(2):'—')+'/'+(tgtYawWorldDeg!=null?tableSigned(tgtYawWorldDeg):'—')+'/'
           +(tgtPitch!=null?tgtPitch.toFixed(1):'—')+'</span>'
@@ -3957,7 +3960,7 @@ const rk300TableHtml = () => {
     '悬停看世界坐标、车心、同曝光 TCP 与每帧质检。')+'">'+
     '视觉拍心−车心@FinalHT+zPhase附近<br>x/y/z(cm,世界轴)<br>人工轨迹或最近前/后＋ht前逐帧；视觉−同曝光TCP（dx，dy，dz）</th>'+
     '<th title="车体 yaw@FinalHT（与本表所有 RK/Arm 列同锚）：取 /bot_state 瞬时值——车控 accept AprilTag 定位后 yaw 由 IMU 连续更新、HT 结束后才重定位，故采样点无重定位台阶，挥拍位姿伪迹只塌陷位置不动 yaw。悬停看 IMU yaw_speed 换算的 10ms 时序灵敏度；右侧拍面yaw 直接减同一 RK yaw，不读取PC yaw">车yaw@FinalHT<br>(°)</th>'+
-    '<th title="目标三量：speed=目标触球拍速（m/s，拍心；RL=FinalHT 目标的 speed_req，规则=最后 accepted 过完钳位的计划值，悬停看 speed_req/shortened）/ yaw=世界系拍面目标 yaw=−δ（δ=payload hit_yaw_extra 击球整体多转；与右列实测世界 yaw 同口径）/ pitch=目标拍面仰角（°，臂系≡世界系）">目标挥拍速度/yaw/pitch<br>(m/s, °, °)</th>'+
+    '<th title="目标三量：speed=共享三维碰撞反解的补偿后接触拍速目标（m/s；机械臂局部 J1 切向，碰撞前叠加同 payload 的底盘世界速度；RL/规则同口径）/ yaw=世界系拍面目标 yaw=−δ（δ=payload hit_yaw_extra 击球整体多转；与右列实测世界 yaw 同口径）/ pitch=目标拍面仰角（°，臂系≡世界系）。悬停同时显示实际 apex_z 与球底过网净空 net_clearance">目标挥拍速度/yaw/pitch<br>(m/s, °, °)</th>'+
     '<th title="拍面法向（车型配置轴；V04 为 FK link6 +Y）的世界 yaw / pitch，同一份冲击前窗[−80,−6]ms 线性拟合@FinalHT；'+
     '灰字为世界拍心速度 |v_world|：拍心点 p_head 的 ±10ms 中心差分（v0.4 的 p_head 走冻结柔度模型 F='+
     'FK(q−c·τ+d·q̇)+R·tool_offset+[dx,dy,0]，不是刚性 FK(q) 的 TCP；0907 黑标三场把反馈→视觉甜点 '+

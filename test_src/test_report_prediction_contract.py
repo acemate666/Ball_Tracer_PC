@@ -1276,6 +1276,16 @@ def test_rk300_table_anchors_everything_on_finalht():
     assert "yawExtra:Number(p.hit_yaw_extra), carYaw:Number(p.car_yaw)" in source
     assert "tgtSpeed:statusNum(e.text,'speed')" in source
     assert "tgtSpeedReq:statusNum(e.text,'speed_req')" in source
+    assert "tgtApexZ:statusNum(e.text,'apex_z')" in source
+    assert "tgtNetClearance:statusNum(e.text,'net_clearance')" in source
+    assert "const tgtApexZ=accepted&&isNum(accepted.tgtApexZ)?accepted.tgtApexZ:null;" in table
+    assert ("const tgtNetClearance=accepted&&isNum(accepted.tgtNetClearance)"
+            "?accepted.tgtNetClearance:null;") in table
+    assert "共享三维碰撞模型反解的补偿后接触拍速目标" in table
+    assert "apex_z='+tgtApexZ.toFixed(3)" in table
+    assert "net_clearance='+tgtNetClearance.toFixed(3)" in table
+    assert "上游 speed 指令或拍速预测器解" not in source
+    assert "口径 2·|行程|/hit_time·x，只算 J1" not in source
     assert table.count("<td>'+tgtCell+'</td>") == 1
     # 车yaw@FinalHT 列：/bot_state yaw 按它自己的 imu_t 物理轴严格夹取
     assert "const carYawAcc=finalHt!=null?botYawDegAt(finalHt):null;" in table
