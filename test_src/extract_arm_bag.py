@@ -18,8 +18,8 @@ compact_arm_kinematics + config/cars/v04.yaml（零位 offset_rad、tool_x、hit
   events   — status / arm_command / hit_pos / predict_hit_pos 文本事件
 
 时间轴（全项目只有两个时间轴）：
-  所有 t 一律为 RK 单调钟（CLOCK_MONOTONIC）绝对秒 —— 与 /predict_hit_pos
-  的 ct/ht、rk_tracking 的 payload t 同一个钟。报告端固定用 scale=1 的 RK→PC
+  所有 t 一律为 RK perf_counter 单调钟绝对秒 —— 与 /predict_hit_pos
+  的 generated_at/source_ct/contact_ht（历史 ct/ht）、rk_tracking payload t 同钟。报告端固定用 scale=1 的 RK→PC
   常数偏移映射，臂数据没有任何独立的桥。
 
   新固件（damiao 驱动 + arm_controller 单调钟版）：
@@ -43,7 +43,6 @@ import math
 import os
 import re
 import statistics
-import sys
 from pathlib import Path
 from typing import Iterable, NamedTuple
 
@@ -385,8 +384,9 @@ EVENT_TOPICS = (
 
 # RK 单调钟参考话题（按优先级）：payload 带发布时刻的单调钟 t，发布延迟接近 0。
 # 仅旧 bag（epoch stamp / 无 t= 的 status）需要；新固件全部原生直读。
-# /predict_hit_pos 的 ct 是球观测时刻（比发布早一个 RK 管线时延，0716 实测
-# ~70ms），只配当保底，用到时在 clock_sync 里明示 biased。
+# 新合同 /predict_hit_pos 的 generated_at 接近发布时刻；历史 ct 是球观测时刻
+# （比发布早一个 RK 管线时延，0716 实测 ~70ms）。后者只配当保底，用到时
+# 在 clock_sync 里明示 biased。
 MONO_REF_TOPICS = ("/bot_state", "/chassis_can/imu")
 
 # 单调钟量级上限：RK 开机秒（连续运行数月也 <1e8）；epoch 秒 ~1.7e9。
@@ -395,12 +395,42 @@ MONO_MAX_SEC = 1e8
 # status 文本尾缀发布时刻（arm_controller 单调钟版追加）："... t=9203.123456"
 STATUS_T_RE = re.compile(r"\s+t=([0-9]+\.[0-9]+)$")
 
-# 事件文本必须原样落盘：/predict_hit_pos 是报告端要 JSON.parse 的载荷、status 的发布时刻
-# `t=` 挂在尾部，截一刀两者都静默失效。原来的 500 字上限就这么炸过一次——0809 103849 场
-# RK 端加了 spin/cor 在线估计字段后 payload 越过 500，625 条 predict_hit_pos 全部 parse
-# 失败 → armPreds 空 → accepted 回配 0 票 → 整张臂表全是 —，页面上没有任何报错。
-# 这里只留一个防病态消息的宽上限，且一旦触发就在 stderr 告警，不再无声截断。
-EVENT_TEXT_MAX = 4000
+def _event_payload_time(topic: str, text: str) -> float | None:
+    """Return the RK perf-counter timestamp carried by an event payload.
+
+    ``final_hit_plan/v1`` and ``preaim_hint/v1`` use ``generated_at``: that is
+    when the immutable payload exists and is published.  ``source_ct`` only
+    timestamps the ball state consumed by the solve.  Legacy payloads use
+    ``ct``.  A message that declares a
+    ``kind`` never falls back to the legacy key: that would silently turn a
+    malformed new contract into an apparently valid historical message.
+    """
+    if topic == "/predict_hit_pos":
+        try:
+            payload = json.loads(text)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        key = "generated_at" if "kind" in payload else "ct"
+        value = payload.get(key)
+        return (
+            float(value)
+            if isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            else None
+        )
+    return None
+
+
+def _event_text(raw, msg) -> str:
+    """Serialize a String/array event without imposing a report-side size cap."""
+    if raw is None:
+        return str(msg)
+    if isinstance(raw, (list, tuple)) or type(raw).__name__ == "array":
+        return " ".join(f"{float(v):.4g}" for v in raw)
+    return str(raw)
 
 
 def _ordered(values: list[float], names: list[str], joint_names: tuple[str, ...]) -> list[float | None]:
@@ -507,11 +537,10 @@ def main() -> int:
     state_diffs: list[tuple[float, float]] = []    # (recv_s, stamp − recv) 全部有效 stamp
     command_diffs: list[tuple[float, float]] = []
     mono_diffs: dict[str, list[tuple[float, float]]] = {t: [] for t in MONO_REF_TOPICS}
-    predict_ct_diffs: list[tuple[float, float]] = []
+    predict_event_diffs: list[tuple[float, float]] = []
     counts: dict[str, int] = {}
     seen_state_names: list[str] = []
     seen_command_names: list[str] = []
-    truncated: dict[str, int] = {}
     start_ns: int | None = None
     end_ns: int | None = None
 
@@ -582,28 +611,14 @@ def main() -> int:
                 except Exception:
                     pass
                 continue
-            if raw is not None:
-                text = (
-                    " ".join(f"{float(v):.4g}" for v in raw)
-                    if isinstance(raw, (list, tuple)) or type(raw).__name__ == "array"
-                    else str(raw)
-                )
-            else:
-                text = str(msg)
-            if len(text) > EVENT_TEXT_MAX:
-                truncated[topic] = truncated.get(topic, 0) + 1
-                text = text[:EVENT_TEXT_MAX]
+            text = _event_text(raw, msg)
             event = {"recv": recv, "topic": topic, "text": text, "t_payload": None}
             if topic == "/predict_hit_pos":
-                # payload 自带 ct（RK 单调钟，球观测时刻）——事件直接用它，
-                # 与 rk_tracking 的 pred 序列同源同值。
-                try:
-                    ct = json.loads(text).get("ct")
-                    if isinstance(ct, (int, float)):
-                        predict_ct_diffs.append((recv, float(ct) - recv))
-                        event["t_payload"] = float(ct)
-                except Exception:
-                    pass
+                # 新合同 generated_at 是计划/提示的生成时刻；历史合同 ct 是观测时刻。
+                payload_t = _event_payload_time(topic, text)
+                if payload_t is not None:
+                    predict_event_diffs.append((recv, payload_t - recv))
+                    event["t_payload"] = payload_t
             else:
                 # 新固件 status 尾缀 " t=<单调秒>" = 发布时刻，解析后从文本剥离
                 m = STATUS_T_RE.search(event["text"])
@@ -614,14 +629,6 @@ def main() -> int:
 
     if start_ns is None:
         raise RuntimeError(f"bag has no messages: {args.bag}")
-
-    if truncated:
-        detail = ", ".join(f"{topic} × {n}" for topic, n in sorted(truncated.items()))
-        print(
-            f"[extract_arm_bag] 警告：事件文本超过 {EVENT_TEXT_MAX} 字被截断（{detail}）——"
-            "JSON 载荷会 parse 失败、status 尾缀 t= 会丢，报告端相关列将整列为空",
-            file=sys.stderr,
-        )
 
     # ---- stamp 时钟域判定（按话题多数）----
     def _stamp_domain(rows: list[dict]) -> str | None:
@@ -648,11 +655,13 @@ def main() -> int:
                 mono_ref_topic = topic
                 c_mono = _median([d for _, d in mono_diffs[topic]])
                 break
-        if c_mono is None and len(predict_ct_diffs) >= 10:
-            # 保底：ct 是观测时刻，比发布早一个 RK 管线时延 → 相关事件整体偏早同量
-            mono_ref_topic = "/predict_hit_pos(ct, biased)"
-            mono_ref_biased = True
-            c_mono = _median([d for _, d in predict_ct_diffs])
+        if c_mono is None and len(predict_event_diffs) >= 10:
+            # 新合同 generated_at 近似发布时刻；历史 ct 比发布早一段管线时延。
+            mono_ref_topic = "/predict_hit_pos(generated_at/legacy ct)"
+            mono_ref_biased = any(
+                '"kind"' not in e["text"] for e in events if e["topic"] == "/predict_hit_pos"
+            )
+            c_mono = _median([d for _, d in predict_event_diffs])
         if c_mono is None:
             raise RuntimeError(
                 "no RK mono reference in bag (/bot_state, /chassis_can/imu or "
@@ -728,7 +737,7 @@ def main() -> int:
 
     mono_drift_samples = (
         mono_diffs[mono_ref_topic] if mono_ref_topic in mono_diffs
-        else (state_diffs if state_domain == "rk_mono_native" else predict_ct_diffs)
+        else (state_diffs if state_domain == "rk_mono_native" else predict_event_diffs)
     )
     clock_sync = {
         "joint_states_stamp_domain": state_domain,
@@ -763,8 +772,8 @@ def main() -> int:
                 "header.stamp（RK 单调钟原生）" if command_domain == "rk_mono_native"
                 else "同 states 换算（用 motor_command 自己的 stamp−recv 中位）"
             ),
-            "events": "status 尾缀 t= / predict 的 ct（原生）；无时间的旧事件 = recv + median(bot_state.t−recv)",
-            "note": "与 /predict_hit_pos ct/ht、rk_tracking payload t 同钟；报告端固定 scale=1，只用 RK→PC 常数偏移",
+            "events": "status 尾缀 t= / 新计划 generated_at / 历史 predict ct（原生）；无时间事件 = recv + median(bot_state.t−recv)",
+            "note": "与 /predict_hit_pos source_ct/contact_ht（历史 ct/ht）、rk_tracking payload t 同钟；报告端固定 scale=1，只用 RK→PC 常数偏移",
         },
         "clock_sync": clock_sync,
         "bag_dir": str(args.bag.resolve()),

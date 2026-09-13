@@ -48,10 +48,82 @@ def _topic_key(topic: str) -> str:
 
 def _payload_time(topic: str, payload: dict) -> float | None:
     if topic == "/predict_hit_pos":
-        value = payload.get("ct")
+        # New automatic messages have an explicit kind and use generated_at;
+        # source_ct is the input ball-state time, not the publish/event time.
+        # Do not let a malformed new message fall back to the legacy ct key.
+        value = payload.get("generated_at") if "kind" in payload else payload.get("ct")
     else:
         value = payload.get("t")
     return float(value) if _finite(value) else None
+
+
+def _report_prediction_payload(payload: dict) -> dict | None:
+    """Map a valid FinalHitPlan onto the historical prediction series.
+
+    Pre-aim hints are intentionally absent: they are iteration seeds and must
+    never become a report FinalHT candidate.  A declared new kind is either a
+    valid v1 plan or rejected; legacy field fallback is only for messages with
+    no kind at all.
+    """
+    kind = payload.get("kind")
+    if kind is None:
+        return payload
+    if kind != "final_hit_plan" or payload.get("contract") != "final_hit_plan/v1":
+        return None
+    required = (
+        "source_ct", "generated_at", "contact_ht", "n_points",
+        "contact_x", "contact_y", "contact_z",
+        "contact_rel_x", "contact_rel_y", "contact_rel_z",
+        "arm_target_rel_x", "arm_target_rel_y", "arm_target_rel_z",
+        "incoming_vx", "incoming_vy", "incoming_vz",
+        "arm_center_x", "arm_center_y", "arm_center_vx", "arm_center_vy",
+        "car_center_x", "car_center_y", "car_center_vx", "car_center_vy",
+        "car_yaw_at_ht", "car_yaw_rate_at_ht",
+        "face_normal_yaw_world", "face_pitch",
+        "face_normal_nx", "face_normal_ny", "face_normal_nz",
+        "compensated_speed",
+        "racket_contact_vx", "racket_contact_vy", "racket_contact_vz",
+        "outgoing_vx", "outgoing_vy", "outgoing_vz",
+        "landing_x", "landing_y", "apex_z_world", "net_clearance_m",
+        "collision_en", "collision_kt", "solve_iterations", "solve_ms",
+    )
+    if (
+        not all(_finite(payload.get(key)) for key in required)
+        or not isinstance(payload.get("plan_id"), str)
+        or not payload["plan_id"]
+        or not isinstance(payload.get("model_fingerprint"), str)
+        or not payload["model_fingerprint"]
+        or not isinstance(payload.get("revision"), int)
+        or isinstance(payload["revision"], bool)
+        or payload["revision"] < 0
+        or not isinstance(payload.get("n_points"), int)
+        or isinstance(payload["n_points"], bool)
+        or payload["n_points"] < 1
+        or not isinstance(payload.get("solve_iterations"), int)
+        or isinstance(payload["solve_iterations"], bool)
+        or not 1 <= payload["solve_iterations"] <= 4
+        or not payload["source_ct"] <= payload["generated_at"] < payload["contact_ht"]
+        or payload["solve_ms"] < 0
+    ):
+        return None
+    return {
+        **payload,
+        "ct": payload["source_ct"],
+        "ht": payload["contact_ht"],
+        "x": payload["contact_x"],
+        "y": payload["contact_y"],
+        "z": payload["contact_z"],
+        "rel_x": payload["contact_rel_x"],
+        "rel_y": payload["contact_rel_y"],
+        "rel_z": payload["contact_rel_z"],
+        "stage": 1,
+        "duration": payload["contact_ht"] - payload["source_ct"],
+        "car_pred_x": payload["car_center_x"],
+        "car_pred_y": payload["car_center_y"],
+        "arm_pred_x": payload["arm_center_x"],
+        "arm_pred_y": payload["arm_center_y"],
+        "n_bounce_fit": payload["n_points"],
+    }
 
 
 def _new_series() -> dict:
@@ -494,6 +566,9 @@ def main() -> int:
             )
             _append_xyz(xy_world, t, payload)
         elif key == "predict_hit_pos":
+            payload = _report_prediction_payload(payload)
+            if payload is None:
+                continue
             ht = payload.get("ht")
             duration = (ht - payload_t) if _finite(ht) else payload.get("duration")
             stage = payload.get("stage")

@@ -1205,9 +1205,10 @@ def test_rk300_table_anchors_everything_on_finalht():
     assert "p[2]-zArmMinusWorld" in source
     assert "armZOff" not in source
     # 臂目标：RL=FinalHT 消息自身 rel_x/rel_z，规则=最后 accepted 的（late 只改 ht）；目标侧不做任何变换
-    assert "const aimIsFinal=!!(fin&&(fin.source==='rl_status'||fin.source==='rl_recon'));" in table
-    assert "const aim=aimIsFinal?[fin.relX,fin.relZ]" in table
-    assert ":(accepted&&isNum(accepted.wx)&&isNum(accepted.wz)?[accepted.wx,accepted.wz]:null);" in table
+    assert "const aimIsFinal=!!(fin&&(fin.source==='final_plan'||fin.source==='rl_status'||fin.source==='rl_recon'));" in table
+    assert "const aim=finalPlan?[finalPlan.arm_target_rel_x,finalPlan.arm_target_rel_z]" in table
+    assert ":(aimIsFinal?[fin.relX,fin.relZ]" in table
+    assert ":(accepted&&isNum(accepted.wx)&&isNum(accepted.wz)?[accepted.wx,accepted.wz]:null));" in table
     assert "const tcpAimDx=tcpWorld&&aim?(tcpWorld[0]-aim[0])*100:null;" in table
     assert "const tcpAimDz=tcpWorld&&aim?(tcpWorld[2]-aim[1])*100:null;" in table
     assert "直接取上游 /predict_hit_pos rel_x/z=(" in table
@@ -1229,7 +1230,7 @@ def test_rk300_table_anchors_everything_on_finalht():
         "TCP@FinalHT x/y/z(cm,世界轴)<br>相对机械臂中心地面点z=0<br>tcp−臂目标（dx，dz）</th>",
         "视觉拍心−车心@FinalHT+zPhase附近<br>x/y/z(cm,世界轴)<br>人工轨迹或最近前/后＋ht前逐帧；视觉−同曝光TCP（dx，dy，dz）</th>",
         "车yaw@FinalHT<br>(°)</th>",
-        "目标挥拍速度/yaw/pitch<br>(m/s, °, °)</th>",
+        "目标挥拍速度/yaw/pitch<br>(m/s, °, °)<br>碰撞 / 求解</th>",
         "拍面yaw,pitch / 世界拍心speed<br>@FinalHT<br>(°,°,m/s;世界系)</th>",
         "拍面yaw,pitch / 世界拍心speed<br>@FinalHT−12ms<br>(°,°,m/s;世界系)</th>",
         "PC回球<br>yaw/俯仰(°) / speed / Δt(ms)</th>",
@@ -1270,20 +1271,21 @@ def test_rk300_table_anchors_everything_on_finalht():
     assert "peakDt" not in source
     # 目标三量：RL 用 FinalHT 目标（rl_swing done 状态），规则用最后 accepted 计划量；yaw=−δ（世界系）
     assert "const doneNum=k=>done?statusNum(done.text,k):null;" in table
-    assert "const tgtSpeed=isNum(doneNum('speed_req'))?doneNum('speed_req')" in table
-    assert ":(accepted&&isNum(accepted.tgtSpeed)?accepted.tgtSpeed:null);" in table
-    assert "const tgtYawWorldDeg=tgtYawExtraDeg!=null?-tgtYawExtraDeg" in table
+    assert "const tgtSpeed=finalPlan?finalPlan.compensated_speed" in table
+    assert ":(isNum(doneNum('speed_req'))?doneNum('speed_req')" in table
+    assert ":(accepted&&isNum(accepted.tgtSpeed)?accepted.tgtSpeed:null));" in table
+    assert "const tgtYawWorldDeg=finalPlan?finalPlan.face_normal_yaw_world*180/Math.PI" in table
+    assert ":(tgtYawExtraDeg!=null?-tgtYawExtraDeg" in table
     assert "yawExtra:Number(p.hit_yaw_extra), carYaw:Number(p.car_yaw)" in source
     assert "tgtSpeed:statusNum(e.text,'speed')" in source
     assert "tgtSpeedReq:statusNum(e.text,'speed_req')" in source
     assert "tgtApexZ:statusNum(e.text,'apex_z')" in source
     assert "tgtNetClearance:statusNum(e.text,'net_clearance')" in source
-    assert "const tgtApexZ=accepted&&isNum(accepted.tgtApexZ)?accepted.tgtApexZ:null;" in table
-    assert ("const tgtNetClearance=accepted&&isNum(accepted.tgtNetClearance)"
-            "?accepted.tgtNetClearance:null;") in table
+    assert "const tgtApexZ=finalPlan?finalPlan.apex_z_world" in table
+    assert "const tgtNetClearance=finalPlan?finalPlan.net_clearance_m" in table
     assert "共享三维碰撞模型反解的补偿后接触拍速目标" in table
-    assert "apex_z='+tgtApexZ.toFixed(3)" in table
-    assert "net_clearance='+tgtNetClearance.toFixed(3)" in table
+    assert "apex_z_world='+tgtApexZ.toFixed(3)" in table
+    assert "net_clearance_m='+tgtNetClearance.toFixed(3)" in table
     assert "上游 speed 指令或拍速预测器解" not in source
     assert "口径 2·|行程|/hit_time·x，只算 J1" not in source
     assert table.count("<td>'+tgtCell+'</td>") == 1
@@ -1985,5 +1987,5 @@ def test_chassis_fallback_is_labelled_in_table_and_summary():
     assert "回退为底盘末次 target 对应预测 [车]" in table
     assert "臂无 FinalHT 时回退=底盘末次 target 对应预测 [车]" in table
     # 回退不冒充臂目标：tcp−臂目标 / 目标拍速仍只认 RL/规则的源
-    assert "const aimIsFinal=!!(fin&&(fin.source==='rl_status'||fin.source==='rl_recon'));" in table
+    assert "const aimIsFinal=!!(fin&&(fin.source==='final_plan'||fin.source==='rl_status'||fin.source==='rl_recon'));" in table
     assert "if(!ARM) return {mode:'rules', source:'bag 无 /joint_states，臂栈未运行'};" in source

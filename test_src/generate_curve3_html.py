@@ -1867,7 +1867,26 @@ const SWING_HT_UPDATE_MIN_REMAINING_SEC=0.060;
 // 解析失败必须计数：extract_arm_bag 曾把事件文本截到 500 字，RK 加字段后 payload 越过阈值
 // → 这里整场 catch 掉 → armPreds 空 → 回配 0 票 → 臂表整列 —，页面上却没有任何报错
 // （0809 103849 场）。截断已修，但解析失败仍要显式暴露，见 armDataWarnHtml。
-let armPredParseBad=0, armPredTotal=0;
+// [[final-hit-plan-parse-core-begin]]
+const FINAL_HIT_PLAN_CONTRACT='final_hit_plan/v1';
+const FINAL_HIT_PLAN_FINITE_FIELDS=[
+  'source_ct','generated_at','contact_ht','n_points',
+  'contact_rel_x','contact_rel_y','contact_rel_z',
+  'arm_target_rel_x','arm_target_rel_y','arm_target_rel_z',
+  'contact_x','contact_y','contact_z','incoming_vx','incoming_vy','incoming_vz',
+  'arm_center_x','arm_center_y','arm_center_vx','arm_center_vy',
+  'car_center_x','car_center_y','car_center_vx','car_center_vy',
+  'racket_contact_vx','racket_contact_vy','racket_contact_vz',
+  'car_yaw_at_ht','car_yaw_rate_at_ht','face_normal_yaw_world','face_pitch',
+  'face_normal_nx','face_normal_ny','face_normal_nz',
+  'compensated_speed','outgoing_vx','outgoing_vy','outgoing_vz',
+  'landing_x','landing_y','apex_z_world','net_clearance_m','collision_en','collision_kt',
+  'solve_iterations','solve_ms'
+];
+const planIdentityKey=(planId,revision)=>String(planId)+'\u001f'+String(revision);
+let armPredParseBad=0, armPredTotal=0, armPreaimCount=0, armPanelHitCount=0;
+const armPlanContractErrors=[];
+let hasStructuredHitMessages=false;
 const armPreds = (()=>{
   if(!ARM) return [];
   const out=[];
@@ -1876,6 +1895,93 @@ const armPreds = (()=>{
     armPredTotal+=1;
     try{
       const p=JSON.parse(e.text);
+      if(Object.prototype.hasOwnProperty.call(p,'kind')){
+        if(p.kind==='panel_hit'){
+          armPanelHitCount+=1;
+          return;
+        }
+        hasStructuredHitMessages=true;
+        if(p.kind==='preaim_hint'){
+          armPreaimCount+=1;
+          const bad=p.contract!=='preaim_hint/v1'||typeof p.hint_id!=='string'||!p.hint_id
+            ||!Number.isInteger(p.revision)||p.revision<0
+            ||!['source_ct','generated_at','estimate_ht','n_points',
+                'estimate_rel_x','estimate_rel_y','estimate_rel_z',
+                'car_yaw_estimate','face_normal_yaw_seed'].every(k=>isNum(p[k]))
+            ||!Number.isInteger(p.n_points)||p.n_points<1
+            ||!(p.source_ct<=p.generated_at&&p.generated_at<p.estimate_ht);
+          if(bad) armPlanContractErrors.push('PreAimHint '+String(p.hint_id||'?')+'#'+String(p.revision)+' 合同缺失/非法');
+          return;
+        }
+        if(p.kind!=='final_hit_plan'){
+          armPlanContractErrors.push('未知 kind='+String(p.kind));
+          return;
+        }
+        const missing=[];
+        if(p.contract!==FINAL_HIT_PLAN_CONTRACT) missing.push('contract='+String(p.contract));
+        if(typeof p.plan_id!=='string'||!p.plan_id) missing.push('plan_id');
+        if(!Number.isInteger(p.revision)||p.revision<0) missing.push('revision');
+        if(typeof p.model_fingerprint!=='string'||!p.model_fingerprint) missing.push('model_fingerprint');
+        FINAL_HIT_PLAN_FINITE_FIELDS.forEach(k=>{ if(!isNum(p[k])) missing.push(k); });
+        if(isNum(p.source_ct)&&isNum(p.contact_ht)&&!(p.source_ct<p.contact_ht)) missing.push('source_ct<contact_ht');
+        if(isNum(p.generated_at)&&isNum(p.source_ct)&&p.generated_at<p.source_ct) missing.push('generated_at>=source_ct');
+        if(isNum(p.generated_at)&&isNum(p.contact_ht)&&p.generated_at>=p.contact_ht) missing.push('generated_at<contact_ht');
+        if(isNum(p.solve_iterations)&&(!Number.isInteger(p.solve_iterations)||p.solve_iterations<1||p.solve_iterations>4))
+          missing.push('solve_iterations[1,4]');
+        if(isNum(p.solve_ms)&&p.solve_ms<0) missing.push('solve_ms>=0');
+        if(isNum(p.n_points)&&(!Number.isInteger(p.n_points)||p.n_points<1)) missing.push('n_points');
+        if(['contact_x','contact_y','contact_z','arm_center_x','arm_center_y',
+            'contact_rel_x','contact_rel_y','contact_rel_z'].every(k=>isNum(p[k]))){
+          const relErr=Math.hypot(
+            p.contact_x-p.arm_center_x-p.contact_rel_x,
+            p.contact_y-p.arm_center_y-p.contact_rel_y,
+            p.contact_z-p.contact_rel_z);
+          if(relErr>1e-4) missing.push('contact_rel_xyz一致性');
+        }
+        if(['arm_center_x','arm_center_y','arm_center_vx','arm_center_vy',
+            'car_center_x','car_center_y','car_center_vx','car_center_vy',
+            'car_yaw_at_ht','car_yaw_rate_at_ht'].every(k=>isNum(p[k]))){
+          const rx=-0.045*Math.sin(p.car_yaw_at_ht), ry=0.045*Math.cos(p.car_yaw_at_ht);
+          const armErr=Math.hypot(p.arm_center_x-(p.car_center_x+rx),p.arm_center_y-(p.car_center_y+ry));
+          const armVErr=Math.hypot(p.arm_center_vx-(p.car_center_vx-p.car_yaw_rate_at_ht*ry),
+                                   p.arm_center_vy-(p.car_center_vy+p.car_yaw_rate_at_ht*rx));
+          if(armErr>1e-4||armVErr>1e-4) missing.push('car→arm 4.5cm刚体变换一致性');
+        }
+        if(['face_normal_nx','face_normal_ny','face_normal_nz','face_normal_yaw_world','face_pitch'].every(k=>isNum(p[k]))){
+          const nNorm=Math.hypot(p.face_normal_nx,p.face_normal_ny,p.face_normal_nz);
+          const yaw=Math.atan2(-p.face_normal_nx,p.face_normal_ny);
+          const pitch=Math.asin(Math.max(-1,Math.min(1,p.face_normal_nz)));
+          const wrap=a=>Math.atan2(Math.sin(a),Math.cos(a));
+          if(Math.abs(nNorm-1)>1e-5||Math.abs(wrap(yaw-p.face_normal_yaw_world))>1e-5
+             ||Math.abs(pitch-p.face_pitch)>1e-5) missing.push('拍面法向/yaw/pitch一致性');
+        }
+        if(['incoming_vx','incoming_vy','incoming_vz','racket_contact_vx','racket_contact_vy','racket_contact_vz',
+            'face_normal_nx','face_normal_ny','face_normal_nz','collision_en','collision_kt',
+            'outgoing_vx','outgoing_vy','outgoing_vz'].every(k=>isNum(p[k]))){
+          const vin=[p.incoming_vx,p.incoming_vy,p.incoming_vz];
+          const vr=[p.racket_contact_vx,p.racket_contact_vy,p.racket_contact_vz];
+          const n=[p.face_normal_nx,p.face_normal_ny,p.face_normal_nz];
+          const u=vin.map((v,i)=>v-vr[i]), un=u.reduce((s,v,i)=>s+v*n[i],0);
+          const replay=vr.map((v,i)=>v+p.collision_kt*(u[i]-un*n[i])-p.collision_en*un*n[i]);
+          const outErr=Math.hypot(replay[0]-p.outgoing_vx,replay[1]-p.outgoing_vy,replay[2]-p.outgoing_vz);
+          if(outErr>1e-4) missing.push('碰撞前向复算一致性');
+        }
+        if(missing.length){
+          armPlanContractErrors.push('FinalHitPlan '+String(p.plan_id||'?')+'#'+String(p.revision)+' 缺失/非法：'+missing.join(','));
+          return;
+        }
+        out.push({kind:p.kind, contract:p.contract, plan:p,
+                  planId:p.plan_id, revision:p.revision,
+                  t:e.t, rel_x:p.contact_rel_x, rel_y:p.contact_rel_y, rel_z:p.contact_rel_z,
+                  armTargetRelX:p.arm_target_rel_x, armTargetRelY:p.arm_target_rel_y,
+                  armTargetRelZ:p.arm_target_rel_z,
+                  xWorld:p.contact_x, carPredX:p.arm_center_x,
+                  armPredX:p.arm_center_x, armPredY:p.arm_center_y, armOrigin:true,
+                  duration:p.contact_ht-p.source_ct, ht:p.contact_ht, ct:p.source_ct,
+                  stage:1, nFit:p.n_points, relSrc:'final_hit_plan',
+                  yawExtra:null, carYaw:p.car_yaw_at_ht});
+        return;
+      }
       out.push({t:e.t, rel_x:Number(p.rel_x), rel_y:Number(p.rel_y), rel_z:Number(p.rel_z),
                 xWorld:Number(p.x), carPredX:Number(p.car_pred_x),
                 armPredX:p.arm_pred_x, armPredY:p.arm_pred_y,
@@ -1884,10 +1990,15 @@ const armPreds = (()=>{
                 nFit:Number(p.n_bounce_fit), relSrc:String(p.rel_src||'?'),
                 // 击球整体多转 δ（rad，逐抛）与车 yaw：北极星表「目标 yaw」列 = −δ（世界系）
                 yawExtra:Number(p.hit_yaw_extra), carYaw:Number(p.car_yaw)});
-    }catch(err){ armPredParseBad+=1; }
+    }catch(err){
+      armPredParseBad+=1;
+      if(/"kind"\s*:\s*"(?:preaim_hint|final_hit_plan)"/.test(String(e.text||'')))
+        hasStructuredHitMessages=true;
+    }
   });
   return out;
 })();
+// [[final-hit-plan-parse-core-end]]
 // [[arm-pred-align-core-begin]]
 // 序号对齐：hit_pos 派生状态与 /predict_hit_pos 的序号差 δ=si−pi。
 // 投票只用两把弱键（到达窗 + 时序键）：同一抛内相邻消息也会投票，但每条 accepted 的正确源
@@ -1898,7 +2009,7 @@ const armPreds = (()=>{
 //（armPredForStatus），过不了就地失配、不硬套。
 // 实测：0716~0811 共 60 场 bag，状态数≡消息数、δ≡0（唯一例外 0719 100823 那场早期 bag）。
 const armHitStatuses = ((ARM&&ARM.events)||[])
-  .filter(e=>e.topic==='/tennis/status' &&
+  .filter(e=>(typeof hasStructuredHitMessages==='undefined'||!hasStructuredHitMessages) && e.topic==='/tennis/status' &&
     /^(accepted hit |late ht saved|reject hit:|error hit_pos)/.test(String(e.text||'')))
   .map((e,si)=>({si, t:e.t, text:String(e.text)}));
 const armAcceptedHitRe=/^accepted hit x=([\-0-9.]+) z=([\-0-9.]+) duration=([0-9.]+)/;
@@ -2002,6 +2113,61 @@ const statusNum = (text,key) => {
   const m=new RegExp('(?:^|\\s)'+key+'=(-?[0-9]+(?:\\.[0-9]+)?)').exec(text||'');
   return m?Number(m[1]):null;
 };
+// [[final-hit-plan-ack-core-begin]]
+// 新合同只按 (plan_id, revision) 结构键回配，contact_ht 再作同源校验。
+// preaim_hint 没有 plan_id，也不进入 armPreds，因此永远不可能冒充 FinalHT。
+const armFinalPlans=armPreds.filter(p=>p.kind==='final_hit_plan');
+const armFinalPlanByKey=new Map();
+const armFinalPlanConflictKeys=new Set();
+armFinalPlans.forEach(p=>{
+  const key=planIdentityKey(p.planId,p.revision), old=armFinalPlanByKey.get(key);
+  if(old && JSON.stringify(old.plan)!==JSON.stringify(p.plan)){
+    armPlanContractErrors.push('重复计划身份 '+p.planId+'#'+p.revision+' 的 payload 不一致');
+    armFinalPlanByKey.delete(key);
+    armFinalPlanConflictKeys.add(key);
+  } else if(!old&&!armFinalPlanConflictKeys.has(key)) armFinalPlanByKey.set(key,p);
+});
+const armPlanAckErrors=[];
+const armPlanAcks=[];
+((ARM&&ARM.events)||[]).forEach(e=>{
+  if(e.topic!=='/tennis/status') return;
+  const text=String(e.text||'');
+  const idMatch=/(?:^|\s)plan_id=([^\s]+)/.exec(text);
+  if(!idMatch) return;
+  const revision=statusNum(text,'revision'), contactHt=statusNum(text,'contact_ht');
+  const identity=idMatch[1]+'#'+String(revision);
+  if(!Number.isInteger(revision)||!isNum(contactHt)){
+    armPlanAckErrors.push('状态 '+identity+' 缺 revision/contact_ht');
+    return;
+  }
+  if(!/^accepted hit\b/.test(text)) return;
+  const plan=armFinalPlanByKey.get(planIdentityKey(idMatch[1],revision));
+  if(!plan){
+    armPlanAckErrors.push('accepted '+identity+' 找不到同身份 FinalHitPlan');
+    return;
+  }
+  if(Math.abs(plan.ht-contactHt)>1e-5){
+    armPlanAckErrors.push('accepted '+identity+' contact_ht 与计划相差 '
+      +((contactHt-plan.ht)*1000).toFixed(3)+'ms');
+    return;
+  }
+  if(e.t+((RK&&isNum(RK.t0))?RK.t0:0)<plan.plan.generated_at-1e-6){
+    armPlanAckErrors.push('accepted '+identity+' 早于计划 generated_at');
+    return;
+  }
+  armPlanAcks.push({t:e.t,text,plan,planId:idMatch[1],revision,contactHt});
+});
+const acceptedRecordForPlanAck=ack=>{
+  const p=ack.plan, q=p.plan;
+  return {label:'hit',cmd:ack.t,lastAcceptT:ack.t,start:null,done:q.contact_ht-((RK&&isNum(RK.t0))?RK.t0:0),
+    n:1,lates:[],planAck:ack,plan:p,
+    wx:q.arm_target_rel_x,wy:q.arm_target_rel_y,wz:q.arm_target_rel_z,wct:p.ct,wht:p.ht,
+    wxw:p.xWorld,wcarx:p.armPredX,armOrigin:true,armPredX:p.armPredX,
+    wpredT:p.t,wstage:1,wnFit:p.nFit,finalHt:p.ht,finalCt:p.ct,finalMismatch:false,
+    tgtPitch:q.face_pitch,tgtSpeed:q.compensated_speed,tgtSpeedReq:q.compensated_speed,
+    tgtFaceYaw:null,tgtApexZ:q.apex_z_world,tgtNetClearance:q.net_clearance_m};
+};
+// [[final-hit-plan-ack-core-end]]
 const _armHit = (()=>{
   if(!ARM) return {marks:[], nAcc:0, nMatch:0};
   // ARM 时轴与 rebase 状态严格对应：armAligned 时 ARM 各行已减 RK.t0（相对轴），
@@ -2162,9 +2328,16 @@ const armDataWarnHtml = (()=>{
   const bad=[], warn=[];
   if(armPredParseBad>0){
     bad.push('/predict_hit_pos 载荷解析失败 '+armPredParseBad+'/'+armPredTotal+' 条'+
-      '——多半是 extract_arm_bag 把事件文本截断了（RK 端加字段后 payload 变长会撞上限）。'+
-      '重跑 test_src/extract_arm_bag.py 出 _arm.json 后再重生成本页。');
+      '——可能是旧 _arm.json 曾被截断，或消息本身不是合法 JSON。重跑最新版 extract_arm_bag.py 后仍失败需查发布端。');
   }
+  if(typeof armPlanContractErrors!=='undefined'&&armPlanContractErrors.length)
+    bad.push('新击球消息合同错误 '+armPlanContractErrors.length+' 条：'+armPlanContractErrors.slice(0,4).join('；'));
+  if(typeof armPlanAckErrors!=='undefined'&&armPlanAckErrors.length)
+    bad.push('FinalHitPlan/ACK 原子回配错误 '+armPlanAckErrors.length+' 条：'+armPlanAckErrors.slice(0,4).join('；'));
+  if(typeof hasStructuredHitMessages!=='undefined'&&hasStructuredHitMessages&&armFinalPlans.length>0&&!armPlanAcks.length)
+    warn.push('本场有 '+armFinalPlans.length+' 条 FinalHitPlan，但没有 plan_id+revision+contact_ht 三者一致的 accepted ACK；FinalHT 不回退旧状态或 preaim。');
+  if(typeof hasStructuredHitMessages!=='undefined'&&hasStructuredHitMessages&&!armFinalPlans.length&&armPreaimCount)
+    warn.push('本场只有 '+armPreaimCount+' 条 PreAimHint、没有 FinalHitPlan；preaim 不作为 FinalHT。');
   // 回配率是臂表所有列的总闸：失配的拍 accepted 目标/击球真值/TCP 全列 —。
   // 报出三把键各自的状态，下次再出事一眼能定位是结构变了（序号键）还是口径变了（值键）。
   if(_armHit.nAcc>0 && _armHit.nMatch<_armHit.nAcc){
@@ -3175,9 +3348,18 @@ const matchThrowByAcceptedCt = ct => {
   },candidates[0]);
 };
 // [[accepted-match-core-end]]
-const lastAcceptedForThrow = th => armAligned ? armHitMarks
-  .filter(h=>h.label==='hit' && isNum(h.wct) && matchThrowByAcceptedCt(h.wct-RK.t0)===th)
-  .reduce((last,h)=>!last||h.lastAcceptT>last.lastAcceptT?h:last,null) : null;
+const lastAcceptedForThrow = th => {
+  if(!armAligned) return null;
+  if(hasStructuredHitMessages){
+    const ack=armPlanAcks
+      .filter(a=>matchThrowByAcceptedCt(a.plan.ct-RK.t0)===th)
+      .reduce((last,a)=>!last||a.t>last.t?a:last,null);
+    return ack?acceptedRecordForPlanAck(ack):null;
+  }
+  return armHitMarks
+    .filter(h=>h.label==='hit' && isNum(h.wct) && matchThrowByAcceptedCt(h.wct-RK.t0)===th)
+    .reduce((last,h)=>!last||h.lastAcceptT>last.lastAcceptT?h:last,null);
+};
 // [[final-ht-core-begin]]
 // FinalHT / Pre300HT（用户 2026-09-04 定义，北极星表全表唯一时间锚）
 // · FinalHT = 臂**最后接受并准备据此调整**的那条 /predict_hit_pos（用它自己的 ct/ht/rel_x/rel_z）：
@@ -3198,6 +3380,8 @@ const lastAcceptedForThrow = th => armAligned ? armHitMarks
 //   两组列仍有锚；TCP/拍面/目标拍速等臂列照旧为空，臂目标不冒充。
 const RL_TARGET_FREEZE_LEAD_S=0.030;
 const ARM_SWING_MODE=(()=>{
+  if(typeof hasStructuredHitMessages!=='undefined'&&hasStructuredHitMessages)
+    return {mode:'final_plan', source:'kind=final_hit_plan/preaim_hint 新合同'};
   const ov=String(typeof ARM_SWING_MODE_OVERRIDE==='string'?ARM_SWING_MODE_OVERRIDE:'auto').toLowerCase();
   if(ov==='rl'||ov==='rules') return {mode:ov, source:'--arm-swing-mode '+ov+' 覆盖'};
   if(!ARM) return {mode:'rules', source:'bag 无 /joint_states，臂栈未运行'};
@@ -3239,7 +3423,8 @@ const finalTargetIssues = (preds,pick) => {
   if(isNum(pick.rel_y)&&pick.rel_y<0) issues.push('rel_y<0（球已过目标参考原点）');
   return issues;
 };
-const describePred = p => ({pred:p, ct:p.ct, ht:p.ht, relX:p.rel_x, relZ:p.rel_z,
+const describePred = p => ({pred:p, plan:p.plan||null, planId:p.planId||null, revision:p.revision,
+                             ct:p.ct, ht:p.ht, relX:p.rel_x, relZ:p.rel_z,
                             armOrigin:!!p.armOrigin,
                             nFit:p.nFit, stage:p.stage, leadMs:(p.ht-p.ct)*1000});
 // 同抛 RK 预测流（/predict_hit_pos payload，换到 RK 绝对轴），字段与 armPreds 同形，供无臂回退与其 Pre300HT 用
@@ -3276,12 +3461,21 @@ const chassisTargetForThrow = (th,armIssues=[]) => {
 };
 const finalTargetForThrow = th => {
   if(!RK) return null;
-  if(!armAligned) return chassisTargetForThrow(th);
+  const structured=typeof hasStructuredHitMessages!=='undefined'&&hasStructuredHitMessages;
+  if(!armAligned) return structured?null:chassisTargetForThrow(th);
   const preds=armPredsForThrow(th);
   const accepted=lastAcceptedForThrow(th);
   let pick=null, source=null, note='', done=null, arrival=null, nFrozen=null;
   const issues=[];
-  if(ARM_SWING_MODE.mode==='rl'){
+  if(ARM_SWING_MODE.mode==='final_plan'){
+    pick=accepted&&accepted.plan?accepted.plan:null;
+    if(!pick) return null;
+    source='final_plan';
+    done=accepted.planAck;
+    arrival=accepted.planAck.t+RK.t0;
+    note='arm_controller 按 plan_id='+pick.planId+' revision='+pick.revision
+      +' 原子受理，contact_ht 与计划同值';
+  } else if(ARM_SWING_MODE.mode==='rl'){
     done=armRlDones.filter(s=>s.mode==='active'&&isNum(s.ct)&&matchThrowByAcceptedCt(s.ct-RK.t0)===th).pop()||null;
     if(done){
       pick=preds.find(p=>Math.abs(p.ct-done.ct)<1e-5)||null;
@@ -3310,7 +3504,7 @@ const finalTargetForThrow = th => {
     note=viaLate?'挥拍窗内最后一条 late ht saved（x/z 执行值仍是最后 accepted 的）':'最后一条 accepted hit（挥拍窗内无更新）';
     if(accepted.finalMismatch) issues.push('最后一条 late ht saved 回配原消息失败，退回最后 accepted');
   }
-  if(!pick) return chassisTargetForThrow(th,issues);
+  if(!pick) return structured?null:chassisTargetForThrow(th,issues);
   issues.push(...finalTargetIssues(preds,pick));
   return {...describePred(pick), source, note, issues, accepted, arrival, nFrozen, done, preds, fallback:false};
 };
@@ -3452,8 +3646,9 @@ const rk300TableHtml = () => {
   const visualTcpGeometryKnown=ARM&&String(ARM.fk_car||'').toLowerCase()==='v04';
   const racketBlackMarker=pcRacketRows.some(r=>r.blackMarker);
   const armContractRows=[];
-  const srcLabel={rl_status:'RL',rl_recon:'RL*',late_saved:'late',accepted:'acc',chassis_target:'车'};
-  const srcNote={rl_status:'RL 冻结前最后接受的目标（臂 rl_swing done 状态回配）',
+  const srcLabel={final_plan:'PLAN',rl_status:'RL',rl_recon:'RL*',late_saved:'late',accepted:'acc',chassis_target:'车'};
+  const srcNote={final_plan:'FinalHitPlan 与 arm_controller ACK 按 plan_id+revision 原子回配',
+                 rl_status:'RL 冻结前最后接受的目标（臂 rl_swing done 状态回配）',
                  rl_recon:'RL 冻结前最后接受的目标（旧 bag 按到达代理重建，--arm-swing-mode rl）',
                  late_saved:'规则规划器：挥拍窗内最后一条 late ht saved（只改 ht；x/z 执行值仍是最后 accepted）',
                  accepted:'规则规划器：最后一条 accepted hit',
@@ -3496,7 +3691,7 @@ const rk300TableHtml = () => {
     const truthPre=pre300HtPcSample!=null?pcTruthAt(pre300HtPcSample):null;
     const originTruthFin=pcTruthForTarget(truthFin,fin,botYawDegAt(finalHt),armForwardOffsetM);
     const originTruthPre=pcTruthForTarget(truthPre,pre,botYawDegAt(pre300Ht),armForwardOffsetM);
-    const finalMismatch=!!(fin&&fin.source!=='rl_status'&&fin.source!=='rl_recon'
+    const finalMismatch=!!(fin&&fin.source!=='final_plan'&&fin.source!=='rl_status'&&fin.source!=='rl_recon'
                            &&accepted&&accepted.finalMismatch);
     armContractRows.push({
       reportRow:idx+1,
@@ -3504,11 +3699,35 @@ const rk300TableHtml = () => {
       finalMismatch,
       swingMode:ARM_SWING_MODE.mode,
       finalHtSource:fin?fin.source:null,
+      planId:fin?fin.planId:null,
+      planRevision:fin&&Number.isInteger(fin.revision)?fin.revision:null,
       finalRelOrigin:fin?(fin.armOrigin?'arm_center':'car_center'):null,
       finalHtFallback:!!(fin&&fin.fallback),
       finalHtRkAbs:fin?fin.ht:null,
       finalCtRkAbs:fin?fin.ct:null,
       finalIssues:fin?fin.issues:[],
+      plannedCollision:fin&&fin.plan?{
+        timing:{sourceCt:fin.plan.source_ct,generatedAt:fin.plan.generated_at,contactHt:fin.plan.contact_ht},
+        contactWorld:[fin.plan.contact_x,fin.plan.contact_y,fin.plan.contact_z],
+        contactRel:[fin.plan.contact_rel_x,fin.plan.contact_rel_y,fin.plan.contact_rel_z],
+        armTargetRel:[fin.plan.arm_target_rel_x,fin.plan.arm_target_rel_y,fin.plan.arm_target_rel_z],
+        incoming:[fin.plan.incoming_vx,fin.plan.incoming_vy,fin.plan.incoming_vz],
+        racketContactVelocity:[fin.plan.racket_contact_vx,fin.plan.racket_contact_vy,fin.plan.racket_contact_vz],
+        faceNormal:[fin.plan.face_normal_nx,fin.plan.face_normal_ny,fin.plan.face_normal_nz],
+        faceNormalYawWorld:fin.plan.face_normal_yaw_world,facePitch:fin.plan.face_pitch,
+        armCenter:[fin.plan.arm_center_x,fin.plan.arm_center_y],
+        armCenterVelocity:[fin.plan.arm_center_vx,fin.plan.arm_center_vy],
+        carCenter:[fin.plan.car_center_x,fin.plan.car_center_y],
+        carCenterVelocity:[fin.plan.car_center_vx,fin.plan.car_center_vy],
+        carYawAtHt:fin.plan.car_yaw_at_ht,carYawRateAtHt:fin.plan.car_yaw_rate_at_ht,
+        compensatedSpeed:fin.plan.compensated_speed,
+        en:fin.plan.collision_en,kt:fin.plan.collision_kt,
+        outgoing:[fin.plan.outgoing_vx,fin.plan.outgoing_vy,fin.plan.outgoing_vz],
+        landing:[fin.plan.landing_x,fin.plan.landing_y],
+        apexZWorld:fin.plan.apex_z_world,netClearanceM:fin.plan.net_clearance_m,
+        solveIterations:fin.plan.solve_iterations,solveMs:fin.plan.solve_ms,
+        modelFingerprint:fin.plan.model_fingerprint,
+      }:null,
       pre300HtRkAbs:pre?pre.ht:null,
       finalHtPcBaselineElapsed:finalHtPcBaseline,
       finalHtPcSampleElapsed:finalHtPcSample,
@@ -3556,7 +3775,9 @@ const rk300TableHtml = () => {
       ? '<span title="'+tableEsc(label+'：/predict_hit_pos ct='+rowPcFixed(d.ct-RK.t0)+'s（观测时刻）、ht='
           +rowPcFixed(d.ht-RK.t0)+'s（global PC轴；原始 ht，未减臂内提前量）、lead='+d.leadMs.toFixed(0)
           +'ms、S'+d.stage+(isNum(d.nFit)?' n_fit='+d.nFit:'')
-          +'；显示 payload rel_x/rel_z 原值（世界轴，原点='+(d.armOrigin?'臂中心，消息含 arm_pred_x/y':'车心，历史消息未含 arm_pred_x/y')+'；不额外旋转或平移）'
+          +(d.plan
+            ? '；contact_rel_x/z=触球时球心−臂中心；arm_target_rel_x/z=球心沿水平拍面法向退一个球半径并加入 bot 偏置后的世界轴拍心执行点，由 arm_controller 实际消费；两者不混用'
+            : '；显示历史 payload rel_x/rel_z 原值（世界轴，原点='+(d.armOrigin?'臂中心，消息含 arm_pred_x/y':'车心，历史消息未含 arm_pred_x/y')+'；不额外旋转或平移）')
           +(d.devMs!=null?'；ct 距 FinalHT−300ms '+tableSigned(d.devMs)+'ms':'')
           +(d.arrival!=null?'；到达臂 '+rowPcFixed(d.arrival-RK.t0)+'s（到达时距 ht '
             +((d.ht-d.arrival)*1000).toFixed(0)+'ms）':'')
@@ -3565,7 +3786,9 @@ const rk300TableHtml = () => {
           +(d.issues&&d.issues.length?'；⚠ '+d.issues.join('；'):''))+'">'
           +(d.issues&&d.issues.length?'<span style="color:#e0a24a">⚠</span>':'')
           +tableXzCm(d.relX,d.relZ)+' <span style="color:#a0a0c0">@'+rowPcFixed(d.ht-RK.t0)
-          +(Number(d.stage)===0?' S0':'')+(tag||'')+'</span></span>'
+          +(Number(d.stage)===0?' S0':'')+(tag||'')+'</span>'
+          +(d.plan?'<br><span style="color:#a0a0c0">arm target '
+            +tableXzCm(d.plan.arm_target_rel_x,d.plan.arm_target_rel_z)+'</span>':'')+'</span>'
       : '<span title="'+tableEsc(fin?'本抛 FinalHT 之前没有更早的预测'
           :('本抛无 FinalHT（无 accepted / 无 RL 目标，底盘也无可回配的末次 target）；臂端拒收原因：'
             +rejectNoteForThrow(th).replace(/<br>/g,'；')))+'">—</span>';
@@ -3588,10 +3811,12 @@ const rk300TableHtml = () => {
     const tcpYawDeg=carYawAcc;
     const tcpWorld=armPointWorld(tcp,tcpYawDeg,armConstCal.zOff);
     // 臂目标：RL = FinalHT 消息的 rel_x/rel_z（RL 真正瞄的）；规则 = 最后 accepted 的（late 只改 ht）
-    const aimIsFinal=!!(fin&&(fin.source==='rl_status'||fin.source==='rl_recon'));
-    const aim=aimIsFinal?[fin.relX,fin.relZ]
-      :(accepted&&isNum(accepted.wx)&&isNum(accepted.wz)?[accepted.wx,accepted.wz]:null);
-    const aimLabel=aimIsFinal?'FinalHT 目标':'last accepted 目标';
+    const aimIsFinal=!!(fin&&(fin.source==='final_plan'||fin.source==='rl_status'||fin.source==='rl_recon'));
+    const finalPlan=fin&&fin.source==='final_plan'?fin.plan:null;
+    const aim=finalPlan?[finalPlan.arm_target_rel_x,finalPlan.arm_target_rel_z]
+      :(aimIsFinal?[fin.relX,fin.relZ]
+      :(accepted&&isNum(accepted.wx)&&isNum(accepted.wz)?[accepted.wx,accepted.wz]:null));
+    const aimLabel=finalPlan?'FinalHitPlan arm_target_rel':(aimIsFinal?'FinalHT 目标':'last accepted 目标');
     const tcpAimDx=tcpWorld&&aim?(tcpWorld[0]-aim[0])*100:null;
     const tcpAimDz=tcpWorld&&aim?(tcpWorld[2]-aim[1])*100:null;
     const tcpAimErrorText=aim?tableSigned(tcpAimDx)+'/'+tableSigned(tcpAimDz):'—/—';
@@ -3716,31 +3941,56 @@ const rk300TableHtml = () => {
       :(accepted&&isNum(accepted.wct)?armPreds.find(p=>Math.abs(p.ct-accepted.wct)<1e-5)||null:null);
     const done=fin?fin.done:null;
     const doneNum=k=>done?statusNum(done.text,k):null;
-    const tgtSpeed=isNum(doneNum('speed_req'))?doneNum('speed_req')
-      :(accepted&&isNum(accepted.tgtSpeed)?accepted.tgtSpeed:null);
-    const tgtPitch=isNum(doneNum('pitch'))?doneNum('pitch')
-      :(accepted&&isNum(accepted.tgtPitch)?accepted.tgtPitch:null);
+    const tgtSpeed=finalPlan?finalPlan.compensated_speed
+      :(isNum(doneNum('speed_req'))?doneNum('speed_req')
+      :(accepted&&isNum(accepted.tgtSpeed)?accepted.tgtSpeed:null));
+    const tgtPitch=finalPlan?finalPlan.face_pitch*180/Math.PI
+      :(isNum(doneNum('pitch'))?doneNum('pitch')
+      :(accepted&&isNum(accepted.tgtPitch)?accepted.tgtPitch:null));
     const tgtFaceYawRad=isNum(doneNum('face_yaw'))?doneNum('face_yaw')
       :(accepted&&isNum(accepted.tgtFaceYaw)?accepted.tgtFaceYaw:null);
-    const tgtApexZ=accepted&&isNum(accepted.tgtApexZ)?accepted.tgtApexZ:null;
-    const tgtNetClearance=accepted&&isNum(accepted.tgtNetClearance)?accepted.tgtNetClearance:null;
+    const tgtApexZ=finalPlan?finalPlan.apex_z_world
+      :(accepted&&isNum(accepted.tgtApexZ)?accepted.tgtApexZ:null);
+    const tgtNetClearance=finalPlan?finalPlan.net_clearance_m
+      :(accepted&&isNum(accepted.tgtNetClearance)?accepted.tgtNetClearance:null);
     const tgtYawExtraDeg=aimPred&&isNum(aimPred.yawExtra)?aimPred.yawExtra*180/Math.PI:null;
-    const tgtYawWorldDeg=tgtYawExtraDeg!=null?-tgtYawExtraDeg
-      :(tgtFaceYawRad!=null&&aimPred&&isNum(aimPred.carYaw)?(tgtFaceYawRad-aimPred.carYaw)*180/Math.PI:null);
+    const tgtYawWorldDeg=finalPlan?finalPlan.face_normal_yaw_world*180/Math.PI
+      :(tgtYawExtraDeg!=null?-tgtYawExtraDeg
+      :(tgtFaceYawRad!=null&&aimPred&&isNum(aimPred.carYaw)?(tgtFaceYawRad-aimPred.carYaw)*180/Math.PI:null));
+    const planVisible=finalPlan
+      ? '<br><span style="color:#a0a0c0">e_n/k_t '+finalPlan.collision_en.toFixed(3)+'/'
+        +finalPlan.collision_kt.toFixed(3)+' · solve '+finalPlan.solve_iterations+'×/'
+        +finalPlan.solve_ms.toFixed(2)+'ms</span><br><span style="color:#a0a0c0">vout '
+        +speedVectorText([finalPlan.outgoing_vx,finalPlan.outgoing_vy,finalPlan.outgoing_vz])
+        +' · apex/net '+finalPlan.apex_z_world.toFixed(2)+'/'+finalPlan.net_clearance_m.toFixed(2)+'m</span>'
+      : '';
     const tgtCell=(tgtSpeed!=null||tgtPitch!=null||tgtYawWorldDeg!=null||tgtApexZ!=null||tgtNetClearance!=null)
-      ? '<span title="'+tableEsc('目标三量来源='+(done?'RL FinalHT 目标（rl_swing done 状态的 speed_req/face_yaw/pitch）':'最后一条 accepted 状态的计划量')
+      ? '<span title="'+tableEsc('目标三量来源='+(finalPlan
+          ? 'final_hit_plan/v1 '+fin.planId+'#'+fin.revision+'（与 arm_controller ACK 原子匹配）'
+          :(done?'RL FinalHT 目标（rl_swing done 状态的 speed_req/face_yaw/pitch）':'最后一条 accepted 状态的计划量'))
           +'；speed='+(tgtSpeed!=null?tgtSpeed.toFixed(2)+'m/s':'—')
           +'（共享三维碰撞模型反解的补偿后接触拍速目标，机械臂局部 J1 切向；碰撞前叠加同 payload 的底盘世界速度）'
           +'；yaw='+(tgtYawWorldDeg!=null?tableSigned(tgtYawWorldDeg)+'°':'—')
-          +'=世界系拍面目标 yaw = face_yaw(臂系) − car_yaw = −δ'
+          +(finalPlan?'=FinalHitPlan 世界拍面法向 yaw':'=世界系拍面目标 yaw = face_yaw(臂系) − car_yaw = −δ')
           +(tgtYawExtraDeg!=null?'（δ=payload hit_yaw_extra='+tgtYawExtraDeg.toFixed(2)+'°，击球整体多转）':'')
           +(tgtFaceYawRad!=null?'；face_yaw(臂系锁面目标)='+(tgtFaceYawRad*180/Math.PI).toFixed(2)+'°':'')
           +'；pitch='+(tgtPitch!=null?tgtPitch.toFixed(2)+'°':'—')+'=目标拍面仰角（臂系≡世界系，可直接减右列实测 pitch）'
-          +(tgtApexZ!=null?('；apex_z='+tgtApexZ.toFixed(3)+'m=规划出球实际最高点（上限 2.700m，pitch 超过 28° 时自适应降低）'):'')
-          +(tgtNetClearance!=null?('；net_clearance='+tgtNetClearance.toFixed(3)+'m=球底相对 0.914m 网高的过网净空（要求 ≥0.100m）'):'')
+          +(tgtApexZ!=null?('；apex_z_world='+tgtApexZ.toFixed(3)+'m=规划出球实际最高点（上限 2.700m，pitch 超过 28° 时自适应降低）'):'')
+           +(tgtNetClearance!=null?('；net_clearance_m='+tgtNetClearance.toFixed(3)+'m=球底相对 0.914m 网高的过网净空（要求 ≥0.100m）'):'')
+          +(finalPlan?('；incoming='+speedVectorText([finalPlan.incoming_vx,finalPlan.incoming_vy,finalPlan.incoming_vz])
+            +'m/s；racket_contact_v='+speedVectorText([finalPlan.racket_contact_vx,finalPlan.racket_contact_vy,finalPlan.racket_contact_vz])
+            +'m/s；face_normal='+speedVectorText([finalPlan.face_normal_nx,finalPlan.face_normal_ny,finalPlan.face_normal_nz])
+            +'；car_center=('+finalPlan.car_center_x.toFixed(3)+','+finalPlan.car_center_y.toFixed(3)+')m'
+            +'；arm_center=('+finalPlan.arm_center_x.toFixed(3)+','+finalPlan.arm_center_y.toFixed(3)+')m'
+            +'；outgoing='+speedVectorText([finalPlan.outgoing_vx,finalPlan.outgoing_vy,finalPlan.outgoing_vz])
+            +'m/s；landing=('+finalPlan.landing_x.toFixed(3)+','+finalPlan.landing_y.toFixed(3)+')m'
+            +'；e_n='+finalPlan.collision_en.toFixed(6)+'，k_t='+finalPlan.collision_kt.toFixed(6)
+            +'；generated−source='+((finalPlan.generated_at-finalPlan.source_ct)*1000).toFixed(2)+'ms'
+            +'，solve='+finalPlan.solve_iterations+' 次/'+finalPlan.solve_ms.toFixed(3)+'ms'
+            +'；model='+finalPlan.model_fingerprint):'')
           +htSrcNote)+'">'
           +(tgtSpeed!=null?tgtSpeed.toFixed(2):'—')+'/'+(tgtYawWorldDeg!=null?tableSigned(tgtYawWorldDeg):'—')+'/'
-          +(tgtPitch!=null?tgtPitch.toFixed(1):'—')+'</span>'
+          +(tgtPitch!=null?tgtPitch.toFixed(1):'—')+planVisible+'</span>'
       : '<span title="本抛无 accepted/rl_swing 状态，或该场 arm_controller 早于可变 pitch(0805)/拍速逐拍指定(0808)，状态行不带这些字段">—</span>';
     // ⑬⑭ 拍面 yaw/pitch 与世界拍心速度 @FinalHT / @FinalHT−12ms
     const faceYaw=faceAnglesWorldAt(finalHt);
@@ -3929,12 +4179,14 @@ const rk300TableHtml = () => {
   const nIssue=armContractRows.filter(r=>r.finalIssues&&r.finalIssues.length).length;
   const nChassis=srcCounts.chassis_target||0;
   const modeSummary='<div style="font-size:11px;color:#a0a0c0;margin:0 0 6px">臂挥拍模式：<b style="color:#e6e6f0">'
-    +(!ARM?'无臂数据':(ARM_SWING_MODE.mode==='rl'?'RL（rl_swing_mode=active）':'规则规划器'))+'</b>（判定：'+ARM_SWING_MODE.source+'）'
+    +(!ARM?'无臂数据':(ARM_SWING_MODE.mode==='final_plan'?'FinalHitPlan v1'
+      :(ARM_SWING_MODE.mode==='rl'?'RL（rl_swing_mode=active）':'规则规划器')))+'</b>（判定：'+ARM_SWING_MODE.source+'）'
     +'；FinalHT 可用 '+nFinal+'/'+reportThrows.length+' 抛（源 '
     +(Object.keys(srcCounts).map(k=>srcLabel[k]+'='+srcCounts[k]).join('，')||'—')+'）'
     +(nIssue?'；<span style="color:#e0a24a">⚠ '+nIssue+' 抛 FinalHT 校验有告警（悬停看原因）</span>':'')
-    +'。FinalHT=臂最后接受并据此调整的那条 /predict_hit_pos（RL：30ms 冻结前末条；规则：最后 accepted 或其后 late ht saved；'
-    +'臂无 FinalHT 时回退=底盘末次 target 对应预测 [车]）'
+    +(hasStructuredHitMessages
+      ? '。FinalHT=kind=final_hit_plan 且与 accepted 状态按 plan_id+revision 原子匹配、contact_ht 同值的计划；preaim_hint 与旧状态均不回退。'
+      : '。FinalHT=臂最后接受并据此调整的那条 /predict_hit_pos（RL：30ms 冻结前末条；规则：最后 accepted 或其后 late ht saved；臂无 FinalHT 时回退=底盘末次 target 对应预测 [车]）')
     +'；Pre300HT=同抛 ct 最接近 FinalHT−300ms 的那条。全表 PC 取样、TCP、拍面、车 yaw 都锚在 FinalHT（PC 侧加本抛 zPhase）。'
     +(nChassis?'<span style="color:#e0a24a">本场 '+nChassis+' 抛臂无 FinalHT，回退为底盘末次 target 对应预测 [车]：'
       +'车移动 / PC 真值列可用；TCP、拍面、目标拍速等臂列为空。</span>':'')
@@ -3960,7 +4212,7 @@ const rk300TableHtml = () => {
     '悬停看世界坐标、车心、同曝光 TCP 与每帧质检。')+'">'+
     '视觉拍心−车心@FinalHT+zPhase附近<br>x/y/z(cm,世界轴)<br>人工轨迹或最近前/后＋ht前逐帧；视觉−同曝光TCP（dx，dy，dz）</th>'+
     '<th title="车体 yaw@FinalHT（与本表所有 RK/Arm 列同锚）：取 /bot_state 瞬时值——车控 accept AprilTag 定位后 yaw 由 IMU 连续更新、HT 结束后才重定位，故采样点无重定位台阶，挥拍位姿伪迹只塌陷位置不动 yaw。悬停看 IMU yaw_speed 换算的 10ms 时序灵敏度；右侧拍面yaw 直接减同一 RK yaw，不读取PC yaw">车yaw@FinalHT<br>(°)</th>'+
-    '<th title="目标三量：speed=共享三维碰撞反解的补偿后接触拍速目标（m/s；机械臂局部 J1 切向，碰撞前叠加同 payload 的底盘世界速度；RL/规则同口径）/ yaw=世界系拍面目标 yaw=−δ（δ=payload hit_yaw_extra 击球整体多转；与右列实测世界 yaw 同口径）/ pitch=目标拍面仰角（°，臂系≡世界系）。悬停同时显示实际 apex_z 与球底过网净空 net_clearance">目标挥拍速度/yaw/pitch<br>(m/s, °, °)</th>'+
+    '<th title="FinalHitPlan：补偿拍速/世界拍面法向yaw/pitch；第二行显示碰撞 e_n/k_t 与联立求解迭代数/耗时，第三行显示三维出球速度与最高点/过网净空。悬停含输入/输出速度、落点、generated_at−source_ct 和模型指纹。历史消息仍显示原 speed/yaw/pitch。">目标挥拍速度/yaw/pitch<br>(m/s, °, °)<br>碰撞 / 求解</th>'+
     '<th title="拍面法向（车型配置轴；V04 为 FK link6 +Y）的世界 yaw / pitch，同一份冲击前窗[−80,−6]ms 线性拟合@FinalHT；'+
     '灰字为世界拍心速度 |v_world|：拍心点 p_head 的 ±10ms 中心差分（v0.4 的 p_head 走冻结柔度模型 F='+
     'FK(q−c·τ+d·q̇)+R·tool_offset+[dx,dy,0]，不是刚性 FK(q) 的 TCP；0907 黑标三场把反馈→视觉甜点 '+
