@@ -27,8 +27,8 @@ class SiteConfigTest(unittest.TestCase):
 
     def test_ros2_addresses(self) -> None:
         # 18F PC 当前绑定 192.168.50.153（Wi-Fi）。
-        # Peers 是两台车各自唯一的 IP（v03=.143 / v04=.208，车上静态配置）。
-        car_ips = {"192.168.50.143", "192.168.50.208"}
+        # Peers 是各车唯一的 IP（v03=.143 / v04=.208 / v05=.110）。
+        car_ips = {"192.168.50.143", "192.168.50.208", "192.168.50.110"}
         for filename in ("cyclonedds_18.xml",):
             root = ET.parse(ROS2_DIR / filename).getroot()
             self.assertEqual(

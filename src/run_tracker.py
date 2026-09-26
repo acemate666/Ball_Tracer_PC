@@ -102,6 +102,7 @@ from src.tile_manager import TileManager, TileRect
 CAR_LAYOUT_CONFIGS = {
     "v03": "arm_poe_racket_center.json",
     "v04": "vehicle_v04.json",
+    "v05": "vehicle_v05.json",
 }
 
 
@@ -2063,7 +2064,7 @@ def main() -> int:
         default=str(config_dir / "four_camera_calib_18.json"),
         help="相机标定与外参配置",
     )
-    # 车型必须显式选，**没有默认值**。两台车的 AprilTag 布局完全不同，选错了车
+    # 车型必须显式选，**没有默认值**。各车的 AprilTag 布局不同，选错了车
     # 定位会整体偏几十 cm、yaw 还可能翻 180°，而 tracker 自己看不出来——刚性拟合
     # 照样收敛，唯一的信号是 car_loc.reprojection_error 从 ~2px 涨到 40px+，
     # 那要等出报告才发现（2026-08-15 就这么坏了一整场）。宁可启动失败。

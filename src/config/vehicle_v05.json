@@ -1,0 +1,30 @@
+{
+  "config_role": "vehicle_v0.5_apriltag_layout",
+  "vehicle_reference": {
+    "car_base_definition": "car chassis center on the ground plane (z = 0).",
+    "layout_axis_convention": "Tag centers and rotations are expressed in the car body frame: origin = car center on ground, x right, y forward, z up.",
+    "apriltag_black_edge_m": 0.161,
+    "apriltags": {
+      "0": {
+        "center_car_m": [0.2475, -0.428, 0.2875],
+        "R_tag_car": [
+          [-0.018231, 0.998331, 0.054797],
+          [0.088386, 0.0562, -0.9945],
+          [-0.995919, -0.013288, -0.089263]
+        ],
+        "position_note": "右下。用户实测：x=0.85/2-0.097-0.161/2，y=-0.85/2-0.003，z=0.207+0.161/2（m）。",
+        "orientation_note": "相机实测朝车尾、侧贴：印面右朝下、印面上朝车右；对应名义面内旋转 -90°。"
+      },
+      "1": {
+        "center_car_m": [-0.4065, 0.035, 0.3375],
+        "R_tag_car": [
+          [0.998873, -0.021313, -0.04241],
+          [-0.043631, -0.060518, -0.997213],
+          [0.018687, 0.99794, -0.06138]
+        ],
+        "position_note": "左上。用户实测：x=-0.85/2-0.062+0.161/2，y=-0.85/2+0.46，z=0.257+0.161/2（m）。",
+        "orientation_note": "相机实测朝车尾、正贴，印面上朝上；对应名义面内旋转 0°。"
+      }
+    }
+  }
+}

@@ -10,8 +10,9 @@ TRACKER_PC_IP = os.environ.get("BALL_TRACER_PC_IP", "192.168.50.153")
 CAR_RK_IPS = {
     "v03": "192.168.50.143",
     "v04": "192.168.50.208",
+    "v05": "192.168.50.110",
 }
-# run_tracker.ps1 按 -Car 设置；没设时列出两台车（本值只用于启动打印，
+# run_tracker.ps1 按 -Car 设置；没设时列出所有车（本值只用于启动打印，
 # 实际 DDS 发现走 CYCLONEDDS_URI 指到的 xml 里的 Peers）
 RK_CAR_IP = os.environ.get("BALL_TRACER_RK_CAR_IP", "")
 DEFAULT_ROS_DOMAIN_ID = "2"

@@ -26,12 +26,12 @@ param(
     [double]$GainDb = -1,
     [Nullable[double]]$DigitalShift = $null,
     [string]$CalibrationConfig = '',
-    # 车型必选，没有默认值：两台车的车载 AprilTag 布局完全不同，选错了车定位会静默
+    # 车型必选，没有默认值：各车的车载 AprilTag 布局不同，选错了车定位会静默
     # 偏几十 cm、yaw 还可能翻 180°（拟合照样收敛，只有 car_loc 重投影会从 ~2px 涨到
     # 40px+，要等出报告才看得见）。不传就在这里弹提示让你选，别猜。
     # HelpMessage 保持 ASCII：本文件无 BOM，PS 5.1 按 ANSI 读，中文字面量会变乱码
-    [Parameter(Mandatory = $true, HelpMessage = "Pick the car: v03 (old car) or v04 (new car)")]
-    [ValidateSet('v03', 'v04')]
+    [Parameter(Mandatory = $true, HelpMessage = "Pick the car: v03, v04, or v05")]
+    [ValidateSet('v03', 'v04', 'v05')]
     [string]$Car,
     # 只在要跑非标布局文件时用；给了就覆盖 -Car 选出来的那份
     [string]$CarConfig = '',
@@ -91,6 +91,7 @@ function Get-LocalIPv4Addresses {
 $carRkIps = @{
     'v03' = '192.168.50.143'
     'v04' = '192.168.50.208'
+    'v05' = '192.168.50.110'
 }
 
 $localIps = Get-LocalIPv4Addresses
@@ -106,10 +107,6 @@ if ($localIps -notcontains $trackerPcIp) {
     } else {
         throw "$ipMsg`nCycloneDDS would fail to bind ($cycloneXmlName). Fix the network, or use -Ros2Mode off to run offline."
     }
-}
-
-if ($Car -ne 'v04') {
-    Write-Warning "18F normally runs v04, but -Car $Car was given. Check the AprilTag layout is really $Car."
 }
 
 if ([string]::IsNullOrWhiteSpace($CameraConfig)) {

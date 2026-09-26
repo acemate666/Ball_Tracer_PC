@@ -6,6 +6,10 @@ Launch with:
 .\run_tracker_with_predict.ps1 -Car v04
 ```
 
+Both launchers accept `-Car v03`, `-Car v04`, and `-Car v05`. V05 selects
+`src/config/vehicle_v05.json` and the car address `192.168.50.110`.
+The PC arm FK report currently supports v03/v04 only; v05 uses a five-axis arm.
+
 The launcher is a thin opt-in over `run_tracker.ps1`; camera, floor, ROS2 and
 environment selection stay identical. The original launcher remains unchanged
 unless `-EnableRkTimeAlign` is explicitly supplied.
