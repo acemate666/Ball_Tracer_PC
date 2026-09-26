@@ -1,8 +1,8 @@
 {
   "config_role": "vehicle_v0.5_apriltag_layout",
   "vehicle_reference": {
-    "car_base_definition": "car chassis center on the ground plane (z = 0).",
-    "layout_axis_convention": "Tag centers and rotations are expressed in the car body frame: origin = car center on ground, x right, y forward, z up.",
+    "car_base_definition": "car chassis center on the ground plane (z = 0). On v05 the robotic arm base (joint_1 axis) is at this same point.",
+    "layout_axis_convention": "Tag centers and rotations are expressed in the car body frame: origin = chassis center on ground = arm base, x right, y forward, z up.",
     "apriltag_black_edge_m": 0.161,
     "apriltags": {
       "0": {
