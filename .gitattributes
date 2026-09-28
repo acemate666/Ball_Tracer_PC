@@ -1,0 +1,34 @@
+# 全项目换行符一律 LF（2026-09-28 用户定）：Windows 上写代码 → Jetson / RK 上跑，两边工作树逐字节相同。
+# 规则、各写文件工具的坑、自检命令见 tennis-man 根仓库 memory/lf-line-endings-everywhere.md。
+* text=auto eol=lf
+
+# 唯一例外：只在 Windows cmd.exe 里执行的批处理保留 CRLF（LF 时 goto / call :label 会找错标签）。
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制写死、永不做换行转换（text=auto 只看前 8KB 有没有 NUL 来猜，小文件会猜错）。
+*.bin    binary
+*.elf    binary
+*.so     binary
+*.dll    binary
+*.lib    binary
+*.pyd    binary
+*.pt     binary
+*.pth    binary
+*.onnx   binary
+*.engine binary
+*.rknn   binary
+*.npz    binary
+*.npy    binary
+*.pkl    binary
+*.db3    binary
+*.mcap   binary
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.ico    binary
+*.pdf    binary
+*.zip    binary
+*.mp4    binary
+*.avi    binary
