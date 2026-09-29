@@ -2123,61 +2123,6 @@ const armPredForStatus = (s,dur) => {
   return p;
 };
 // [[arm-pred-align-core-end]]
-// [[arm-const-cal-core-begin]]
-// 臂端三个量逐场自标定（写死会随控制端改版整场失效）。样本 = 序号对齐配上的 accepted↔源消息对
-//（旧版拿 x 值键当筛选来自举，臂端一改 x 变换就取不到样本 → 标定与回配一起归零，
-//  0811 113734 场就是这么全表 — 的；现在筛选里没有任何值键）：
-//   · z 偏移 zOff = 众数(acc_z − rel_z)（0.1mm 分辨率）= config 的 HIT_POS_Z_OFFSET。
-//   · x 比例 xScale = 中位(acc_x / rel_x) = 1/cos(kHitYawExtraRad)。取比例不取差值：变换是
-//     乘性的，差值随 x 变（0.7~1.1m 量程上差 0.3mm，会咬掉值键 5e-4 的判别力）；acc_x 只印
-//     4 位小数 → 比值量化 1e-4，故取中位不取众数。⚠ 若哪天臂端改成加性偏置，这里会退化成
-//     ±20%·偏置 的残差，值键兜底随之失灵——但主键是序号键，报告不会因此空表，
-//     且残差会被 armDataWarnHtml 的 okN<accN 抓出来。
-//   · 提前量 adv = round(median(ht−acc_t−dur)+1ms) = 臂内提前量 − 状态发布开销（实测 0.3~1.4ms）。
-//     实测 0802/0803晨 C=+8.9→10ms、0803夜 +13.9→15ms、0804 起 −1.1→0ms，与 config 历史逐场对上。
-// 票数 <3 时保留缺省值（页面红条标出），不拿噪声改合同。panel 手动目标不走 z 偏移，不参与投票。
-const armConstCal = (()=>{
-  const t0 = (RK && isNum(RK.t0)) ? RK.t0 : 0;
-  const votes=new Map(), cands=[], ratios=[];
-  const take=(p,ax,az,at,dur)=>{
-    if(p.relSrc==='panel') return;
-    if(!isNum(p.rel_x)||!isNum(p.rel_z)||!isNum(p.ht)) return;
-    const key=Math.round((az-p.rel_z)*1e4)/1e4;
-    votes.set(key,(votes.get(key)||0)+1);
-    cands.push({key,c:p.ht-at-dur});
-    if(Math.abs(p.rel_x)>0.1) ratios.push(ax/p.rel_x);
-  };
-  armHitStatuses.forEach(s=>{
-    const m=armAcceptedHitRe.exec(s.text);
-    if(!m) return;
-    const ax=Number(m[1]), az=Number(m[2]), dur=Number(m[3]), at=s.t+t0;
-    const p=armPredForStatus(s,dur);
-    if(p){ take(p,ax,az,at,dur); return; }
-    if(armPredAlign.delta!=null) return;   // 序号对齐立得住时只信它，不掺值键样本
-    // 兜底自举（序号对齐不可用的早期 bag）：老办法用 x 值键 + 时序键圈候选族，
-    // 同抛相邻消息会投错票，靠 z 众数压掉。臂端一改 x 变换这条路就取不到样本 → 见上。
-    armPreds.forEach(q=>{
-      if(!(q.t<=s.t && s.t-q.t<=ARM_PRED_ARRIVE_MAX_SEC)) return;
-      if(!isNum(q.rel_x)||!isNum(q.ht)) return;
-      if(Math.abs(q.rel_x*ARM_HIT_X_SCALE-ax)>=5e-4) return;
-      if(Math.abs(q.ht-at-dur)>=ARM_PRED_HT_TOL_SEC) return;
-      take(q,ax,az,at,dur);
-    });
-  });
-  let zOff=null, best=0, total=0;
-  votes.forEach((n,k)=>{ total+=n; if(n>best){ best=n; zOff=k; } });
-  if(best<3) return {zOff:null, xScale:null, adv:null, n:best, total, c:null};
-  const cs=cands.filter(r=>r.key===zOff).map(r=>r.c).sort((a,b)=>a-b);
-  const c=cs[cs.length>>1];
-  const adv=Math.round(c*1000+1)/1000;
-  ratios.sort((a,b)=>a-b);
-  const xScale=ratios.length>=3?ratios[ratios.length>>1]:null;
-  return {zOff, xScale, adv:(adv>=0&&adv<=0.03)?adv:null, n:best, total, c, nx:ratios.length};
-})();
-if(armConstCal.zOff!=null) ARM_HIT_Z_OFFSET=armConstCal.zOff;
-if(armConstCal.xScale!=null) ARM_HIT_X_SCALE=armConstCal.xScale;
-if(armConstCal.adv!=null) HIT_TIME_ADVANCE_SEC=armConstCal.adv;
-// [[arm-const-cal-core-end]]
 // /tennis/status 尾部的 `key=数值` 字段取值：字段随 arm_controller 版本增删（可变 pitch 0805、
 // 拍速指定 0808…），老 bag 取不到就返回 null 让对应列显示 —。key 后必须紧跟 =，故取 'speed'
 // 不会命中 'speed_req'。
@@ -2240,6 +2185,73 @@ const acceptedRecordForPlanAck=ack=>{
     tgtFaceYaw:null,tgtApexZ:q.apex_z_world,tgtNetClearance:q.net_clearance_m};
 };
 // [[final-hit-plan-ack-core-end]]
+// [[arm-const-cal-core-begin]]
+// 臂端三个量逐场自标定（写死会随控制端改版整场失效）。样本 = 序号对齐配上的 accepted↔源消息对
+//（旧版拿 x 值键当筛选来自举，臂端一改 x 变换就取不到样本 → 标定与回配一起归零，
+//  0811 113734 场就是这么全表 — 的；现在筛选里没有任何值键）：
+//   · z 偏移 zOff = 众数(acc_z − rel_z)（0.1mm 分辨率）= config 的 HIT_POS_Z_OFFSET。
+//   · x 比例 xScale = 中位(acc_x / rel_x) = 1/cos(kHitYawExtraRad)。取比例不取差值：变换是
+//     乘性的，差值随 x 变（0.7~1.1m 量程上差 0.3mm，会咬掉值键 5e-4 的判别力）；acc_x 只印
+//     4 位小数 → 比值量化 1e-4，故取中位不取众数。⚠ 若哪天臂端改成加性偏置，这里会退化成
+//     ±20%·偏置 的残差，值键兜底随之失灵——但主键是序号键，报告不会因此空表，
+//     且残差会被 armDataWarnHtml 的 okN<accN 抓出来。
+//   · 提前量 adv = round(median(ht−acc_t−dur)+1ms) = 臂内提前量 − 状态发布开销（实测 0.3~1.4ms）。
+//     实测 0802/0803晨 C=+8.9→10ms、0803夜 +13.9→15ms、0804 起 −1.1→0ms，与 config 历史逐场对上。
+// 票数 <3 时保留缺省值（页面红条标出），不拿噪声改合同。panel 手动目标不走 z 偏移，不参与投票。
+// FinalHitPlan 场没有旧状态（armHitStatuses 为空），样本改用按 plan_id+revision 原子回配的
+// accepted↔计划对（armPlanAcks）。臂端 z = arm_target_rel_z + hit_pos_z_offset_m（车型量，
+// v04 −0.193109308），故 zOff = 众数(acc_z − arm_target_rel_z)；用 contact_rel_z 会混进
+// arm_target_z_bias_m。x 比例与提前量只服务旧状态回配，新合同下没有消费者，不标。
+// zOff 缺失时 TCP 列、视觉−TCP 与黑标测量整场失效（0923 155028 场 40/40 —）。
+const armConstCal = (()=>{
+  const t0 = (RK && isNum(RK.t0)) ? RK.t0 : 0;
+  const votes=new Map(), cands=[], ratios=[];
+  const take=(p,ax,az,at,dur)=>{
+    if(p.relSrc==='panel') return;
+    if(!isNum(p.rel_x)||!isNum(p.rel_z)||!isNum(p.ht)) return;
+    const key=Math.round((az-p.rel_z)*1e4)/1e4;
+    votes.set(key,(votes.get(key)||0)+1);
+    cands.push({key,c:p.ht-at-dur});
+    if(Math.abs(p.rel_x)>0.1) ratios.push(ax/p.rel_x);
+  };
+  armHitStatuses.forEach(s=>{
+    const m=armAcceptedHitRe.exec(s.text);
+    if(!m) return;
+    const ax=Number(m[1]), az=Number(m[2]), dur=Number(m[3]), at=s.t+t0;
+    const p=armPredForStatus(s,dur);
+    if(p){ take(p,ax,az,at,dur); return; }
+    if(armPredAlign.delta!=null) return;   // 序号对齐立得住时只信它，不掺值键样本
+    // 兜底自举（序号对齐不可用的早期 bag）：老办法用 x 值键 + 时序键圈候选族，
+    // 同抛相邻消息会投错票，靠 z 众数压掉。臂端一改 x 变换这条路就取不到样本 → 见上。
+    armPreds.forEach(q=>{
+      if(!(q.t<=s.t && s.t-q.t<=ARM_PRED_ARRIVE_MAX_SEC)) return;
+      if(!isNum(q.rel_x)||!isNum(q.ht)) return;
+      if(Math.abs(q.rel_x*ARM_HIT_X_SCALE-ax)>=5e-4) return;
+      if(Math.abs(q.ht-at-dur)>=ARM_PRED_HT_TOL_SEC) return;
+      take(q,ax,az,at,dur);
+    });
+  });
+  armPlanAcks.forEach(ack=>{
+    const m=armAcceptedHitRe.exec(ack.text);
+    if(!m) return;
+    const key=Math.round((Number(m[2])-ack.plan.armTargetRelZ)*1e4)/1e4;
+    votes.set(key,(votes.get(key)||0)+1);
+  });
+  let zOff=null, best=0, total=0;
+  votes.forEach((n,k)=>{ total+=n; if(n>best){ best=n; zOff=k; } });
+  if(best<3) return {zOff:null, xScale:null, adv:null, n:best, total, c:null};
+  if(hasStructuredHitMessages) return {zOff, xScale:null, adv:null, n:best, total, c:null};
+  const cs=cands.filter(r=>r.key===zOff).map(r=>r.c).sort((a,b)=>a-b);
+  const c=cs[cs.length>>1];
+  const adv=Math.round(c*1000+1)/1000;
+  ratios.sort((a,b)=>a-b);
+  const xScale=ratios.length>=3?ratios[ratios.length>>1]:null;
+  return {zOff, xScale, adv:(adv>=0&&adv<=0.03)?adv:null, n:best, total, c, nx:ratios.length};
+})();
+if(armConstCal.zOff!=null) ARM_HIT_Z_OFFSET=armConstCal.zOff;
+if(armConstCal.xScale!=null) ARM_HIT_X_SCALE=armConstCal.xScale;
+if(armConstCal.adv!=null) HIT_TIME_ADVANCE_SEC=armConstCal.adv;
+// [[arm-const-cal-core-end]]
 const _armHit = (()=>{
   if(!ARM) return {marks:[], nAcc:0, nMatch:0};
   // ARM 时轴与 rebase 状态严格对应：armAligned 时 ARM 各行已减 RK.t0（相对轴），

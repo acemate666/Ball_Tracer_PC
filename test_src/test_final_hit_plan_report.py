@@ -348,6 +348,49 @@ def test_report_matches_only_exact_plan_identity_and_contact_ht(tmp_path):
     assert (result["id"], result["revision"]) == ("throw42", 3)
 
 
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_final_plan_session_calibrates_arm_z_offset_from_plan_acks(tmp_path):
+    """FinalHitPlan 场没有旧状态可回配，zOff 必须从 plan_id+revision 原子回配的 ACK 标定。
+
+    臂端 z = arm_target_rel_z + hit_pos_z_offset_m；夹具 arm_target_z_bias=−0.02，误用
+    contact_rel_z 会差 2cm。zOff=null 会让 TCP 列与黑标测量整场失效（0923 155028 场）。
+    """
+    z_offset = -0.193109308
+    events = []
+    for k in range(3):
+        plan = _plan(plan_id=f"throw{k}", revision=1)
+        events.append({"t": 0.02 + 0.01 * k, "topic": "/predict_hit_pos",
+                       "text": json.dumps(plan)})
+        events.append({"t": 0.05 + 0.01 * k, "topic": "/tennis/status", "text":
+                       f"accepted hit x={plan['arm_target_rel_x']:.4f} "
+                       f"z={plan['arm_target_rel_z'] + z_offset:.4f} duration=0.5500 "
+                       f"plan_id=throw{k} revision=1 contact_ht=100.600000 solve_ms=1.380"})
+    body = (
+        "const isNum=v=>typeof v==='number'&&Number.isFinite(v);\n"
+        "const RK={t0:100};\n"
+        "let HIT_TIME_ADVANCE_SEC=0.0;\n"
+        f"const ARM={{events:{json.dumps(events)}}};\n"
+        + _core("arm-prediction-match-core-begin", "arm-prediction-match-core-end")
+        + _core("final-hit-plan-parse-core-begin", "final-hit-plan-parse-core-end")
+        + _core("arm-pred-align-core-begin", "arm-pred-align-core-end")
+        + "\nconst statusNum=(text,key)=>{const m=new RegExp('(?:^|\\\\s)'+key+'=(-?[0-9]+(?:\\\\.[0-9]+)?)').exec(text||'');return m?Number(m[1]):null;};\n"
+        + _core("final-hit-plan-ack-core-begin", "final-hit-plan-ack-core-end")
+        + _core("arm-const-cal-core-begin", "arm-const-cal-core-end")
+        + "console.log(JSON.stringify({acks:armPlanAcks.length,cal:armConstCal,z:ARM_HIT_Z_OFFSET}));\n"
+    )
+    script = tmp_path / "final_plan_z_offset.js"
+    script.write_text(body, encoding="utf-8")
+    run = subprocess.run(
+        [NODE, str(script)], capture_output=True, text=True, encoding="utf-8", timeout=30
+    )
+    assert run.returncode == 0, run.stderr
+    result = json.loads(run.stdout)
+    assert result["acks"] == 3
+    assert result["cal"]["zOff"] == pytest.approx(-0.1931, abs=1e-9)
+    assert result["cal"]["n"] == 3
+    assert result["z"] == pytest.approx(-0.1931, abs=1e-9)
+
+
 def test_report_surfaces_plan_physics_and_disables_new_contract_fallback():
     source = SRC.read_text(encoding="utf-8")
     assert "return structured?null:chassisTargetForThrow" in source

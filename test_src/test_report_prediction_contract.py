@@ -559,6 +559,9 @@ def _const_cal_harness(events: list) -> str:
         "const isNum=v=>typeof v==='number'&&Number.isFinite(v);\n"
         "const RK={t0:0};\n"
         "let HIT_TIME_ADVANCE_SEC=0.0;\n"
+        # 旧状态场：没有 FinalHitPlan，ACK 回配为空
+        "const hasStructuredHitMessages=false;\n"
+        "const armPlanAcks=[];\n"
         f"const ARM={{events:{json.dumps(events)}}};\n"
         + _core("arm-prediction-match-core-begin", "arm-prediction-match-core-end") + "\n"
         "const armPreds=ARM.events.filter(e=>e.topic==='/predict_hit_pos').map(e=>{"
