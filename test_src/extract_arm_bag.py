@@ -2,14 +2,19 @@
 """从 tracker rosbag 提取机械臂数据为 {run_id}_arm.json。
 
 必须在 ROS2 环境中运行（经 ros2/run_ros2.bat 启动），依赖 rosbag2_py。
-TCP 正解：v0.3 用本文件内置的 USD 链；v0.4 直接引用标准文件——tennis-man/arm_controller 的
-compact_arm_kinematics + config/cars/v04.yaml（零位 offset_rad、tool_x、hit_pos_z_offset_m 都在那里，
+TCP 正解：v0.3 用本文件内置的 USD 链；v0.4 / v0.5 直接引用标准文件——tennis-man/arm_controller 的
+compact_arm_kinematics + config/cars/<car>.yaml（零位 offset_rad、tool_x、hit_pos_z_offset_m 都在那里，
 2026-09-05 用户定：臂端 FK 与报告 FK 只认这一份真值；路径可用 TENNIS_MAN_ARM_CONTROLLER 覆盖）。
 
-⚠ 车型（--car v03|v04）决定用哪条 FK 链，**没有默认值**：两台车的肩高、连杆与拍心标定距离
+⚠ 车型（--car v03|v04|v05）决定用哪条 FK 链，**没有默认值**：各车的肩高、连杆与拍心标定距离
 均不同，选错不会报错、只会让整场 TCP 偏几厘米。不给 --car 时从同目录的 tracker JSON
 （config.car_config_path，run_tracker 按启动的 --car 写入）推断，推不出来直接失败。
 选中的车型写进输出的 "car"/"car_source"/"fk_source"，报告端按它复算，绝不自己猜。
+
+关节一律按控制器的 6 个槽输出（position/velocity/effort 都是 6 列，joint_names 是各槽的名字）。
+v0.5 是五轴臂（没有腕转）：/joint_states 与 /tennis/motor_command 只有 joint1..joint5 五个名字，
+按臂端 car_config 同一规则进槽 0,1,2,3,5（名叫 joint5 的是拍柄滚转 → 槽 5），槽 4 空、恒 0。
+包里的关节名对不上所选车型直接失败——那是拿错车的另一种征兆。
 
 输出供 test_src/generate_curve3_html.py 的 Arm tab 使用：
   states   — /joint_states 实际关节位置/速度/力矩 + FK TCP
@@ -43,16 +48,19 @@ import math
 import os
 import re
 import statistics
+from collections.abc import Mapping
+from functools import partial
 from pathlib import Path
 from typing import Iterable, NamedTuple
 
 import numpy as np
 
 
-# ── 车型运动学（v0.3 / v0.4 是两台不同的臂）────────────────────────────────────
-# v03：逐值抄自 arm_controller.compact_arm_kinematics@a266857（USD tennis_arm_j5j6_7_6_world）。
-# v04：**不抄**，从标准 checkout 加载 compact_arm_kinematics 并 use_car("v04")——关节表、工具轴、
-# 甜点距离（yaml kinematics.tool_x 反推）全部来自 config/cars/v04.yaml 这一份真值。
+# ── 车型运动学（v0.3 / v0.4 / v0.5 是三台不同的臂）──────────────────────────────
+# v03：逐值抄自 arm_controller.compact_arm_kinematics@a266857（USD tennis_arm_j5j6_7_6_world）；
+#      v0.3 已随车从 arm_controller 删除（0923，连同 assets/v03），这份抄本冻结，只为回放老场次。
+# v04 / v05：**不抄**，从标准 checkout 加载 compact_arm_kinematics 并 use_car(car)——关节表（五轴臂由
+# six_slot_urdf 补空腕转槽）、工具轴、甜点距离（yaml kinematics.tool_x 反推）全部来自 config/cars/<car>.yaml。
 # 一致性由 test_src/test_arm_kinematics_cars.py 拿臂端导出的黄金向量（assets/<car>/test_vectors.json）守着。
 #
 # ⚠ 拿错车算 TCP **不会报错**，只会整场偏几厘米：当前资产用 v0.3 链交叉计算 v0.4
@@ -154,7 +162,8 @@ BASE_ROT = np.array(
 
 
 class CarModel(NamedTuple):
-    """一台车的整条 FK 链。tcp_distance = 拍甜点沿 link6 工具轴的标定距离。"""
+    """一台车的整条 FK 链。tcp_distance = 拍甜点沿 link6 工具轴的标定距离。
+    slot_joint_names[i] = 给控制器槽 i 供数的 ROS 关节名；None = 空槽（五轴臂的腕转槽 4，恒 0）。"""
 
     car: str
     source_model: str
@@ -164,62 +173,119 @@ class CarModel(NamedTuple):
     tool_axis_in_link6: np.ndarray  # 拍柄方向
     face_normal_in_link6: np.ndarray
     tcp_distance: float
+    slot_joint_names: tuple
 
-# ── v0.4：标准运动学（唯一真值 = tennis-man/arm_controller 的 compact_arm_kinematics + config/cars/v04.yaml）
+# ── v0.4 / v0.5：标准运动学（唯一真值 = tennis-man/arm_controller 的 compact_arm_kinematics + config/cars/<car>.yaml）
 ARM_CONTROLLER_ROOT = Path(os.environ.get("TENNIS_MAN_ARM_CONTROLLER", "D:/tennis-man/arm_controller"))
-_STANDARD_V04 = None
+_STANDARD: dict = {}
+
+# 电机 → 控制器槽，与臂端 C++ car_config（kSixMotorSlots / kFiveMotorSlots）、web_panel._MOTOR_SLOTS 同一规则：
+# 6 个电机 = 槽 0..5；5 个电机 = 五轴臂（没有腕转），占槽 0,1,2,3,5，槽 4 空、恒 0。
+_MOTOR_SLOTS = {6: (0, 1, 2, 3, 4, 5), 5: (0, 1, 2, 3, 5)}
+# 输出 joint_names 里空槽的名字（报告 Arm tab 拿它当图例；该槽数值恒 0）
+EMPTY_SLOT_LABEL = "腕转(空槽)"
 
 
-def standard_v04_kinematics():
-    """加载标准 checkout 的 compact_arm_kinematics 并切到 v04（缓存）。缺 checkout 直接报错，不回退。"""
-    global _STANDARD_V04
-    if _STANDARD_V04 is None:
+def standard_kinematics(car: str):
+    """加载标准 checkout 的 compact_arm_kinematics 并切到 car（缓存）。缺 checkout 直接报错，不回退。
+
+    use_car() 改的是模块全局量，所以每台车各 exec 一份独立的模块实例，互不覆盖。
+    """
+    module = _STANDARD.get(car)
+    if module is None:
         import importlib.util
 
         path = ARM_CONTROLLER_ROOT / "src" / "arm_controller" / "compact_arm_kinematics.py"
         if not path.is_file():
             raise SystemExit(
                 f"标准运动学不存在：{path}（设 TENNIS_MAN_ARM_CONTROLLER 指向 arm_controller checkout）")
-        spec = importlib.util.spec_from_file_location("standard_compact_arm_kinematics", path)
+        spec = importlib.util.spec_from_file_location(f"standard_compact_arm_kinematics_{car}", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        module.use_car("v04")
-        _STANDARD_V04 = module
-    return _STANDARD_V04
+        module.use_car(car)
+        _STANDARD[car] = module
+    return module
 
 
-def _standard_v04_model() -> "CarModel":
-    cak = standard_v04_kinematics()
+def _slot_joint_names(cak, car: str) -> tuple:
+    """各槽的 ROS 关节名。真值 = 臂车型 yaml 的 motors[].joint_name（控制器发 /joint_states 用的就是它们）。"""
+    import yaml
+
+    path = cak._CAR_YAML_DIR / f"{car}.yaml"
+    names = [str(m["joint_name"]) for m in yaml.safe_load(path.read_text(encoding="utf-8"))["motors"]]
+    slots = _MOTOR_SLOTS.get(len(names))
+    if slots is None:
+        raise SystemExit(f"{path}：{len(names)} 个电机，控制器只支持 5 或 6 个")
+    out: list = [None] * 6
+    for slot, name in zip(slots, names):
+        out[slot] = name
+    if (out[4] is not None) != bool(cak.HAS_WRIST_YAW):
+        raise SystemExit(f"{path}：{len(names)} 个电机与臂 URDF 有无腕转对不上")
+    return tuple(out)
+
+
+def _standard_model(car: str) -> "CarModel":
+    cak = standard_kinematics(car)
     return CarModel(
-        car="v04",
-        source_model=f"{cak.URDF_PATH} + config/cars/v04.yaml",
+        car=car,
+        source_model=f"{cak.URDF_PATH} + config/cars/{car}.yaml",
         root_link=cak.ROOT_LINK,
         base_transform=cak.WORLD_TO_BASE,
         joints=cak.JOINTS,
         tool_axis_in_link6=cak.TOOL_AXIS_IN_LINK6,
         face_normal_in_link6=cak.FACE_NORMAL_IN_LINK6,
         tcp_distance=float(cak.TCP_DISTANCE),
+        slot_joint_names=_slot_joint_names(cak, car),
     )
 
 
-CAR_MODELS = {
-    "v03": CarModel(
-        car="v03",
-        source_model="src/arm_controller/urdf/tennis_arm_j5j6_7_6_world.usd",
-        root_link=_V03_ROOT_LINK,
-        base_transform=BASE_ROT,
-        joints=_V03_JOINTS,
-        tool_axis_in_link6=np.array([0.0, 0.0, 1.0]),
-        face_normal_in_link6=np.array([1.0, 0.0, 0.0]),
-        tcp_distance=0.62,
-    ),
-    "v04": _standard_v04_model(),
-}
+_V03_MODEL = CarModel(
+    car="v03",
+    source_model="src/arm_controller/urdf/tennis_arm_j5j6_7_6_world.usd",
+    root_link=_V03_ROOT_LINK,
+    base_transform=BASE_ROT,
+    joints=_V03_JOINTS,
+    tool_axis_in_link6=np.array([0.0, 0.0, 1.0]),
+    face_normal_in_link6=np.array([1.0, 0.0, 0.0]),
+    tcp_distance=0.62,
+    slot_joint_names=SHORT_JOINT_NAMES,
+)
+
+
+class _CarModels(Mapping):
+    """车型 → CarModel。v04/v05 第一次用到才加载标准运动学：臂 checkout 缺哪台车的配置，只坏那台车的场次。"""
+
+    def __init__(self, builders: dict):
+        self._builders = builders
+        self._built: dict = {}
+
+    def __getitem__(self, car: str) -> CarModel:
+        if car not in self._built:
+            self._built[car] = self._builders[car]()
+        return self._built[car]
+
+    def __contains__(self, car) -> bool:  # 只查登记，不触发加载
+        return car in self._builders
+
+    def __iter__(self):
+        return iter(self._builders)
+
+    def __len__(self) -> int:
+        return len(self._builders)
+
+
+# 走标准 arm_controller checkout 的车型（臂端有 config/cars/<car>.yaml）；v0.3 只有本文件的冻结抄本。
+STANDARD_CARS = ("v04", "v05")
+CAR_MODELS = _CarModels({
+    "v03": lambda: _V03_MODEL,
+    **{car: partial(_standard_model, car) for car in STANDARD_CARS},
+})
 
 # tracker JSON 的 config.car_config_path 文件名 → 车型（src/run_tracker.py CAR_LAYOUT_CONFIGS 的逆）。
 CAR_BY_LAYOUT_CONFIG = {
     "arm_poe_racket_center.json": "v03",
     "vehicle_v04.json": "v04",
+    "vehicle_v05.json": "v05",
 }
 
 _ACTIVE: CarModel | None = None
@@ -245,8 +311,9 @@ def use_car(car: str) -> CarModel:
 def active_car() -> CarModel:
     if _ACTIVE is None:
         raise RuntimeError(
-            "还没选车型：先调 extract_arm_bag.use_car('v03'|'v04')（或 car_for_tracker_json 推断）。"
-            "没有默认值是故意的——两台车的臂不同，选错只会静默偏几厘米，见文件头注释。"
+            f"还没选车型：先调 extract_arm_bag.use_car({'|'.join(map(repr, CAR_MODELS))})"
+            "（或 car_for_tracker_json 推断）。"
+            "没有默认值是故意的——各车的臂不同，选错只会静默偏几厘米，见文件头注释。"
         )
     return _ACTIVE
 
@@ -433,14 +500,32 @@ def _event_text(raw, msg) -> str:
     return str(raw)
 
 
-def _ordered(values: list[float], names: list[str], joint_names: tuple[str, ...]) -> list[float | None]:
-    """按 joint_names 顺序重排（与 session_viewer._ordered 一致）。"""
+def _ordered(values: list[float], names: list[str], slot_names: tuple) -> list[float | None]:
+    """按控制器 6 个槽重排：slot_names[i] 是槽 i 的 ROS 关节名，None = 空槽（恒 0）。
+
+    消息带名字就按名字取；不带名字按电机顺序（空槽不占位）。消息里这个字段整个没有（如 effort 为空）→ 全 None。
+    """
+    if not values:
+        return [None] * len(slot_names)
     by_name = {name: idx for idx, name in enumerate(names)}
     ordered: list[float | None] = []
-    for idx, name in enumerate(joint_names):
-        src = by_name.get(name, idx if not names else None)
+    motor = 0
+    for name in slot_names:
+        if name is None:
+            ordered.append(0.0)
+            continue
+        src = by_name.get(name) if names else motor
+        motor += 1
         ordered.append(float(values[src]) if src is not None and src < len(values) else None)
     return ordered
+
+
+def check_joint_names(topic: str, seen: list[str], slot_names: tuple, car: str) -> None:
+    """包里的关节名必须正好是本车型那一组。v0.4 的包按 v0.5 读，腕转 joint5 会被当成滚转，
+    算出一条看似正常的错 TCP；反过来 v0.5 的包按 v0.4 读则整列缺 joint6。"""
+    expected = sorted(name for name in slot_names if name is not None)
+    if sorted(seen) != expected:
+        raise SystemExit(f"{topic} 的关节名 {seen} 不是车型 {car} 的 {expected}——车型选错了？")
 
 
 def _round_list(values: list[float | None], digits: int) -> list[float | None]:
@@ -505,7 +590,7 @@ def main() -> int:
     from rclpy.serialization import deserialize_message  # noqa: E402
     from rosidl_runtime_py.utilities import get_message  # noqa: E402
 
-    joint_names = tuple(SHORT_JOINT_NAMES)
+    slot_names = model.slot_joint_names
 
     def tcp_of(positions: list[float | None]) -> list[float] | None:
         if any(v is None for v in positions):
@@ -562,8 +647,9 @@ def main() -> int:
             msg = deserialize_message(data, msg_type)
             names = list(msg.name)
             if not seen_state_names and names:
+                check_joint_names(topic, names, slot_names, car)
                 seen_state_names = names
-            positions = _ordered(list(msg.position), names, joint_names)
+            positions = _ordered(list(msg.position), names, slot_names)
             stamp = _header_stamp_sec(msg)
             if stamp > 0.0:
                 state_diffs.append((recv, stamp - recv))
@@ -572,8 +658,8 @@ def main() -> int:
                     "stamp": stamp,
                     "recv": recv,
                     "position": _round_list(positions, 5),
-                    "velocity": _round_list(_ordered(list(msg.velocity), names, joint_names), 5),
-                    "effort": _round_list(_ordered(list(msg.effort), names, joint_names), 5),
+                    "velocity": _round_list(_ordered(list(msg.velocity), names, slot_names), 5),
+                    "effort": _round_list(_ordered(list(msg.effort), names, slot_names), 5),
                     "tcp": tcp_of(positions),
                 }
             )
@@ -584,8 +670,9 @@ def main() -> int:
             point = msg.points[0]
             names = list(msg.joint_names)
             if not seen_command_names and names:
+                check_joint_names(topic, names, slot_names, car)
                 seen_command_names = names
-            positions = _ordered(list(point.positions), names, joint_names)
+            positions = _ordered(list(point.positions), names, slot_names)
             stamp = _header_stamp_sec(msg)
             if stamp > 0.0 and topic == "/tennis/motor_command":
                 command_diffs.append((recv, stamp - recv))
@@ -594,8 +681,8 @@ def main() -> int:
                     "stamp": stamp,
                     "recv": recv,
                     "position": _round_list(positions, 5),
-                    "velocity": _round_list(_ordered(list(point.velocities), names, joint_names), 5),
-                    "effort": _round_list(_ordered(list(point.effort), names, joint_names), 5),
+                    "velocity": _round_list(_ordered(list(point.velocities), names, slot_names), 5),
+                    "effort": _round_list(_ordered(list(point.effort), names, slot_names), 5),
                     "tcp": tcp_of(positions),
                 }
             )
@@ -784,7 +871,7 @@ def main() -> int:
         "fk_source": f"extract_arm_bag.fk({car})",
         "start_ns": start_ns,
         "duration_sec": round((end_ns - start_ns) / 1e9, 4),
-        "joint_names": list(joint_names),
+        "joint_names": [EMPTY_SLOT_LABEL if name is None else name for name in slot_names],
         "state_joint_names_raw": seen_state_names,
         "command_joint_names_raw": seen_command_names,
         "topics": [
