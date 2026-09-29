@@ -130,19 +130,25 @@ def _merge_racket_impact_json(
 
 
 # ---- /joint_states 关节时刻对齐（两相 CAN 调度） -------------------------------------------
-# arm_controller_cpp 的 /joint_states 一条消息里六轴不是同刻采的：header.stamp 是快照里**最新一帧**
-# 反馈的 CAN 到达时刻，而每个 tick(5ms) 只按两相调度发命令（control/tx_schedule.hpp two_phase_j1_j5）：
-#   A 相 J1,J2,J3,J5,J4（5 帧）  B 相 J1,J5,J6（3 帧），帧间 tx_gap≈0.5ms，每帧命令触发一条反馈。
-# 所以 J1 每相第一个采，比戳老 4g(A)/2g(B)≈2.2/1.2ms；J2/J3/J4 只在 A 相刷新，B 相快照里是 5ms 前
-# 的旧值（J6 反之）。报告端按戳线性插值 FK 会让 J1 平均滞后 ~2ms、J2-J4 ~4ms（0905 实测，
+# arm_controller_cpp 的 /joint_states 一条消息里各轴不是同刻采的：header.stamp 是快照里**最新一帧**
+# 反馈的 CAN 到达时刻，而每个 tick(5ms) 只按两相调度发命令（control/tx_schedule.hpp；用哪个调度
+# 写在车型 yaml 的 control.tx_schedule），帧间 tx_gap≈0.5ms，每帧命令触发一条反馈：
+#   v0.4 two_phase_j1_j5：A 相 J1,J2,J3,J5,J4（5 帧）  B 相 J1,J5,J6（3 帧）
+#   v0.5 two_phase_j1   ：A 相 J1,J2,J3,J4（4 帧）     B 相 J1,滚转（2 帧；五轴臂没有槽 4，滚转在槽 5）
+# 所以 J1 每相第一个采，v0.4 比戳老 4g(A)/2g(B)≈2.2/1.2ms（v0.5 是 3g/1g）；J2/J3/J4 只在 A 相刷新，
+# B 相快照里是 5ms 前的旧值（槽 5 反之）。报告端按戳线性插值 FK 会让 J1 平均滞后 ~2ms、J2-J4 ~4ms（0905 实测，
 # memory/v04-fk-vs-vision-time-shift-0905.md）。这里在页面侧把每轴样本放回真实采样时刻，再把六轴
 # 都插值到该行的戳时刻，之后的 TCP/拍面角/拍速全部基于同刻六轴。只动 states，commands 原样
 # （其 stamp=tx_done，各轴生效时刻同样早 (n−k)·g，但那是零阶保持语义，不在本函数范围）。
-# 相位判定：优先看与上一行相比哪些轴变了（A：J2/J3/J4 变而 J6 不变；B：J6 变而 J2-J4 不变），
-# 静止段没变化时用戳间隔（A→B≈5−2g≈4ms，B→A≈5+2g≈6ms）；g 由这两个间隔的中位数反解，
+# 相位判定：优先看与上一行相比哪些轴变了（A：只在 A 相发的轴变、只在 B 相发的轴不变；B 反之），
+# 静止段没变化时用戳间隔（两车 A、B 相都差 2 帧：A→B≈5−2g≈4ms，B→A≈5+2g≈6ms）；g 由这两个间隔的中位数反解，
 # 不从 yaml 抄——实测 0828~0905 四场都是 0.52ms。识别不出两相结构（老 v0.3 单相节点、
-# 合成数据、行数太少）就原样返回 None，页面与从前完全一致。
-_TX_PHASE_ORDER = {"A": (0, 1, 2, 4, 3), "B": (0, 4, 5)}
+# 合成数据、行数太少）或本车不是两相调度，就原样返回 None，页面与从前完全一致。
+# 相表逐项抄臂端 tx_phase（偶数拍 A、奇数拍 B）；车上没有的槽发之前剔掉，与 tx_phase(present_mask) 同。
+_TX_SCHEDULE_PHASES = {
+    "two_phase_j1_j5": {"A": (0, 1, 2, 4, 3), "B": (0, 4, 5)},
+    "two_phase_j1": {"A": (0, 1, 2, 3), "B": (0, 4, 5)},
+}
 _REPLY_FRAME_MS = 0.15          # 反馈帧总线时长(~0.12) + 电机取样→发帧处理：样本时刻 = 到达戳 − 它
 _ALIGN_MAX_BRACKET_MS = 25.0    # 单轴相邻样本超过它视为反馈断档，不插值、保留原值
 _TX_GAP_RANGE_MS = (0.30, 0.80)  # 反解出的 g 不在此范围 ⇒ 不是我们认识的两相调度
@@ -213,8 +219,41 @@ def _head_effective_q(model: dict, q, qd, tau) -> list[float]:
     return qe
 
 
-def _time_align_joint_states(arm) -> dict | None:
-    """就地把 arm.states 的 position/velocity/effort 对齐到各行戳时刻；返回溯源字典或 None（未对齐）。"""
+def _tx_phase_order(car: str | None) -> tuple[str, dict, dict] | None:
+    """本车的两相调度 → (调度名, {相: 槽序（已剔除车上没有的槽）}, {槽: 关节标签 Jn})。
+
+    调度名读臂车型 yaml 的 control.tx_schedule（与 FK 同一份 arm_controller checkout）；
+    标签按本车 ROS 关节名（v0.5 的滚转是 joint5 → J5，虽然它在槽 5）。
+    v0.3（单相节点、臂端已无 yaml）和单相 full 调度返回 None——不对齐。
+    """
+    import extract_arm_bag as _eab
+
+    if car not in _eab.STANDARD_CARS:
+        return None
+    schedule = _eab.standard_kinematics(car).read_car_section(car, "control").get("tx_schedule")
+    table = _TX_SCHEDULE_PHASES.get(schedule)
+    if table is None:
+        return None
+    names = _eab.CAR_MODELS[car].slot_joint_names
+    present = {j for j, name in enumerate(names) if name is not None}
+    phases = {p: tuple(j for j in order if j in present) for p, order in table.items()}
+    labels = {j: "J" + names[j].removeprefix("joint") for j in present}
+    return schedule, phases, labels
+
+
+def _time_align_joint_states(arm, car: str | None) -> dict | None:
+    """就地把 arm.states 的 position/velocity/effort 对齐到各行戳时刻；返回溯源字典或 None（未对齐）。
+    car 决定两相调度的相表（见 _tx_phase_order）；本车不是两相调度就不动。"""
+    sched = _tx_phase_order(car)
+    if sched is None:
+        return None
+    schedule, phase_order, labels = sched
+    a_only = set(phase_order["A"]) - set(phase_order["B"])    # 只在 A 相发的轴（两车都是 J2-J4）
+    b_only = set(phase_order["B"]) - set(phase_order["A"])    # 只在 B 相发的轴（槽 5）
+    frames_diff = len(phase_order["A"]) - len(phase_order["B"])   # A→B 间隔 = 5 − 它·g，B→A = 5 + 它·g
+    if not a_only or not b_only or frames_diff <= 0:
+        return None
+    slots = sorted(set(phase_order["A"]) | set(phase_order["B"]))   # 车上有的槽；空槽（v0.5 槽 4）恒 0、不动
     states = arm.get("states") if isinstance(arm, dict) else None
     if not isinstance(states, list):
         return None
@@ -232,8 +271,9 @@ def _time_align_joint_states(arm) -> dict | None:
     by_change = 0
     for k in range(1, n):
         chg = [pos[k][j] != pos[k - 1][j] for j in range(6)]
-        mid = chg[1] or chg[2] or chg[3]
-        a_sig, b_sig = mid and not chg[5], chg[5] and not mid
+        a_chg = any(chg[j] for j in a_only)
+        b_chg = any(chg[j] for j in b_only)
+        a_sig, b_sig = a_chg and not b_chg, b_chg and not a_chg
         if a_sig != b_sig:
             phase[k] = "A" if a_sig else "B"
             by_change += 1
@@ -243,7 +283,7 @@ def _time_align_joint_states(arm) -> dict | None:
     if len(short) < 100 or len(long_) < 100 or (len(short) + len(long_)) < 0.5 * len(dts):
         return None
     ab, ba = short[len(short) // 2], long_[len(long_) // 2]
-    g = (ba - ab) / 4.0
+    g = (ba - ab) / (2.0 * frames_diff)
     if not (_TX_GAP_RANGE_MS[0] <= g <= _TX_GAP_RANGE_MS[1]):
         return None
     disagree = by_interval = 0
@@ -263,7 +303,7 @@ def _time_align_joint_states(arm) -> dict | None:
         p = phase[k]
         if p is None:
             continue
-        order = _TX_PHASE_ORDER[p]
+        order = phase_order[p]
         m = len(order)
         for pos_in_phase, j in enumerate(order):
             ts = t[k] - ((m - 1 - pos_in_phase) * g + _REPLY_FRAME_MS) * 1e-3
@@ -287,7 +327,7 @@ def _time_align_joint_states(arm) -> dict | None:
     for k in range(n):
         tk = t[k]
         row = states[idx[k]]
-        for j in range(6):
+        for j in slots:
             sj = series[j]
             q = ptr[j]
             while q + 1 < len(sj) and sj[q + 1][0] <= tk:
@@ -297,7 +337,7 @@ def _time_align_joint_states(arm) -> dict | None:
             if raw[field][k] is None:
                 continue
             out = list(raw[field][k])
-            for j in range(6):
+            for j in slots:
                 sj = series[j]
                 q = ptr[j]
                 v = None
@@ -313,11 +353,11 @@ def _time_align_joint_states(arm) -> dict | None:
                     out[j] = round(v, 5)
                     aligned[fi] += 1
             row[field] = out
-    lag_ms = {p: {f"J{j + 1}": round((len(order) - 1 - i) * g + _REPLY_FRAME_MS, 2)
+    lag_ms = {p: {labels[j]: round((len(order) - 1 - i) * g + _REPLY_FRAME_MS, 2)
                   for i, j in enumerate(order)}
-              for p, order in _TX_PHASE_ORDER.items()}
+              for p, order in phase_order.items()}
     return {
-        "schedule": "two_phase_j1_j5",
+        "schedule": schedule,
         "tx_gap_ms": round(g, 3),
         "reply_frame_ms": _REPLY_FRAME_MS,
         "interval_ab_ms": round(ab, 3),
@@ -386,7 +426,7 @@ def _add_face_angles(arm, *, tracker_json_path: str | None = None, car: str | No
     except Exception as exc:
         print(
             f"[report] 臂 FK 车型未知（{exc}）：TCP / 拍面角 / 拍速 全列留空。"
-            "重跑 test_src/extract_arm_bag.py --car v03|v04 出 _arm.json 即可。",
+            f"重跑 test_src/extract_arm_bag.py --car {'|'.join(_eab.CAR_MODELS)} 出 _arm.json 即可。",
             file=sys.stderr,
         )
         return
@@ -405,12 +445,12 @@ def _add_face_angles(arm, *, tracker_json_path: str | None = None, car: str | No
               f"本场是 {car}（{car_source}）——就地按 {car} 复算 TCP"
               f"（commands {n_cmd} 行，states 随下面的逐帧 FK 一起）。")
     # 关节时刻对齐（两相 CAN 调度）：对齐后六轴同刻，TCP 必须按对齐后的关节整表复算。
-    align = _time_align_joint_states(arm)
+    align = _time_align_joint_states(arm, car)
     if align:
         arm["joint_time_alignment"] = align
         arm["fk_source"] += "（关节时刻已按两相 CAN 调度对齐到戳，见 joint_time_alignment）"
         lag = align["sample_lag_before_stamp_ms"]
-        print(f"[report] /joint_states 关节时刻对齐：g={align['tx_gap_ms']}ms，"
+        print(f"[report] /joint_states 关节时刻对齐（{align['schedule']}）：g={align['tx_gap_ms']}ms，"
               f"J1 比戳老 {lag['A']['J1']}/{lag['B']['J1']}ms(A/B)，J2-J4 在 B 相另老一拍；"
               f"states {align['rows']} 行（A {align['phase_rows']['A']} / B {align['phase_rows']['B']} / "
               f"未判 {align['phase_rows']['unknown']}），position 对齐 "
