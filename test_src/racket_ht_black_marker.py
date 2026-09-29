@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Measure the V04 fixed black racket-centre marker around report final HTs."""
+"""Measure the V04/V05 fixed black racket-centre marker around report final HTs."""
 
 from __future__ import annotations
 
@@ -39,6 +39,55 @@ TRAJ_NEIGHBOR_MAX_SIDE_S = 0.095
 TRAJ_EXTRAP_MAX_S = 0.062
 ARM_STATE_MAX_GAP_S = 0.1
 CAR_LOC_MAX_GAP_S = 0.5
+# 校正锚点（见 CarMarkerPolicy）：本场「黑标 − 同曝光 FK」车体系偏差 = 第一遍解的稳健中位数
+# （离初值 40 mm 内的算内点，≥8 个内点且过半才用）；重解按相机视线深度 / 横向分开设门——
+# 深度方向三角化噪声大（v05 真检出 y 散 ±57 mm），横向真检出 ≤25 mm、假点 47–82 mm。
+REANCHOR_MIN_INLIERS = 8
+REANCHOR_INLIER_MM = 40.0
+REANCHOR_MAX_LATERAL_MM = 35.0
+REANCHOR_MAX_DEPTH_MM = 80.0
+
+
+@dataclass(frozen=True)
+class CarMarkerPolicy:
+    """黑标解算里两车不同的两件事（v05 由 tracker_20260929_221737 逐帧目视 50 帧定）。
+
+    v05 四相机都在底线后、离拍 7–8.5 m、两两视线夹角 16–55°：黑方块在录像里只有 ~5 px，1 px
+    质心误差在留一三角化里就是 ~10 mm 深度，10 mm 的 LOO 门系统性刷掉真黑方块、反而放行
+    拍框/背景小暗点（50 个检出里 14 个假点）。且真黑标一贯比 FK 拍心低 ~50 mm（车体系中位
+    (+6, +9, −50) mm、z 离散 6 mm），按「离 FK 最近」排名会选中锚点附近的假点。
+    loo_max_mm=None：不设 LOO 毫米门，一致性由重投影 2.5 px + 留一回投 6 px 把关；
+    reanchor：第一遍解完后以「FK + 本场偏差」为锚、按视线深度/横向分开设门重解。
+    """
+
+    loo_max_mm: float | None
+    reanchor: bool
+
+
+CAR_MARKER_POLICY = {
+    "v04": CarMarkerPolicy(loo_max_mm=MARKER_MAX_LOO_MM, reanchor=False),
+    "v05": CarMarkerPolicy(loo_max_mm=None, reanchor=True),
+}
+
+
+@dataclass(frozen=True)
+class AnchorGate:
+    """校正锚点的各向异性门：沿相机平均视线的深度分量与垂直于视线的横向分量分开限。"""
+
+    view_dir: np.ndarray
+    max_lateral_mm: float
+    max_depth_mm: float
+
+    def split(self, offset_mm: np.ndarray) -> tuple[float, float]:
+        depth = float(offset_mm @ self.view_dir)
+        lateral = float(np.linalg.norm(offset_mm - depth * self.view_dir))
+        return lateral, abs(depth)
+
+    def rank(self, offset_mm: np.ndarray) -> float | None:
+        lateral, depth = self.split(offset_mm)
+        if lateral > self.max_lateral_mm or depth > self.max_depth_mm:
+            return None
+        return math.hypot(lateral / self.max_lateral_mm, depth / self.max_depth_mm)
 
 
 class NothingToMeasure(Exception):
@@ -352,7 +401,11 @@ def _solve_marker(
     expected_xyz_mm: np.ndarray,
     serials: list[str],
     max_expected_mm: float,
+    *,
+    loo_max_mm: float | None = MARKER_MAX_LOO_MM,
+    gate: AnchorGate | None = None,
 ) -> MarkerFit | None:
+    """gate 给定时，锚距门与排名改用它的深度/横向分量（max_expected_mm 只剩种子预筛）。"""
     if any(not candidates.get(serial) for serial in serials):
         return None
     proposed: dict[tuple[int, ...], float] = {}
@@ -401,8 +454,15 @@ def _solve_marker(
         if fit.max_px > MARKER_MAX_REPROJ_PX:
             continue
         expected_distance = float(np.linalg.norm(fit.xyz_mm - expected_xyz_mm))
-        if expected_distance > max_expected_mm:
-            continue
+        if gate is None:
+            if expected_distance > max_expected_mm:
+                continue
+            anchor_rank = expected_distance
+        else:
+            gated = gate.rank(fit.xyz_mm - expected_xyz_mm)
+            if gated is None:
+                continue
+            anchor_rank = gated
         loo_delta: dict[str, float] = {}
         heldout: dict[str, float] = {}
         try:
@@ -419,7 +479,7 @@ def _solve_marker(
                 )
         except (ValueError, np.linalg.LinAlgError):
             continue
-        if max(loo_delta.values()) >= MARKER_MAX_LOO_MM:
+        if loo_max_mm is not None and max(loo_delta.values()) >= loo_max_mm:
             continue
         if max(heldout.values()) > MARKER_MAX_HELDOUT_PX:
             continue
@@ -434,7 +494,7 @@ def _solve_marker(
             loo_heldout_px=heldout,
             expected_distance_mm=expected_distance,
         )
-        rank = (expected_distance, max(loo_delta.values()), fit.rms_px, -score_sum)
+        rank = (anchor_rank, max(loo_delta.values()), fit.rms_px, -score_sum)
         if best is None or rank < best[0]:
             best = (rank, marker)
     return None if best is None else best[1]
@@ -523,6 +583,70 @@ def _expected_world_mm(
     )
 
 
+def _car_to_world(yaw: float, vector_mm: np.ndarray) -> np.ndarray:
+    """车体系（x 右, y 前, z 上）向量转世界轴，与 _expected_world_mm 同一旋转。"""
+    cosine, sine = math.cos(yaw), math.sin(yaw)
+    return np.asarray(
+        [
+            cosine * vector_mm[0] - sine * vector_mm[1],
+            sine * vector_mm[0] + cosine * vector_mm[1],
+            vector_mm[2],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _world_to_car(yaw: float, vector_mm: np.ndarray) -> np.ndarray:
+    cosine, sine = math.cos(yaw), math.sin(yaw)
+    return np.asarray(
+        [
+            cosine * vector_mm[0] + sine * vector_mm[1],
+            -sine * vector_mm[0] + cosine * vector_mm[1],
+            vector_mm[2],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _session_marker_offset(
+    samples_car_mm: list[np.ndarray],
+) -> tuple[np.ndarray, int] | None:
+    """「黑标 − 同曝光 FK」车体系偏差的稳健中位数（mm）与内点数。
+
+    以全体中位为初值，只留离它 REANCHOR_INLIER_MM 内的内点再取中位，迭代到内点集不变。
+    内点不足 REANCHOR_MIN_INLIERS 或不过半 → None（第一遍解本身不可信，不校正）。
+    """
+    if len(samples_car_mm) < REANCHOR_MIN_INLIERS:
+        return None
+    samples = np.asarray(samples_car_mm, dtype=np.float64)
+    center = np.median(samples, axis=0)
+    inliers: np.ndarray | None = None
+    for _ in range(10):
+        mask = np.linalg.norm(samples - center, axis=1) <= REANCHOR_INLIER_MM
+        count = int(mask.sum())
+        if count < REANCHOR_MIN_INLIERS or 2 * count <= len(samples):
+            return None
+        if inliers is not None and np.array_equal(mask, inliers):
+            break
+        inliers = mask
+        center = np.median(samples[mask], axis=0)
+    return center, int(inliers.sum())
+
+
+def _mean_view_dir(
+    cameras: dict[str, CameraModel], serials: list[str], point_mm: np.ndarray
+) -> np.ndarray:
+    """各相机中心指向该点的单位视线取平均再归一：三角化深度误差主要沿它。"""
+    directions = []
+    for serial in serials:
+        camera = cameras[serial]
+        center = (-camera.R.T @ camera.t).reshape(3)
+        ray = np.asarray(point_mm, dtype=np.float64) - center
+        directions.append(ray / np.linalg.norm(ray))
+    mean = np.mean(directions, axis=0)
+    return mean / np.linalg.norm(mean)
+
+
 def _traj_predict(
     fits: list[tuple[float, np.ndarray]], t: float
 ) -> np.ndarray | None:
@@ -568,32 +692,53 @@ def _attempt_solve(
     serials: list[str],
     fk_expected: np.ndarray | None,
     traj_expected: np.ndarray | None,
+    *,
+    loo_max_mm: float | None = MARKER_MAX_LOO_MM,
+    fk_gate: AnchorGate | None = None,
 ) -> tuple[MarkerFit, int, str, str | None] | None:
-    """Acceptance ladder: 4-cam/FK, 4-cam/traj, then 3-cam per anchor."""
+    """Acceptance ladder: 4-cam/FK, 4-cam/traj, then 3-cam per anchor.
+
+    fk_gate（v05 校正锚点）给定时，FK 的四相机与三相机两级都用它代替 110/80 mm 球形门。
+    """
+    if fk_gate is None:
+        fk_limits = (MARKER_MAX_EXPECTED_DISTANCE_MM, MARKER_MAX_EXPECTED_RECOVERY_MM)
+    else:
+        fk_limits = (math.hypot(fk_gate.max_lateral_mm, fk_gate.max_depth_mm),) * 2
     if fk_expected is not None:
         fit = _solve_marker(
-            candidates, cameras, fk_expected, serials, MARKER_MAX_EXPECTED_DISTANCE_MM
+            candidates, cameras, fk_expected, serials, fk_limits[0],
+            loo_max_mm=loo_max_mm, gate=fk_gate,
         )
         if fit is not None:
             return fit, 4, "fk", None
     if traj_expected is not None:
         fit = _solve_marker(
-            candidates, cameras, traj_expected, serials, MARKER_MAX_EXPECTED_RECOVERY_MM
+            candidates, cameras, traj_expected, serials, MARKER_MAX_EXPECTED_RECOVERY_MM,
+            loo_max_mm=loo_max_mm,
         )
         if fit is not None:
             return fit, 4, "traj", None
-    for anchor_name, expected in (("fk", fk_expected), ("traj", traj_expected)):
+    for anchor_name, expected, limit, gate in (
+        ("fk", fk_expected, fk_limits[1], fk_gate),
+        ("traj", traj_expected, MARKER_MAX_EXPECTED_RECOVERY_MM, None),
+    ):
         if expected is None:
             continue
         best: tuple[tuple[float, float], str, MarkerFit] | None = None
         for dropped in serials:
             subset = [serial for serial in serials if serial != dropped]
             fit = _solve_marker(
-                candidates, cameras, expected, subset, MARKER_MAX_EXPECTED_RECOVERY_MM
+                candidates, cameras, expected, subset, limit,
+                loo_max_mm=loo_max_mm, gate=gate,
             )
             if fit is None:
                 continue
-            rank = (fit.expected_distance_mm, fit.point.rms_px)
+            anchor_rank = (
+                fit.expected_distance_mm
+                if gate is None
+                else gate.rank(fit.point.xyz_mm - expected)
+            )
+            rank = (anchor_rank, fit.point.rms_px)
             if best is None or rank < best[0]:
                 best = (rank, dropped, fit)
         if best is not None:
@@ -652,10 +797,13 @@ def _measurement_context(
     rk = _load_json(rk_path)
     tables = _load_json(tables_path)
     config = tracker.get("config") or {}
-    if str(arm.get("car", "")).lower() != "v04" or "v04" not in Path(
+    # 锚点 = 车位姿 + R(yaw)·TCP（z 减 zOff）。两车的 TCP 都标在拍面黑标上（v04 0905 tool_x 改到黑标；
+    # v05 0928 标定黑标比 TCP 只差 −0.7 mm），车定位原点都是 z=0 地面点（v05 即 J1 轴）。
+    car = str(arm.get("car", "")).lower()
+    if car not in ("v04", "v05") or car not in Path(
         str(config.get("car_config_path", ""))
     ).stem.lower():
-        raise ValueError("fixed black-marker HT measurement is supported only for V04")
+        raise ValueError("fixed black-marker HT measurement is supported only for V04/V05")
     video_output = config.get("video_output") or {}
     if (
         video_output.get("layout") != "grid"
@@ -775,6 +923,8 @@ def measure(
         z_offset,
         targets,
     ) = _measurement_context(tracker_path, arm_path, rk_path, tables_path)
+    car = str(arm["car"]).lower()
+    policy = CAR_MARKER_POLICY[car]
     config = tracker["config"]
     calibration_path = _session_path(config["calib_config_path"], tracker_path)
     cameras = _load_cameras(calibration_path, serials)
@@ -853,6 +1003,10 @@ def measure(
                         target["rk_to_pc_bias_s"],
                         z_offset,
                     ),
+                    "car_yaw": _interpolate_yaw(
+                        car_yaw_rows, center_elapsed, CAR_LOC_MAX_GAP_S
+                    ),
+                    "fk_anchor": None,
                     "candidates": None,
                     "accepted": None,
                 }
@@ -905,6 +1059,14 @@ def measure(
         dt_ms = 1000.0 * (
             job["center_elapsed"] - job["target"]["final_ht_pc_elapsed_s"]
         )
+        # 报告把 expected_distance_mm 读作「距同曝光 FK」：校正锚点解也按原始 FK 算，
+        # 离校正锚点的距离另记 anchor_distance_mm。
+        corrected = anchor_name == "fk" and job["fk_anchor"] is not None
+        expected_distance = (
+            float(np.linalg.norm(fit.point.xyz_mm - job["fk_expected"]))
+            if corrected
+            else fit.expected_distance_mm
+        )
         observation = {
             "x": float(fit.point.xyz_mm[0] / 1000.0),
             "y": float(fit.point.xyz_mm[1] / 1000.0),
@@ -923,9 +1085,11 @@ def measure(
             "reproj_max_px": fit.point.max_px,
             "loo_max_mm": max(fit.loo_delta_mm.values()),
             "heldout_max_px": max(fit.loo_heldout_px.values()),
-            "expected_distance_mm": fit.expected_distance_mm,
+            "expected_distance_mm": expected_distance,
             "black_marker": True,
         }
+        if corrected:
+            observation["anchor_distance_mm"] = fit.expected_distance_mm
         if dropped is not None:
             observation["dropped_serial"] = dropped
         job["accepted"] = observation
@@ -959,10 +1123,70 @@ def measure(
         read_frames(capture, anchored)
         for job in anchored:
             solved = _attempt_solve(
-                job["candidates"], cameras, serials, job["fk_expected"], None
+                job["candidates"], cameras, serials, job["fk_expected"], None,
+                loo_max_mm=policy.loo_max_mm,
             )
             if solved is not None:
                 accept(job, solved)
+
+        # Pass 1b（policy.reanchor）：第一遍解估本场「黑标 − FK」车体系偏差，以 FK+偏差为锚、
+        # 深度/横向分开设门全部重解（候选沿用第一遍，不重新解码）。估不出偏差 = 第一遍本身
+        # 不可信，整场不出观测，不拿假点凑数。
+        if policy.reanchor:
+            samples = [
+                _world_to_car(
+                    job["car_yaw"],
+                    1000.0
+                    * np.asarray(
+                        [job["accepted"][key] for key in ("x", "y", "z")],
+                        dtype=np.float64,
+                    )
+                    - job["fk_expected"],
+                )
+                for job in anchored
+                if job["accepted"] is not None and job["car_yaw"] is not None
+            ]
+            estimate = _session_marker_offset(samples)
+            reanchor_summary = {"pass1_fits": len(samples)}
+            for job in anchored:
+                job["accepted"] = None
+            if estimate is None:
+                print(
+                    f"[racket] re-anchor unavailable ({len(samples)} pass-1 fits): "
+                    "no black-marker observations for this session",
+                    flush=True,
+                )
+            else:
+                offset, inliers = estimate
+                reanchor_summary.update(
+                    offset_car_mm=[round(float(value), 1) for value in offset],
+                    inliers=inliers,
+                )
+                print(
+                    f"[racket] re-anchor: marker - FK = car ({offset[0]:+.1f}, "
+                    f"{offset[1]:+.1f}, {offset[2]:+.1f}) mm from {inliers}/"
+                    f"{len(samples)} pass-1 fits",
+                    flush=True,
+                )
+                for job in anchored:
+                    if job["car_yaw"] is None:
+                        continue
+                    job["fk_anchor"] = job["fk_expected"] + _car_to_world(
+                        job["car_yaw"], offset
+                    )
+                    gate = AnchorGate(
+                        _mean_view_dir(cameras, serials, job["fk_anchor"]),
+                        REANCHOR_MAX_LATERAL_MM,
+                        REANCHOR_MAX_DEPTH_MM,
+                    )
+                    solved = _attempt_solve(
+                        job["candidates"], cameras, serials, job["fk_anchor"], None,
+                        loo_max_mm=policy.loo_max_mm, fk_gate=gate,
+                    )
+                    if solved is not None:
+                        accept(job, solved)
+        else:
+            reanchor_summary = None
 
         # Pass 2: chain neighbour fits as trajectory anchors. Candidate-bearing
         # frames retry without video; anchorless frames (car-loc holes) decode
@@ -987,7 +1211,8 @@ def measure(
                 if job["candidates"] is None:
                     read_frames(capture, [job])
                 solved = _attempt_solve(
-                    job["candidates"], cameras, serials, None, traj
+                    job["candidates"], cameras, serials, None, traj,
+                    loo_max_mm=policy.loo_max_mm,
                 )
                 if solved is not None:
                     accept(job, solved)
@@ -1022,7 +1247,7 @@ def measure(
     n_3cam = sum(1 for row in observations if row.get("n_cam") == 3)
     return {
         "config": {
-            "measurement": "V04 fixed black marker center",
+            "measurement": "fixed black marker center (V04/V05, TCP calibrated onto the marker)",
             "timing": (
                 "four-camera exposure center: exposure_pc + "
                 f"{exposure_center_offset_s * 1000.0:.3f} ms"
@@ -1031,13 +1256,26 @@ def measure(
                 f"video frames from report raw final HT {-PRE_WINDOW_S:g}s to "
                 f"{POST_WINDOW_S:+g}s (per-throw zPhase applied); "
                 f"max reprojection {MARKER_MAX_REPROJ_PX:g} px; "
-                f"leave-one-out < {MARKER_MAX_LOO_MM:g} mm; held-out <= "
-                f"{MARKER_MAX_HELDOUT_PX:g} px; 4-cam FK search distance <= "
-                f"{MARKER_MAX_EXPECTED_DISTANCE_MM:g} mm; 3-cam and "
-                "neighbour-trajectory-anchored recoveries <= "
+                + (
+                    f"leave-one-out < {policy.loo_max_mm:g} mm; "
+                    if policy.loo_max_mm is not None
+                    else "no leave-one-out mm gate; "
+                )
+                + f"held-out <= {MARKER_MAX_HELDOUT_PX:g} px; "
+                + (
+                    "FK anchor corrected by the session marker-FK car-frame offset, "
+                    f"gated lateral <= {REANCHOR_MAX_LATERAL_MM:g} mm / view depth <= "
+                    f"{REANCHOR_MAX_DEPTH_MM:g} mm; "
+                    if policy.reanchor
+                    else f"4-cam FK search distance <= {MARKER_MAX_EXPECTED_DISTANCE_MM:g} "
+                    f"mm; 3-cam <= {MARKER_MAX_EXPECTED_RECOVERY_MM:g} mm; "
+                )
+                + "neighbour-trajectory-anchored recoveries <= "
                 f"{MARKER_MAX_EXPECTED_RECOVERY_MM:g} mm (rows carry n_cam/anchor"
                 "/dropped_serial provenance)"
             ),
+            "car": car,
+            "reanchor": reanchor_summary,
             "coordinate": (
                 "multi-camera marker world position; report subtracts visual car "
                 "center on field world axes"

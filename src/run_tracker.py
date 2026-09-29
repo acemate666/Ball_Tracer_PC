@@ -1021,7 +1021,7 @@ def _generate_post_run_artifacts(
             command.extend(["--racket-impact-json", str(racket_impact_json_path)])
         return command
 
-    # ── V04 四相机固定黑标拍心（供报告「视觉拍心−车心」列）──
+    # ── V04/V05 四相机固定黑标拍心（供报告「视觉拍心−车心」列）──
     # final HT 直接取报告页面已执行的 arm contract，避免 Python 另写一套 accepted/late-sweep
     # 匹配逻辑。第一次报告导出 contract，测量扫 HT−450ms~+120ms（覆盖 ht 前整个引拍/挥拍
     # 段，带 3 相机与邻帧轨迹锚补捞），第二次报告合入视觉侧车。
@@ -1038,7 +1038,7 @@ def _generate_post_run_artifacts(
             and car != "v03"
         )
         if not prerequisites:
-            print("[post] Skip fixed black-marker racket: V04 grid video/arm/RK/report missing")
+            print("[post] Skip fixed black-marker racket: grid video/arm/RK/report missing")
         else:
             tables_path = html_path.with_name(f"{html_path.stem}_tables.json")
             tables_path.unlink(missing_ok=True)
@@ -1064,7 +1064,7 @@ def _generate_post_run_artifacts(
             if (
                 tables_path.exists()
                 and _run_postprocess_command(
-                    "Measure V04 fixed black-marker racket",
+                    "Measure fixed black-marker racket",
                     measure_command,
                     env=report_env,
                 )
@@ -2184,7 +2184,7 @@ def main() -> int:
     post_run_annotated_video_no_racket = post_run_cfg.get(
         "annotated_video_no_racket", True
     )
-    # V04 四相机固定黑标拍心：结束后围绕报告 raw final HT 重扫视频，写入北极星表。
+    # V04/V05 四相机固定黑标拍心：结束后围绕报告 raw final HT 重扫视频，写入北极星表。
     post_run_measure_racket = bool(post_run_cfg.get("measure_racket", False))
     post_run_measure_racket_impact = racket_impact_enabled
 

@@ -7,10 +7,17 @@ import numpy as np
 import pytest
 
 from racket_ht_black_marker import (
+    CAR_MARKER_POLICY,
+    REANCHOR_INLIER_MM,
+    REANCHOR_MIN_INLIERS,
+    AnchorGate,
     CameraModel,
     NothingToMeasure,
+    _car_to_world,
     _grid_panels,
     _measurement_context,
+    _session_marker_offset,
+    _world_to_car,
 )
 
 
@@ -218,3 +225,90 @@ def test_grid_panels_reject_a_video_that_is_not_a_roi_of_the_calibrated_frame():
     cameras = {serial: _camera((2048, 1536)) for serial in SERIALS}
     with pytest.raises(ValueError, match="bottom-cropped ROI"):
         _grid_panels(grid, SERIALS, cameras)
+
+
+def _set_car(paths, car: str, layout: str) -> None:
+    tracker, arm = paths[0], paths[1]
+    payload = json.loads(tracker.read_text(encoding="utf-8"))
+    payload["config"]["car_config_path"] = layout
+    tracker.write_text(json.dumps(payload), encoding="utf-8")
+    arm.write_text(json.dumps({"car": car}), encoding="utf-8")
+
+
+def test_measurement_context_accepts_v05(tmp_path: Path):
+    paths = _write_inputs(tmp_path)
+    _set_car(paths, "v05", r"D:\robot\Ball_Tracer_PC\src\config\vehicle_v05.json")
+    _, arm, _, _, _, _, targets = _measurement_context(*paths)
+    assert arm["car"] == "v05"
+    assert [row["report_row"] for row in targets] == [1]
+
+
+@pytest.mark.parametrize(
+    ("car", "layout"),
+    [("v05", "vehicle_v04.json"), ("v04", "vehicle_v05.json"), ("v03", "vehicle_v03.json")],
+)
+def test_measurement_context_rejects_car_layout_mismatch(tmp_path: Path, car, layout):
+    paths = _write_inputs(tmp_path)
+    _set_car(paths, car, layout)
+    with pytest.raises(ValueError, match="V04/V05"):
+        _measurement_context(*paths)
+
+
+def test_car_policy_keeps_v04_gates_and_reanchors_v05():
+    # v04 已验证的解算（10 mm LOO、按原始 FK 排名）不动；v05 换成校正锚点 + 无 LOO 毫米门。
+    assert CAR_MARKER_POLICY["v04"].loo_max_mm == 10.0
+    assert CAR_MARKER_POLICY["v04"].reanchor is False
+    assert CAR_MARKER_POLICY["v05"].loo_max_mm is None
+    assert CAR_MARKER_POLICY["v05"].reanchor is True
+
+
+def test_car_world_rotation_round_trips():
+    offset = np.array([6.0, 9.0, -50.0])
+    for yaw in (-2.5, -0.03, 0.0, 0.4, 3.0):
+        world = _car_to_world(yaw, offset)
+        assert np.linalg.norm(world[:2]) == pytest.approx(np.linalg.norm(offset[:2]))
+        assert _world_to_car(yaw, world) == pytest.approx(offset)
+    # yaw=+90°：车体 x（右）指向世界 +y
+    assert _car_to_world(np.pi / 2, np.array([1.0, 0.0, 0.0])) == pytest.approx([0.0, 1.0, 0.0])
+
+
+def test_session_marker_offset_is_the_inlier_median():
+    rng = np.random.default_rng(7)
+    truth = np.array([6.0, 9.0, -50.0])
+    inliers = [truth + rng.normal(0.0, [5.0, 15.0, 5.0]) for _ in range(20)]
+    # 拍框/背景假点：离真值 60–150 mm（0929 v05 实场 14 个假点的量级）
+    outliers = [truth + np.array(v) for v in (
+        [30, -40, 80], [-35, 5, 95], [-110, 20, 60], [40, -10, 50],
+        [-5, 110, -120], [30, 20, 130], [-60, -40, 10], [45, -50, 65],
+    )]
+    offset, count = _session_marker_offset(inliers + outliers)
+    assert count == 20
+    assert offset == pytest.approx(np.median(np.array(inliers), axis=0))
+    assert np.linalg.norm(offset - truth) < 10.0
+
+
+def test_session_marker_offset_refuses_weak_or_minority_clusters():
+    truth = np.array([6.0, 9.0, -50.0])
+    few = [truth + np.array([k, 0.0, 0.0]) for k in range(REANCHOR_MIN_INLIERS - 1)]
+    assert _session_marker_offset(few) is None
+    # 聚成一团的不过半：宁可整场不出，也不拿假点定锚
+    cluster = [truth + np.array([k, 0.0, 0.0]) for k in range(REANCHOR_MIN_INLIERS)]
+    scattered = [
+        truth + (3.0 * REANCHOR_INLIER_MM) * np.array([np.cos(a), np.sin(a), 0.5])
+        for a in np.linspace(0.0, 2.0 * np.pi, REANCHOR_MIN_INLIERS + 1, endpoint=False)
+    ]
+    assert _session_marker_offset(cluster + scattered) is None
+
+
+def test_anchor_gate_separates_view_depth_from_lateral():
+    gate = AnchorGate(np.array([0.0, 1.0, 0.0]), max_lateral_mm=35.0, max_depth_mm=80.0)
+    assert gate.split(np.array([20.0, -60.0, 10.0])) == pytest.approx(
+        (np.hypot(20.0, 10.0), 60.0)
+    )
+    # 深度方向三角化噪声大：沿视线 70 mm 仍收，横向 40 mm（拍框/背景假点的量级）就拒
+    assert gate.rank(np.array([0.0, 70.0, 0.0])) is not None
+    assert gate.rank(np.array([40.0, 0.0, 0.0])) is None
+    assert gate.rank(np.array([0.0, -90.0, 0.0])) is None
+    near = gate.rank(np.array([5.0, 20.0, 5.0]))
+    far = gate.rank(np.array([25.0, 20.0, 5.0]))
+    assert near is not None and far is not None and near < far
