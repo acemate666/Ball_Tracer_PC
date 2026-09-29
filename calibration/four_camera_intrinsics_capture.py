@@ -110,7 +110,14 @@ def main() -> None:
     session_dir = create_session_dir(data_root, args.content, args.session)
 
     interval = args.duration / args.count
-    overrides = {}
+    # 标定始终采集完整画幅，不继承跟踪配置的 ROI 或逐相机裁剪。
+    overrides = {
+        "roi_height": 0,
+        "slave_params": {},
+        "master_min_bandwidth": False,
+        "fps": 29.0,
+        "acquisition_frame_rate": 30.0,
+    }
     if args.exposure > 0:
         overrides["exposure_us"] = args.exposure
     if args.gain >= 0:
