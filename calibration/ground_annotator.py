@@ -41,13 +41,12 @@ class AnnotatorApp(tk.Tk):
         self.offset_y = 0.0
         self._drag_start = None
 
-        # 缩放图片缓存
-        self._cached_scale = None
+        # 只缓存窗口可见区域，放大时不创建整张巨幅位图。
+        self._cached_view = None
         self._cached_tk_img = None
 
-        # 缩放防抖
-        self._zoom_timer = None
-        self._zoom_anchor = None  # 缩放时鼠标锚点
+        self._redraw_timer = None
+        self._resize_timer = None
 
         # Canvas 上的标注元素 id：[(circle_id, text_id), ...]
         self._marker_ids: list[tuple[int, int]] = []
@@ -105,8 +104,6 @@ class AnnotatorApp(tk.Tk):
         self.canvas.bind("<B3-Motion>", self._on_drag_move)
         self.canvas.bind("<ButtonPress-1>", self._on_click)
         self.canvas.bind("<Configure>", self._on_canvas_resize)
-
-        self._resize_pending = False
 
     # ----------------------------------------------------------------
     # 坐标转换
@@ -169,7 +166,7 @@ class AnnotatorApp(tk.Tk):
         self.annotations.clear()
         self._marker_ids.clear()
         self.annotating = False
-        self._cached_scale = None
+        self._cached_view = None
         self._cached_tk_img = None
         self.btn_annotate.config(text="开始标注", relief=tk.RAISED)
         self.canvas.config(cursor="")
@@ -194,31 +191,43 @@ class AnnotatorApp(tk.Tk):
         self.scale = min(cw / iw, ch / ih, 1.0)
         self.offset_x = (cw - iw * self.scale) / 2
         self.offset_y = (ch - ih * self.scale) / 2
-        self._cached_scale = None
+        self._cached_view = None
         self._full_redraw()
 
     def _render_scaled_image(self):
-        """生成缩放后的 PhotoImage（仅在 scale 变化时调用）"""
-        iw, ih = self.pil_img.size
-        new_w = max(1, int(iw * self.scale))
-        new_h = max(1, int(ih * self.scale))
-        resized = self.pil_img.resize((new_w, new_h), Image.BILINEAR)
-        self._cached_tk_img = ImageTk.PhotoImage(resized)
-        self._cached_scale = self.scale
+        """按视图反变换采样原图，输出始终不超过 Canvas 大小。"""
+        width = max(1, self.canvas.winfo_width())
+        height = max(1, self.canvas.winfo_height())
+        inverse_scale = 1.0 / self.scale
+        visible = self.pil_img.transform(
+            (width, height),
+            Image.Transform.AFFINE,
+            (inverse_scale, 0.0, -self.offset_x * inverse_scale,
+             0.0, inverse_scale, -self.offset_y * inverse_scale),
+            resample=Image.Resampling.BILINEAR,
+            fillcolor="#2b2b2b",
+        )
+        self._cached_tk_img = ImageTk.PhotoImage(visible, master=self.canvas)
+        self._cached_view = (width, height, self.scale, self.offset_x, self.offset_y)
 
     def _full_redraw(self):
-        """完整重绘（缩放变化、窗口 resize 时调用）"""
+        """绘制当前可见图像和与其使用同一坐标变换的标注。"""
+        if self._redraw_timer is not None:
+            self.after_cancel(self._redraw_timer)
+            self._redraw_timer = None
         self.canvas.delete("all")
         self._marker_ids.clear()
 
         if self.pil_img is None:
             return
 
-        if self._cached_scale != self.scale or self._cached_tk_img is None:
+        view = (max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height()),
+                self.scale, self.offset_x, self.offset_y)
+        if self._cached_view != view or self._cached_tk_img is None:
             self._render_scaled_image()
 
         self._img_on_canvas = self.canvas.create_image(
-            self.offset_x, self.offset_y, anchor=tk.NW, image=self._cached_tk_img
+            0, 0, anchor=tk.NW, image=self._cached_tk_img
         )
 
         for i, item in enumerate(self.annotations):
@@ -244,7 +253,7 @@ class AnnotatorApp(tk.Tk):
     # 缩放 & 拖动
     # ----------------------------------------------------------------
     def _on_scroll(self, event):
-        if self.pil_img is None:
+        if self.pil_img is None or event.delta == 0:
             return
 
         # 计算新 scale 和 offset
@@ -257,17 +266,14 @@ class AnnotatorApp(tk.Tk):
         self.offset_x = cx - (cx - self.offset_x) * ratio
         self.offset_y = cy - (cy - self.offset_y) * ratio
 
-        # 即时预览：用 canvas.scale() 缩放现有元素（无需重新生成图片）
-        self.canvas.scale("all", cx, cy, ratio, ratio)
+        self._schedule_redraw()
 
-        # 防抖：连续滚轮事件合并，停止 80ms 后才真正 resize 图片
-        if self._zoom_timer is not None:
-            self.after_cancel(self._zoom_timer)
-        self._zoom_timer = self.after(80, self._deferred_zoom)
+    def _schedule_redraw(self):
+        if self._redraw_timer is None:
+            self._redraw_timer = self.after(16, self._deferred_redraw)
 
-    def _deferred_zoom(self):
-        """滚轮停止后，生成精确的缩放图片"""
-        self._zoom_timer = None
+    def _deferred_redraw(self):
+        self._redraw_timer = None
         self._full_redraw()
 
     def _on_drag_start(self, event):
@@ -281,18 +287,23 @@ class AnnotatorApp(tk.Tk):
         self._drag_start = (event.x, event.y)
         self.offset_x += dx
         self.offset_y += dy
-        self.canvas.move("all", dx, dy)
+        self._schedule_redraw()
 
     def _on_canvas_resize(self, event):
         if self.pil_img is None:
             return
-        if not self._resize_pending:
-            self._resize_pending = True
-            self.after(100, self._deferred_resize)
+        if self._resize_timer is None:
+            self._resize_timer = self.after(100, self._deferred_resize)
 
     def _deferred_resize(self):
-        self._resize_pending = False
+        self._resize_timer = None
         self._fit_image_to_canvas()
+
+    def destroy(self):
+        for timer in (self._redraw_timer, self._resize_timer):
+            if timer is not None:
+                self.after_cancel(timer)
+        super().destroy()
 
     # ----------------------------------------------------------------
     # 标注
