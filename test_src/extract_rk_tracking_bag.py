@@ -34,9 +34,12 @@ CONFIG_TOPICS = {
 }
 
 _TENNIS_BALL_RADIUS_M = 0.033
+# 指纹前缀 = bot_center return_hit_model.hpp 的 kContract / kContractFiveAxis：六轴臂甜点在
+# 「过臂中心、垂直拍面法向」的线上；五轴臂（v05，没有腕转）甜点绕 J1 偏 φ'，挥拍方向随之转。
 _FINAL_HIT_PLAN_FINGERPRINT_RE = re.compile(
-    r"world3d_effective_v3_arm_center_sweetspot:[0-9a-f]{16}\Z"
+    r"world3d_effective_v3_(arm_center|five_axis)_sweetspot:[0-9a-f]{16}\Z"
 )
+_FINAL_HIT_PLAN_FIVE_AXIS_PREFIX = "world3d_effective_v3_five_axis_sweetspot:"
 _GRAVITY_MPS2 = 9.8
 _STAGE1_LAMBDA_MIN = 0.02
 _STAGE1_LAMBDA_MAX = 0.40
@@ -57,6 +60,7 @@ def _valid_final_hit_plan_physics(payload: dict) -> bool:
     yaw = payload["face_normal_yaw_world"]
     pitch = payload["face_pitch"]
     horizontal_normal = (-math.sin(yaw), math.cos(yaw))
+    five_axis = payload["model_fingerprint"].startswith(_FINAL_HIT_PLAN_FIVE_AXIS_PREFIX)
 
     relative_error = math.sqrt(
         (payload["contact_x"] - payload["arm_center_x"] - payload["contact_rel_x"]) ** 2
@@ -83,12 +87,15 @@ def _valid_final_hit_plan_physics(payload: dict) -> bool:
     if arm_position_error > tolerance or arm_velocity_error > tolerance:
         return False
 
-    contact_plane = (
-        horizontal_normal[0] * payload["contact_rel_x"]
-        + horizontal_normal[1] * payload["contact_rel_y"]
-    )
-    if abs(contact_plane - payload["tennis_ball_radius_m"]) > tolerance:
-        return False
+    # 水平触球平面只对六轴成立（拍面过臂中心）；五轴拍面离臂中心 along·tan φ'，
+    # 这层几何由下面的挥拍切向一并校验（φ' 取自臂的 face table，报告端不复算）。
+    if not five_axis:
+        contact_plane = (
+            horizontal_normal[0] * payload["contact_rel_x"]
+            + horizontal_normal[1] * payload["contact_rel_y"]
+        )
+        if abs(contact_plane - payload["tennis_ball_radius_m"]) > tolerance:
+            return False
 
     target_error = math.sqrt(
         (
@@ -128,13 +135,27 @@ def _valid_final_hit_plan_physics(payload: dict) -> bool:
     if normal_error > normal_tolerance:
         return False
 
+    # 拍心世界水平速度 = 臂中心速度 + ω×甜点 + 补偿拍速 × 挥拍方向。挥拍方向 = 甜点绕 J1 的切向：
+    # 六轴即拍面水平法向；五轴 = ẑ×t̂（t = 臂中心→甜点水平向量，= 法向再转 φ'，bot_center
+    # solve_fixed_apex），且甜点须在 J1 前侧（along>0 ⇔ 切向与法向夹角 <90°；另一侧是镜像根）。
+    swing = horizontal_normal
+    if five_axis:
+        target_radius = math.hypot(payload["arm_target_rel_x"], payload["arm_target_rel_y"])
+        if not target_radius > 0:
+            return False
+        swing = (
+            -payload["arm_target_rel_y"] / target_radius,
+            payload["arm_target_rel_x"] / target_radius,
+        )
+        if swing[0] * horizontal_normal[0] + swing[1] * horizontal_normal[1] <= 0:
+            return False
     expected_racket_xy = (
         payload["arm_center_vx"]
         - payload["car_yaw_rate_at_ht"] * payload["arm_target_rel_y"]
-        + payload["compensated_speed"] * horizontal_normal[0],
+        + payload["compensated_speed"] * swing[0],
         payload["arm_center_vy"]
         + payload["car_yaw_rate_at_ht"] * payload["arm_target_rel_x"]
-        + payload["compensated_speed"] * horizontal_normal[1],
+        + payload["compensated_speed"] * swing[1],
     )
     if math.hypot(
         payload["racket_contact_vx"] - expected_racket_xy[0],

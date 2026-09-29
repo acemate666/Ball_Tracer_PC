@@ -141,6 +141,58 @@ def _plan(plan_id: str = "throw42", revision: int = 3, contact_ht: float = 100.6
     }
 
 
+def _five_axis_plan(
+    plan_id: str = "throw42", revision: int = 3, sweet_spot_yaw: float = 0.21
+) -> dict:
+    """v05 五轴臂方案：甜点绕 J1 偏 φ'（sweet_spot_yaw），挥拍方向 = 甜点绕 J1 的切向。
+
+    与 bot_center return_hit_model.cpp 同式：甜点 t = R·(cos ψ, sin ψ)、挥拍方向
+    (−sin ψ, cos ψ)，ψ = 拍面法向 yaw + φ'；拍面法向、碰撞系数沿用六轴夹具。
+    """
+    plan = _plan(plan_id, revision)
+    yaw = plan["face_normal_yaw_world"]
+    horizontal_normal = (-math.sin(yaw), math.cos(yaw))
+    swing_yaw = yaw + sweet_spot_yaw
+    radius = 1.05
+    target = (radius * math.cos(swing_yaw), radius * math.sin(swing_yaw),
+              plan["arm_target_rel_z"])
+    ball_radius = plan["tennis_ball_radius_m"]
+    contact_rel = (
+        target[0] + ball_radius * horizontal_normal[0] - plan["arm_target_x_bias_m"],
+        target[1] + ball_radius * horizontal_normal[1],
+        target[2] - plan["arm_target_z_bias_m"],
+    )
+    yaw_rate = plan["car_yaw_rate_at_ht"]
+    racket = (
+        plan["arm_center_vx"] - yaw_rate * target[1]
+        + plan["compensated_speed"] * -math.sin(swing_yaw),
+        plan["arm_center_vy"] + yaw_rate * target[0]
+        + plan["compensated_speed"] * math.cos(swing_yaw),
+        plan["racket_contact_vz"],
+    )
+    incoming = tuple(plan[f"incoming_v{axis}"] for axis in "xyz")
+    normal = tuple(plan[f"face_normal_n{axis}"] for axis in "xyz")
+    relative = tuple(vin - vr for vin, vr in zip(incoming, racket))
+    relative_normal = sum(u * n for u, n in zip(relative, normal))
+    outgoing = tuple(
+        vr + plan["collision_kt"] * (u - relative_normal * n)
+        - plan["collision_en"] * relative_normal * n
+        for vr, u, n in zip(racket, relative, normal)
+    )
+    plan.update(
+        contact_rel_x=contact_rel[0], contact_rel_y=contact_rel[1],
+        contact_rel_z=contact_rel[2],
+        contact_x=plan["arm_center_x"] + contact_rel[0],
+        contact_y=plan["arm_center_y"] + contact_rel[1],
+        contact_z=contact_rel[2],
+        arm_target_rel_x=target[0], arm_target_rel_y=target[1], arm_target_rel_z=target[2],
+        racket_contact_vx=racket[0], racket_contact_vy=racket[1], racket_contact_vz=racket[2],
+        outgoing_vx=outgoing[0], outgoing_vy=outgoing[1], outgoing_vz=outgoing[2],
+        model_fingerprint="world3d_effective_v3_five_axis_sweetspot:a1939d6096395e7a",
+    )
+    return plan
+
+
 def _preaim() -> dict:
     return {
         "kind": "preaim_hint",
@@ -404,5 +456,99 @@ def test_report_surfaces_plan_physics_and_disables_new_contract_fallback():
         "racket_contact_vx", "face_normal_nx",
     ):
         assert field in source
-    assert "world3d_effective_v3_arm_center_sweetspot:[0-9a-f]{16}" in source
+    assert "world3d_effective_v3_(arm_center|five_axis)_sweetspot:[0-9a-f]{16}" in source
     assert "碰撞 / 求解" in source
+
+
+def _run_plan_parse(tmp_path, events: list) -> dict:
+    body = (
+        "const isNum=v=>typeof v==='number'&&Number.isFinite(v);\n"
+        "const RK={t0:100};\n"
+        f"const ARM={{events:{json.dumps(events)}}};\n"
+        + _core("final-hit-plan-parse-core-begin", "final-hit-plan-parse-core-end")
+        + "\nconst statusNum=(text,key)=>{const m=new RegExp('(?:^|\\\\s)'+key+'=(-?[0-9]+(?:\\\\.[0-9]+)?)').exec(text||'');return m?Number(m[1]):null;};\n"
+        + _core("final-hit-plan-ack-core-begin", "final-hit-plan-ack-core-end")
+        + "\nconsole.log(JSON.stringify({plans:armFinalPlans.map(p=>p.planId),"
+          "acks:armPlanAcks.map(a=>a.plan.planId),"
+          "contractErrors:armPlanContractErrors,ackErrors:armPlanAckErrors}));\n"
+    )
+    script = tmp_path / "five_axis_plan.js"
+    script.write_text(body, encoding="utf-8")
+    run = subprocess.run(
+        [NODE, str(script)], capture_output=True, text=True, encoding="utf-8", timeout=30
+    )
+    assert run.returncode == 0, run.stderr
+    return json.loads(run.stdout)
+
+
+def test_five_axis_fixture_is_offset_from_six_axis_plane():
+    plan = _five_axis_plan()
+    yaw = plan["face_normal_yaw_world"]
+    plane = -math.sin(yaw) * plan["contact_rel_x"] + math.cos(yaw) * plan["contact_rel_y"]
+    # φ'=0.21 rad 时离六轴平面 ~0.2m：夹具确实走了五轴几何，不是六轴换个指纹。
+    assert abs(plane - plan["tennis_ball_radius_m"]) > 0.1
+
+
+def test_rk_extractor_accepts_five_axis_plan():
+    plan = _five_axis_plan()
+    mapped = _report_prediction_payload(plan)
+    assert mapped is not None
+    assert [mapped[k] for k in ("rel_x", "rel_y", "rel_z")] == pytest.approx(
+        [plan["contact_rel_x"], plan["contact_rel_y"], plan["contact_rel_z"]]
+    )
+    # φ'=0 的五轴方案与六轴几何重合（v05 实场 354 条里有 117 条），同样有效。
+    assert _report_prediction_payload(_five_axis_plan(sweet_spot_yaw=0.0)) is not None
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        # 五轴几何贴六轴指纹：六轴触球平面/挥拍方向都对不上
+        lambda p: p.update(
+            model_fingerprint="world3d_effective_v3_arm_center_sweetspot:0123456789abcdef"),
+        lambda p: p.update(racket_contact_vx=p["racket_contact_vx"] + 0.001),
+        lambda p: p.update(arm_target_rel_y=p["arm_target_rel_y"] + 0.001,
+                           contact_rel_y=p["contact_rel_y"] + 0.001,
+                           contact_y=p["contact_y"] + 0.001),
+        lambda p: p.update(
+            model_fingerprint="world3d_effective_v3_five_axis_sweetspot:0123456789ABCDEF"),
+        # J1 另一侧的镜像根：速度与切向自洽，但甜点在 J1 背后
+        lambda p: p.update(_five_axis_plan(sweet_spot_yaw=0.21 + math.pi)),
+    ],
+)
+def test_rk_extractor_rejects_invalid_five_axis_plan(mutate):
+    plan = _five_axis_plan()
+    mutate(plan)
+    assert _report_prediction_payload(plan) is None
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_report_accepts_five_axis_plan_and_matches_ack(tmp_path):
+    good = _five_axis_plan("v05good", 1)
+    as_six_axis = {
+        **_five_axis_plan("as-six-axis", 1),
+        "model_fingerprint": "world3d_effective_v3_arm_center_sweetspot:0123456789abcdef",
+    }
+    bad_racket = _five_axis_plan("bad-racket", 1)
+    bad_racket["racket_contact_vy"] += 0.01
+    mirror = _five_axis_plan("mirror", 1, sweet_spot_yaw=0.21 + math.pi)
+    events = [
+        {"t": 0.0, "topic": "/predict_hit_pos", "text": json.dumps(good)},
+        {"t": 0.01, "topic": "/predict_hit_pos", "text": json.dumps(as_six_axis)},
+        {"t": 0.02, "topic": "/predict_hit_pos", "text": json.dumps(bad_racket)},
+        {"t": 0.03, "topic": "/predict_hit_pos", "text": json.dumps(mirror)},
+        {"t": 0.05, "topic": "/tennis/status", "text":
+         f"accepted hit x={good['arm_target_rel_x']:.4f} z={good['arm_target_rel_z']:.4f} "
+         "duration=0.5500 plan_id=v05good revision=1 contact_ht=100.600000 solve_ms=1.380"},
+    ]
+    result = _run_plan_parse(tmp_path, events)
+    assert result["plans"] == ["v05good"]
+    assert result["acks"] == ["v05good"]
+    assert result["ackErrors"] == []
+    errors = result["contractErrors"]
+    assert len(errors) == 3
+    assert any("as-six-axis#1" in e and "水平触球平面" in e and "拍心世界水平速度" in e
+               for e in errors)
+    assert any("bad-racket#1" in e and "拍心世界水平速度" in e and "水平触球平面" not in e
+               for e in errors)
+    assert any("mirror#1" in e and "J1 前侧" in e for e in errors)

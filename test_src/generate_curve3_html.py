@@ -1909,7 +1909,10 @@ const SWING_HT_UPDATE_MIN_REMAINING_SEC=0.060;
 // （0809 103849 场）。截断已修，但解析失败仍要显式暴露，见 armDataWarnHtml。
 // [[final-hit-plan-parse-core-begin]]
 const FINAL_HIT_PLAN_CONTRACT='final_hit_plan/v1';
-const FINAL_HIT_PLAN_FINGERPRINT_RE=/^world3d_effective_v3_arm_center_sweetspot:[0-9a-f]{16}$/;
+// 指纹前缀 = bot_center return_hit_model.hpp 的 kContract / kContractFiveAxis：六轴臂甜点在
+// 「过臂中心、垂直拍面法向」的线上；五轴臂（v05，没有腕转）甜点绕 J1 偏 φ'，挥拍方向随之转。
+const FINAL_HIT_PLAN_FINGERPRINT_RE=/^world3d_effective_v3_(arm_center|five_axis)_sweetspot:[0-9a-f]{16}$/;
+const FINAL_HIT_PLAN_FIVE_AXIS_PREFIX='world3d_effective_v3_five_axis_sweetspot:';
 const FINAL_HIT_PLAN_FINITE_FIELDS=[
   'source_ct','generated_at','contact_ht','n_points',
   'contact_rel_x','contact_rel_y','contact_rel_z',
@@ -1996,7 +1999,11 @@ const armPreds = (()=>{
                                    p.arm_center_vy-(p.car_center_vy+p.car_yaw_rate_at_ht*rx));
           if(armErr>1e-4||armVErr>1e-4) missing.push('car→arm刚体变换一致性');
         }
-        if(['contact_rel_x','contact_rel_y','face_normal_yaw_world','tennis_ball_radius_m'].every(k=>isNum(p[k]))){
+        const fiveAxis=typeof p.model_fingerprint==='string'
+          &&p.model_fingerprint.startsWith(FINAL_HIT_PLAN_FIVE_AXIS_PREFIX);
+        // 水平触球平面只对六轴成立（拍面过臂中心）；五轴拍面离臂中心 along·tan φ'，
+        // 这层几何由下面的挥拍切向一并校验（φ' 取自臂的 face table，报告端不复算）。
+        if(!fiveAxis&&['contact_rel_x','contact_rel_y','face_normal_yaw_world','tennis_ball_radius_m'].every(k=>isNum(p[k]))){
           const nhx=-Math.sin(p.face_normal_yaw_world), nhy=Math.cos(p.face_normal_yaw_world);
           const plane=nhx*p.contact_rel_x+nhy*p.contact_rel_y;
           if(Math.abs(plane-p.tennis_ball_radius_m)>1e-4) missing.push('水平触球平面一致性');
@@ -2021,11 +2028,17 @@ const armPreds = (()=>{
         }
         if(['arm_center_vx','arm_center_vy','car_yaw_rate_at_ht','arm_target_rel_x','arm_target_rel_y',
             'compensated_speed','face_normal_yaw_world','racket_contact_vx','racket_contact_vy'].every(k=>isNum(p[k]))){
+          // 拍心世界水平速度 = 臂中心速度 + ω×甜点 + 补偿拍速 × 挥拍方向。挥拍方向 = 甜点绕 J1 的切向：
+          // 六轴即拍面水平法向；五轴 = ẑ×t̂（t = 臂中心→甜点水平向量，= 法向再转 φ'，bot_center
+          // solve_fixed_apex），且甜点须在 J1 前侧（along>0 ⇔ 切向与法向夹角 <90°；另一侧是镜像根）。
           const nhx=-Math.sin(p.face_normal_yaw_world), nhy=Math.cos(p.face_normal_yaw_world);
-          const expectedVx=p.arm_center_vx-p.car_yaw_rate_at_ht*p.arm_target_rel_y+p.compensated_speed*nhx;
-          const expectedVy=p.arm_center_vy+p.car_yaw_rate_at_ht*p.arm_target_rel_x+p.compensated_speed*nhy;
-          if(Math.hypot(p.racket_contact_vx-expectedVx,p.racket_contact_vy-expectedVy)>1e-4)
+          const tr=Math.hypot(p.arm_target_rel_x,p.arm_target_rel_y);
+          const ux=fiveAxis?-p.arm_target_rel_y/tr:nhx, uy=fiveAxis?p.arm_target_rel_x/tr:nhy;
+          const expectedVx=p.arm_center_vx-p.car_yaw_rate_at_ht*p.arm_target_rel_y+p.compensated_speed*ux;
+          const expectedVy=p.arm_center_vy+p.car_yaw_rate_at_ht*p.arm_target_rel_x+p.compensated_speed*uy;
+          if(!(Math.hypot(p.racket_contact_vx-expectedVx,p.racket_contact_vy-expectedVy)<=1e-4))
             missing.push('拍心世界水平速度一致性');
+          if(fiveAxis&&!(ux*nhx+uy*nhy>0)) missing.push('五轴甜点在 J1 前侧');
         }
         if(['incoming_vx','incoming_vy','incoming_vz','racket_contact_vx','racket_contact_vy','racket_contact_vz',
             'face_normal_nx','face_normal_ny','face_normal_nz','collision_en','collision_kt',
