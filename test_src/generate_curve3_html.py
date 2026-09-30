@@ -4072,7 +4072,7 @@ const rk300TableHtml = () => {
           +(tgtYawExtraDeg!=null?'（δ=payload hit_yaw_extra='+tgtYawExtraDeg.toFixed(2)+'°，击球整体多转）':'')
           +(tgtFaceYawRad!=null?'；face_yaw(臂系锁面目标)='+(tgtFaceYawRad*180/Math.PI).toFixed(2)+'°':'')
           +'；pitch='+(tgtPitch!=null?tgtPitch.toFixed(2)+'°':'—')+'=目标拍面仰角（臂系≡世界系，可直接减右列实测 pitch）'
-          +(tgtApexZ!=null?('；apex_z_world='+tgtApexZ.toFixed(3)+'m=规划出球实际最高点（上限 2.700m，pitch 超过 28° 时自适应降低）'):'')
+          +(tgtApexZ!=null?('；apex_z_world='+tgtApexZ.toFixed(3)+'m=规划出球实际最高点（取可行的最高值；上限只在 bot_center return_hit_model.cpp 定义，拍面 pitch 超上限时自适应降低）'):'')
            +(tgtNetClearance!=null?('；net_clearance_m='+tgtNetClearance.toFixed(3)+'m=球底相对 0.914m 网高的过网净空（要求 ≥0.100m）'):'')
           +(finalPlan?('；incoming='+speedVectorText([finalPlan.incoming_vx,finalPlan.incoming_vy,finalPlan.incoming_vz])
             +'m/s；racket_contact_v='+speedVectorText([finalPlan.racket_contact_vx,finalPlan.racket_contact_vy,finalPlan.racket_contact_vz])
