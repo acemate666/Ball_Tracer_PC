@@ -43,6 +43,7 @@ import math
 import os
 import queue
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -1061,9 +1062,15 @@ def _generate_post_run_artifacts(
                 "--output",
                 str(racket_candidate),
             ]
-            if (
-                tables_path.exists()
-                and _run_postprocess_command(
+            # 表格导出失败时 generate_curve3_html 只打一行 skipped 照常返回成功；
+            # 这里不明说的话，黑标一步就静默没了（ASUS 没装 node 的那些场次就是这样丢的）
+            if not tables_path.exists():
+                print(
+                    "[post] Skip fixed black-marker racket: report tables were not "
+                    "exported (export_report_tables needs node on PATH)"
+                )
+            elif (
+                _run_postprocess_command(
                     "Measure fixed black-marker racket",
                     measure_command,
                     env=report_env,
@@ -2196,6 +2203,12 @@ def main() -> int:
         print("  日志保存: disabled (--no-log)")
     if args.no_video:
         print("  视频保存: disabled (--no-video)")
+    # 黑标测量要先由报告在 node 里导出 _tables.json；没有 node 只会在收尾时一闪而过，开场就说
+    if post_run_enabled and post_run_measure_racket and shutil.which("node") is None:
+        print(
+            "  [WARN] 黑标拍心: PATH 上没有 node，报告表格导不出，"
+            "收尾的黑标测量（报告「视觉拍心」列）本场会被跳过"
+        )
 
     print("\n[1/5] 初始化 BallDetector (YOLO)...")
     detector = BallDetector(
