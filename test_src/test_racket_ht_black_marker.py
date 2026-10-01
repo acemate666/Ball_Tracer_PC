@@ -1,19 +1,24 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pytest
 
 from racket_ht_black_marker import (
     CAR_MARKER_POLICY,
+    MARKER_ROI_RADIUS_PX,
     REANCHOR_INLIER_MM,
     REANCHOR_MIN_INLIERS,
     AnchorGate,
     CameraModel,
+    MarkerCandidate,
     NothingToMeasure,
     _car_to_world,
+    _component_candidates,
     _grid_panels,
     _measurement_context,
     _session_marker_offset,
@@ -312,3 +317,99 @@ def test_anchor_gate_separates_view_depth_from_lateral():
     near = gate.rank(np.array([5.0, 20.0, 5.0]))
     far = gate.rank(np.array([25.0, 20.0, 5.0]))
     assert near is not None and far is not None and near < far
+
+
+def _component_candidates_full_roi(
+    image, anchor_uv, *, radius, thresholds, anchor_limit_px, result_limit,
+    prefer_near=False, dedupe_px=5.0,
+):
+    """改快之前的实现（每个连通域在整块 ROI 上求质心/对比度），只用来对拍。"""
+    height, width = image.shape[:2]
+    anchor_x, anchor_y = anchor_uv
+    x0 = max(0, int(math.floor(anchor_x - radius)))
+    y0 = max(0, int(math.floor(anchor_y - radius)))
+    x1 = min(width, int(math.ceil(anchor_x + radius)))
+    y1 = min(height, int(math.ceil(anchor_y + radius)))
+    gray = cv2.cvtColor(image[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY).astype(np.float32)
+    background = float(np.median(gray))
+    ys, xs = np.indices(gray.shape)
+    found = []
+    for threshold in thresholds:
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            (gray < threshold).astype(np.uint8), 8
+        )
+        for label in range(1, count):
+            x, y, w, h, area = (int(v) for v in stats[label])
+            if not (8 <= area <= 1200 and 3 <= w <= 50 and 3 <= h <= 50):
+                continue
+            aspect = max(w, h) / max(1.0, min(w, h))
+            fill = area / float(w * h)
+            if aspect > 2.4 or fill < 0.30:
+                continue
+            component = labels == label
+            weights = np.where(component, np.maximum(background - gray, 1.0), 0.0)
+            mass = float(weights.sum())
+            if mass <= 0.0:
+                continue
+            u = x0 + float((weights * xs).sum() / mass)
+            v = y0 + float((weights * ys).sum() / mass)
+            distance = math.hypot(u - anchor_x, v - anchor_y)
+            if anchor_limit_px is not None and distance > anchor_limit_px:
+                continue
+            contrast = float(np.median(background - gray[component]))
+            scale = 25.0 if anchor_limit_px is not None else 140.0
+            found.append(
+                MarkerCandidate(
+                    uv=(u, v),
+                    score=max(contrast, 1.0) * fill * min(area, 250)
+                    / (1.0 + (distance / scale) ** 2),
+                    area=area,
+                    bbox_xywh=(x0 + x, y0 + y, w, h),
+                )
+            )
+    found.sort(
+        key=(
+            (lambda item: (math.hypot(item.uv[0] - anchor_x, item.uv[1] - anchor_y), -item.score))
+            if prefer_near
+            else (lambda item: -item.score)
+        )
+    )
+    deduped = []
+    for item in found:
+        if all(np.linalg.norm(np.subtract(item.uv, old.uv)) > dedupe_px for old in deduped):
+            deduped.append(item)
+        if len(deduped) == result_limit:
+            break
+    return deduped
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_component_candidates_match_the_full_roi_implementation(seed):
+    # 包围盒内求质心是纯提速：同一批连通域、同样的门与排序，坐标只差浮点求和顺序
+    rng = np.random.default_rng(seed)
+    image = (150 + rng.integers(-12, 13, (640, 760, 3))).astype(np.uint8)
+    anchor = (380.4, 317.6)
+    for _ in range(60):
+        near = rng.random() < 0.4
+        cx = anchor[0] + rng.uniform(-40, 40) if near else rng.uniform(0, 760)
+        cy = anchor[1] + rng.uniform(-40, 40) if near else rng.uniform(0, 640)
+        axes = (int(rng.integers(2, 16)), int(rng.integers(2, 16)))
+        level = int(rng.integers(0, 50))
+        cv2.ellipse(
+            image, (int(cx), int(cy)), axes, float(rng.uniform(0, 180)), 0, 360,
+            (level, level, level), -1,
+        )
+    searches = (
+        dict(radius=55, thresholds=[8.0, 12.0, 16.0, 20.0, 24.0, 28.0, 32.0, 36.0, 40.0, 44.0, 48.0, 56.0],
+             anchor_limit_px=45.0, result_limit=12, prefer_near=True, dedupe_px=3.0),
+        dict(radius=MARKER_ROI_RADIUS_PX, thresholds=[8.0, 12.0, 16.0, 20.0, 24.0, 28.0, 32.0],
+             anchor_limit_px=None, result_limit=32),
+    )
+    for kwargs in searches:
+        fast = _component_candidates(image, anchor, **kwargs)
+        reference = _component_candidates_full_roi(image, anchor, **kwargs)
+        assert len(fast) == len(reference) > 0
+        for got, want in zip(fast, reference):
+            assert (got.area, got.bbox_xywh) == (want.area, want.bbox_xywh)
+            assert got.uv == pytest.approx(want.uv, abs=1e-6)
+            assert got.score == pytest.approx(want.score, rel=1e-9)

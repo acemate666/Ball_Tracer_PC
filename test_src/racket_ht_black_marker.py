@@ -6,7 +6,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import time
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -279,7 +282,6 @@ def _component_candidates(
         return []
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY).astype(np.float32)
     background = float(np.median(gray))
-    ys, xs = np.indices(gray.shape)
     found: list[MarkerCandidate] = []
     for threshold in thresholds:
         count, labels, stats, _ = cv2.connectedComponentsWithStats(
@@ -293,17 +295,21 @@ def _component_candidates(
             fill = area / float(w * h)
             if aspect > 2.4 or fill < 0.30:
                 continue
-            component = labels == label
-            weights = np.where(component, np.maximum(background - gray, 1.0), 0.0)
+            # 质心/对比度只在该连通域自己的包围盒里算：包围盒外权重本来全是 0。原先在整块
+            # ROI 上做 labels==label 和加权和，O(连通域数 × ROI 像素)，一路画面 0.35–0.7 s
+            box = gray[y : y + h, x : x + w]
+            component = labels[y : y + h, x : x + w] == label
+            weights = np.where(component, np.maximum(background - box, 1.0), 0.0)
             mass = float(weights.sum())
             if mass <= 0.0:
                 continue
-            u = x0 + float((weights * xs).sum() / mass)
-            v = y0 + float((weights * ys).sum() / mass)
+            ys, xs = np.indices(box.shape)
+            u = x0 + x + float((weights * xs).sum() / mass)
+            v = y0 + y + float((weights * ys).sum() / mass)
             distance = math.hypot(u - anchor_x, v - anchor_y)
             if anchor_limit_px is not None and distance > anchor_limit_px:
                 continue
-            contrast = float(np.median(background - gray[component]))
+            contrast = float(np.median(background - box[component]))
             scale = 25.0 if anchor_limit_px is not None else 140.0
             found.append(
                 MarkerCandidate(
@@ -786,6 +792,120 @@ def _grid_panels(
     return panels
 
 
+def _read_video_frame(
+    capture: cv2.VideoCapture, position: int | None, video_index: int
+) -> tuple[np.ndarray, int]:
+    """读第 video_index 帧：往后 60 帧内顺着解码，否则 seek。返回 (画面, 读后位置)。"""
+    if position is None or video_index < position or video_index - position > 60:
+        if not capture.set(cv2.CAP_PROP_POS_FRAMES, video_index):
+            raise RuntimeError(f"could not seek to video frame {video_index}")
+        actual_position = capture.get(cv2.CAP_PROP_POS_FRAMES)
+        if abs(actual_position - video_index) > 0.5:
+            raise RuntimeError(
+                f"video seek landed at {actual_position}, expected {video_index}"
+            )
+        position = video_index
+    while position < video_index:
+        if not capture.grab():
+            raise RuntimeError(f"could not decode through video frame {position}")
+        position += 1
+    ok, image = capture.read()
+    if not ok:
+        raise RuntimeError(f"could not read video frame {video_index}")
+    return image, video_index + 1
+
+
+def _frame_candidates(
+    image: np.ndarray,
+    serials: list[str],
+    cameras: dict[str, CameraModel],
+    anchor: np.ndarray,
+) -> dict[str, list[MarkerCandidate]]:
+    panels = _grid_panels(image, serials, cameras)
+    return {
+        serial: _marker_candidates(
+            panels[serial], tuple(_project_raw(cameras[serial], anchor))
+        )
+        for serial in serials
+    }
+
+
+def _default_workers() -> int:
+    # 收尾时 tracker 主循环已停，借一半逻辑核（ASUS 32 → 16）；--workers 1 = 原来的单进程
+    return max(1, min(16, (os.cpu_count() or 2) // 2))
+
+
+# 并行子进程状态：每帧的解码/候选/求解与单进程同一套函数、同一份输入，结果与单进程一致；
+# 子进程各开一个 VideoCapture，按「一抛的帧窗」接活
+_WORKER: dict[str, Any] = {}
+
+
+def _worker_init(
+    video_path: str,
+    serials: list[str],
+    cameras: dict[str, CameraModel],
+    loo_max_mm: float | None,
+) -> None:
+    cv2.setNumThreads(1)
+    _WORKER.update(
+        video_path=video_path,
+        serials=serials,
+        cameras=cameras,
+        loo_max_mm=loo_max_mm,
+        capture=None,
+        position=None,
+    )
+
+
+def _worker_fk_pass(
+    window: list[tuple[int, int, np.ndarray]],
+) -> list[tuple[int, dict[str, list[MarkerCandidate]], tuple | None]]:
+    """第一遍：一抛帧窗内逐帧解码 + 候选 + 对 FK 锚求解。window = [(job_id, 视频帧号, FK 锚)]。"""
+    state = _WORKER
+    if state["capture"] is None:
+        # 后端选择同主进程（CAP_ANY）；解码只开 1 线程：默认按核数开，多进程并行时只占内存。
+        # 线程数不改解码结果（0929 场逐帧哈希对过）
+        capture = cv2.VideoCapture(
+            state["video_path"], cv2.CAP_ANY, [cv2.CAP_PROP_N_THREADS, 1]
+        )
+        if not capture.isOpened():
+            raise RuntimeError(f"could not open video {state['video_path']}")
+        state["capture"] = capture
+    results = []
+    for job_id, video_index, fk_expected in window:
+        image, state["position"] = _read_video_frame(
+            state["capture"], state["position"], video_index
+        )
+        candidates = _frame_candidates(
+            image, state["serials"], state["cameras"], fk_expected
+        )
+        solved = _attempt_solve(
+            candidates, state["cameras"], state["serials"], fk_expected, None,
+            loo_max_mm=state["loo_max_mm"],
+        )
+        results.append((job_id, candidates, solved))
+    return results
+
+
+def _abandon_pool(pool: ProcessPoolExecutor, exc: BaseException) -> None:
+    """子进程异常退出（如内存不够）：这一遍改回单进程从头做，黑标照出，只是慢。"""
+    print(f"[racket] worker pool broke ({exc}); redoing this pass in one process", flush=True)
+    pool.shutdown(cancel_futures=True)
+    return None
+
+
+def _worker_reanchor_solve(
+    task: tuple[int, dict[str, list[MarkerCandidate]], np.ndarray, AnchorGate],
+) -> tuple[int, tuple | None]:
+    """第一遍补（校正锚点）：候选沿用第一遍，只重解。"""
+    job_id, candidates, fk_anchor, gate = task
+    state = _WORKER
+    return job_id, _attempt_solve(
+        candidates, state["cameras"], state["serials"], fk_anchor, None,
+        loo_max_mm=state["loo_max_mm"], fk_gate=gate,
+    )
+
+
 def _measurement_context(
     tracker_path: Path,
     arm_path: Path,
@@ -912,6 +1032,8 @@ def measure(
     arm_path: Path,
     rk_path: Path,
     tables_path: Path,
+    *,
+    workers: int = 1,
 ) -> dict:
     started = time.perf_counter()
     (
@@ -1015,43 +1137,23 @@ def measure(
     video_position: list[int | None] = [None]
     decoded_count = [0]
 
+    def count_decoded(n: int) -> None:
+        before = decoded_count[0]
+        decoded_count[0] += n
+        for mark in range((before // 60 + 1) * 60, decoded_count[0] + 1, 60):
+            print(f"[racket] decoded {mark} frames", flush=True)
+
     def read_frames(capture: cv2.VideoCapture, wanted: list[dict]) -> None:
         position = video_position[0]
         for job in sorted(wanted, key=lambda item: item["video_index"]):
-            decoded_count[0] += 1
-            if decoded_count[0] % 60 == 0:
-                print(f"[racket] decoded {decoded_count[0]} frames", flush=True)
-            video_index = job["video_index"]
-            if position is None or video_index < position or video_index - position > 60:
-                if not capture.set(cv2.CAP_PROP_POS_FRAMES, video_index):
-                    raise RuntimeError(f"could not seek to video frame {video_index}")
-                actual_position = capture.get(cv2.CAP_PROP_POS_FRAMES)
-                if abs(actual_position - video_index) > 0.5:
-                    raise RuntimeError(
-                        f"video seek landed at {actual_position}, expected {video_index}"
-                    )
-                position = video_index
-            while position < video_index:
-                if not capture.grab():
-                    raise RuntimeError(f"could not decode through video frame {position}")
-                position += 1
-            ok, image = capture.read()
-            if not ok:
-                raise RuntimeError(f"could not read video frame {video_index}")
-            position = video_index + 1
-            panels = _grid_panels(image, serials, cameras)
+            count_decoded(1)
+            image, position = _read_video_frame(capture, position, job["video_index"])
             anchor = (
                 job["fk_expected"]
                 if job["fk_expected"] is not None
                 else job.get("traj_expected")
             )
-            anchors = {
-                serial: _project_raw(cameras[serial], anchor) for serial in serials
-            }
-            job["candidates"] = {
-                serial: _marker_candidates(panels[serial], tuple(anchors[serial]))
-                for serial in serials
-            }
+            job["candidates"] = _frame_candidates(image, serials, cameras, anchor)
         video_position[0] = position
 
     def accept(job: dict, solved: tuple[MarkerFit, int, str, str | None]) -> None:
@@ -1117,17 +1219,53 @@ def measure(
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         raise RuntimeError(f"could not open video {video_path}")
+    # 第一遍与第一遍补逐帧独立，分给子进程；第二遍要串着用相邻帧的解，留在主进程
+    pool: ProcessPoolExecutor | None = None
+    if workers > 1:
+        print(f"[racket] parallel: {workers} worker processes", flush=True)
+        pool = ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_worker_init,
+            initargs=(str(video_path), serials, cameras, policy.loo_max_mm),
+        )
     try:
         # Pass 1: decode every frame that has an FK anchor; solve against it.
         anchored = [job for job in jobs if job["fk_expected"] is not None]
-        read_frames(capture, anchored)
-        for job in anchored:
-            solved = _attempt_solve(
-                job["candidates"], cameras, serials, job["fk_expected"], None,
-                loo_max_mm=policy.loo_max_mm,
-            )
-            if solved is not None:
-                accept(job, solved)
+        pass1_done = False
+        if pool is not None:
+            job_ids = {id(job): index for index, job in enumerate(jobs)}
+            throw_windows: dict[int, list[dict]] = {}
+            for job in anchored:
+                throw_windows.setdefault(id(job["target"]), []).append(job)
+            work = [
+                [
+                    (job_ids[id(job)], job["video_index"], job["fk_expected"])
+                    for job in sorted(window, key=lambda item: item["video_index"])
+                ]
+                for window in throw_windows.values()
+            ]
+            try:
+                for results in pool.map(_worker_fk_pass, work):
+                    count_decoded(len(results))
+                    for job_id, candidates, solved in results:
+                        jobs[job_id]["candidates"] = candidates
+                        if solved is not None:
+                            accept(jobs[job_id], solved)
+                pass1_done = True
+            except BrokenProcessPool as exc:
+                pool = _abandon_pool(pool, exc)
+                for job in anchored:
+                    job["candidates"] = None
+                    job["accepted"] = None
+        if not pass1_done:
+            read_frames(capture, anchored)
+            for job in anchored:
+                solved = _attempt_solve(
+                    job["candidates"], cameras, serials, job["fk_expected"], None,
+                    loo_max_mm=policy.loo_max_mm,
+                )
+                if solved is not None:
+                    accept(job, solved)
 
         # Pass 1b（policy.reanchor）：第一遍解估本场「黑标 − FK」车体系偏差，以 FK+偏差为锚、
         # 深度/横向分开设门全部重解（候选沿用第一遍，不重新解码）。估不出偏差 = 第一遍本身
@@ -1168,6 +1306,7 @@ def measure(
                     f"{len(samples)} pass-1 fits",
                     flush=True,
                 )
+                regated: list[tuple[dict, AnchorGate]] = []
                 for job in anchored:
                     if job["car_yaw"] is None:
                         continue
@@ -1179,14 +1318,38 @@ def measure(
                         REANCHOR_MAX_LATERAL_MM,
                         REANCHOR_MAX_DEPTH_MM,
                     )
-                    solved = _attempt_solve(
-                        job["candidates"], cameras, serials, job["fk_anchor"], None,
-                        loo_max_mm=policy.loo_max_mm, fk_gate=gate,
-                    )
+                    regated.append((job, gate))
+                solutions: list | None = None
+                if pool is not None:
+                    tasks = [
+                        (index, job["candidates"], job["fk_anchor"], gate)
+                        for index, (job, gate) in enumerate(regated)
+                    ]
+                    try:
+                        solutions = [
+                            solved
+                            for _, solved in pool.map(
+                                _worker_reanchor_solve, tasks, chunksize=8
+                            )
+                        ]
+                    except BrokenProcessPool as exc:
+                        pool = _abandon_pool(pool, exc)
+                if solutions is None:
+                    solutions = [
+                        _attempt_solve(
+                            job["candidates"], cameras, serials, job["fk_anchor"], None,
+                            loo_max_mm=policy.loo_max_mm, fk_gate=gate,
+                        )
+                        for job, gate in regated
+                    ]
+                for (job, _), solved in zip(regated, solutions):
                     if solved is not None:
                         accept(job, solved)
         else:
             reanchor_summary = None
+        if pool is not None:
+            pool.shutdown()
+            pool = None
 
         # Pass 2: chain neighbour fits as trajectory anchors. Candidate-bearing
         # frames retry without video; anchorless frames (car-loc holes) decode
@@ -1220,6 +1383,8 @@ def measure(
             if not progress:
                 break
     finally:
+        if pool is not None:
+            pool.shutdown(cancel_futures=True)
         capture.release()
 
     observations = [job["accepted"] for job in jobs if job["accepted"] is not None]
@@ -1302,6 +1467,12 @@ def main() -> int:
     parser.add_argument("--rk-tracking-json", type=Path, required=True)
     parser.add_argument("--tables-json", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=_default_workers(),
+        help="worker processes for the per-frame passes (1 = single process)",
+    )
     args = parser.parse_args()
     try:
         payload = measure(
@@ -1310,6 +1481,7 @@ def main() -> int:
             args.arm_json,
             args.rk_tracking_json,
             args.tables_json,
+            workers=args.workers,
         )
     except NothingToMeasure as exc:
         # 不写 --output：调用方（run_tracker 后处理）据此知道本场没有视觉拍心可合入报告。
