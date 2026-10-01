@@ -1911,8 +1911,13 @@ const SWING_HT_UPDATE_MIN_REMAINING_SEC=0.060;
 const FINAL_HIT_PLAN_CONTRACT='final_hit_plan/v1';
 // 指纹前缀 = bot_center return_hit_model.hpp 的 kContract / kContractFiveAxis：六轴臂甜点在
 // 「过臂中心、垂直拍面法向」的线上；五轴臂（v05，没有腕转）甜点绕 J1 偏 φ'，挥拍方向随之转。
-const FINAL_HIT_PLAN_FINGERPRINT_RE=/^world3d_effective_v3_(arm_center|five_axis)_sweetspot:[0-9a-f]{16}$/;
-const FINAL_HIT_PLAN_FIVE_AXIS_PREFIX='world3d_effective_v3_five_axis_sweetspot:';
+// 上旋方案（world3d_topspin_v1_*，bot_center return_topspin_racket_vz_mps>0）几何同上，碰撞换旋转模型
+// spin_cross_v1：出球 = 零旋等效（en, kt）出球 + spin_c·R·(ω_in×n)（臂 control/spin_ball.hpp，臂端同式对账）。
+const FINAL_HIT_PLAN_FINGERPRINT_RE=/^world3d_(effective_v3|topspin_v1)_(arm_center|five_axis)_sweetspot:[0-9a-f]{16}$/;
+const FINAL_HIT_PLAN_FIVE_AXIS_RE=/^world3d_(effective_v3|topspin_v1)_five_axis_sweetspot:/;
+const FINAL_HIT_PLAN_SPIN_PREFIX='world3d_topspin_v1_';
+const FINAL_HIT_PLAN_SPIN_FIELDS=['spin_c','incoming_spin_wx','incoming_spin_wy','incoming_spin_wz',
+  'outgoing_spin_wx','outgoing_spin_wy','outgoing_spin_wz'];
 const FINAL_HIT_PLAN_FINITE_FIELDS=[
   'source_ct','generated_at','contact_ht','n_points',
   'contact_rel_x','contact_rel_y','contact_rel_z',
@@ -1968,6 +1973,17 @@ const armPreds = (()=>{
         if(!Number.isInteger(p.revision)||p.revision<1) missing.push('revision');
         if(typeof p.model_fingerprint!=='string'||!FINAL_HIT_PLAN_FINGERPRINT_RE.test(p.model_fingerprint))
           missing.push('model_fingerprint');
+        const spinModel=typeof p.model_fingerprint==='string'
+          &&p.model_fingerprint.startsWith(FINAL_HIT_PLAN_SPIN_PREFIX);
+        // 臂端同口径（node/messages.hpp）：上旋指纹必须带 collision_model=spin_cross_v1，零旋指纹不得带
+        if(spinModel!==Object.prototype.hasOwnProperty.call(p,'collision_model'))
+          missing.push('collision_model与指纹不符');
+        else if(spinModel&&p.collision_model!=='spin_cross_v1')
+          missing.push('collision_model='+String(p.collision_model));
+        if(spinModel){
+          FINAL_HIT_PLAN_SPIN_FIELDS.forEach(k=>{ if(!isNum(p[k])) missing.push(k); });
+          if(isNum(p.spin_c)&&!(p.spin_c>0&&p.spin_c<1)) missing.push('spin_c(0,1)');
+        }
         FINAL_HIT_PLAN_FINITE_FIELDS.forEach(k=>{ if(!isNum(p[k])) missing.push(k); });
         if(isNum(p.source_ct)&&isNum(p.contact_ht)&&!(p.source_ct<p.contact_ht)) missing.push('source_ct<contact_ht');
         if(isNum(p.generated_at)&&isNum(p.source_ct)&&p.generated_at<p.source_ct) missing.push('generated_at>=source_ct');
@@ -2000,7 +2016,7 @@ const armPreds = (()=>{
           if(armErr>1e-4||armVErr>1e-4) missing.push('car→arm刚体变换一致性');
         }
         const fiveAxis=typeof p.model_fingerprint==='string'
-          &&p.model_fingerprint.startsWith(FINAL_HIT_PLAN_FIVE_AXIS_PREFIX);
+          &&FINAL_HIT_PLAN_FIVE_AXIS_RE.test(p.model_fingerprint);
         // 水平触球平面只对六轴成立（拍面过臂中心）；五轴拍面离臂中心 along·tan φ'，
         // 这层几何由下面的挥拍切向一并校验（φ' 取自臂的 face table，报告端不复算）。
         if(!fiveAxis&&['contact_rel_x','contact_rel_y','face_normal_yaw_world','tennis_ball_radius_m'].every(k=>isNum(p[k]))){
@@ -2042,12 +2058,17 @@ const armPreds = (()=>{
         }
         if(['incoming_vx','incoming_vy','incoming_vz','racket_contact_vx','racket_contact_vy','racket_contact_vz',
             'face_normal_nx','face_normal_ny','face_normal_nz','collision_en','collision_kt',
-            'outgoing_vx','outgoing_vy','outgoing_vz'].every(k=>isNum(p[k]))){
+            'outgoing_vx','outgoing_vy','outgoing_vz'].every(k=>isNum(p[k]))
+           &&(!spinModel||[...FINAL_HIT_PLAN_SPIN_FIELDS,'tennis_ball_radius_m'].every(k=>isNum(p[k])))){
           const vin=[p.incoming_vx,p.incoming_vy,p.incoming_vz];
           const vr=[p.racket_contact_vx,p.racket_contact_vy,p.racket_contact_vz];
           const n=[p.face_normal_nx,p.face_normal_ny,p.face_normal_nz];
           const u=vin.map((v,i)=>v-vr[i]), un=u.reduce((s,v,i)=>s+v*n[i],0);
-          const replay=vr.map((v,i)=>v+p.collision_kt*(u[i]-un*n[i])-p.collision_en*un*n[i]);
+          // 上旋加旋转项 spin_c·R·(ω_in×n)：咬合未打滑时与 Cross 模型逐式相等（spin_ball.hpp::spin_transfer）
+          const k=spinModel?p.spin_c*p.tennis_ball_radius_m:0;
+          const w=spinModel?[p.incoming_spin_wx,p.incoming_spin_wy,p.incoming_spin_wz]:[0,0,0];
+          const transfer=[k*(w[1]*n[2]-w[2]*n[1]),k*(w[2]*n[0]-w[0]*n[2]),k*(w[0]*n[1]-w[1]*n[0])];
+          const replay=vr.map((v,i)=>v+p.collision_kt*(u[i]-un*n[i])-p.collision_en*un*n[i]+transfer[i]);
           const outErr=Math.hypot(replay[0]-p.outgoing_vx,replay[1]-p.outgoing_vy,replay[2]-p.outgoing_vz);
           if(outErr>1e-4) missing.push('碰撞前向复算一致性');
         }

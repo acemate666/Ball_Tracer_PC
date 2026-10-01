@@ -36,10 +36,18 @@ CONFIG_TOPICS = {
 _TENNIS_BALL_RADIUS_M = 0.033
 # 指纹前缀 = bot_center return_hit_model.hpp 的 kContract / kContractFiveAxis：六轴臂甜点在
 # 「过臂中心、垂直拍面法向」的线上；五轴臂（v05，没有腕转）甜点绕 J1 偏 φ'，挥拍方向随之转。
+# 上旋方案（world3d_topspin_v1_*，bot_center return_topspin_racket_vz_mps>0）几何同上，碰撞换旋转模型
+# spin_cross_v1：出球 = 零旋等效（en, kt）出球 + spin_c·R·(ω_in×n)（臂 control/spin_ball.hpp，臂端同式对账）。
 _FINAL_HIT_PLAN_FINGERPRINT_RE = re.compile(
-    r"world3d_effective_v3_(arm_center|five_axis)_sweetspot:[0-9a-f]{16}\Z"
+    r"world3d_(effective_v3|topspin_v1)_(arm_center|five_axis)_sweetspot:[0-9a-f]{16}\Z"
 )
-_FINAL_HIT_PLAN_FIVE_AXIS_PREFIX = "world3d_effective_v3_five_axis_sweetspot:"
+_FINAL_HIT_PLAN_FIVE_AXIS_RE = re.compile(r"world3d_(effective_v3|topspin_v1)_five_axis_sweetspot:")
+_FINAL_HIT_PLAN_SPIN_PREFIX = "world3d_topspin_v1_"
+_FINAL_HIT_PLAN_SPIN_FIELDS = (
+    "spin_c",
+    "incoming_spin_wx", "incoming_spin_wy", "incoming_spin_wz",
+    "outgoing_spin_wx", "outgoing_spin_wy", "outgoing_spin_wz",
+)
 _GRAVITY_MPS2 = 9.8
 _STAGE1_LAMBDA_MIN = 0.02
 _STAGE1_LAMBDA_MAX = 0.40
@@ -60,7 +68,7 @@ def _valid_final_hit_plan_physics(payload: dict) -> bool:
     yaw = payload["face_normal_yaw_world"]
     pitch = payload["face_pitch"]
     horizontal_normal = (-math.sin(yaw), math.cos(yaw))
-    five_axis = payload["model_fingerprint"].startswith(_FINAL_HIT_PLAN_FIVE_AXIS_PREFIX)
+    five_axis = _FINAL_HIT_PLAN_FIVE_AXIS_RE.match(payload["model_fingerprint"]) is not None
 
     relative_error = math.sqrt(
         (payload["contact_x"] - payload["arm_center_x"] - payload["contact_rel_x"]) ** 2
@@ -168,11 +176,22 @@ def _valid_final_hit_plan_physics(payload: dict) -> bool:
     normal = tuple(payload[f"face_normal_n{axis}"] for axis in "xyz")
     relative = tuple(vin - vr for vin, vr in zip(incoming, racket))
     relative_normal = sum(value * axis for value, axis in zip(relative, normal))
+    # 上旋加旋转项 spin_c·R·(ω_in×n)：咬合未打滑时与 Cross 模型逐式相等（spin_ball.hpp::spin_transfer）
+    transfer = (0.0, 0.0, 0.0)
+    if payload["model_fingerprint"].startswith(_FINAL_HIT_PLAN_SPIN_PREFIX):
+        k = payload["spin_c"] * payload["tennis_ball_radius_m"]
+        w = tuple(payload[f"incoming_spin_w{axis}"] for axis in "xyz")
+        transfer = (
+            k * (w[1] * normal[2] - w[2] * normal[1]),
+            k * (w[2] * normal[0] - w[0] * normal[2]),
+            k * (w[0] * normal[1] - w[1] * normal[0]),
+        )
     replay = tuple(
         vr
         + payload["collision_kt"] * (value - relative_normal * axis)
         - payload["collision_en"] * relative_normal * axis
-        for vr, value, axis in zip(racket, relative, normal)
+        + extra
+        for vr, value, axis, extra in zip(racket, relative, normal, transfer)
     )
     return math.sqrt(
         sum(
@@ -251,6 +270,16 @@ def _report_prediction_payload(payload: dict) -> dict | None:
         or payload["compensated_speed"] <= 0
         or payload["collision_en"] < 0
         or payload["collision_kt"] < 0
+    ):
+        return None
+    # 臂端同口径（arm_controller node/messages.hpp）：上旋指纹必须带 collision_model=spin_cross_v1，零旋指纹不得带
+    spin_model = payload["model_fingerprint"].startswith(_FINAL_HIT_PLAN_SPIN_PREFIX)
+    if spin_model != ("collision_model" in payload):
+        return None
+    if spin_model and (
+        payload["collision_model"] != "spin_cross_v1"
+        or not all(_finite(payload.get(key)) for key in _FINAL_HIT_PLAN_SPIN_FIELDS)
+        or not 0.0 < payload["spin_c"] < 1.0
     ):
         return None
     if not _valid_final_hit_plan_physics(payload):

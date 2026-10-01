@@ -456,7 +456,7 @@ def test_report_surfaces_plan_physics_and_disables_new_contract_fallback():
         "racket_contact_vx", "face_normal_nx",
     ):
         assert field in source
-    assert "world3d_effective_v3_(arm_center|five_axis)_sweetspot:[0-9a-f]{16}" in source
+    assert "world3d_(effective_v3|topspin_v1)_(arm_center|five_axis)_sweetspot:[0-9a-f]{16}" in source
     assert "碰撞 / 求解" in source
 
 
@@ -552,3 +552,153 @@ def test_report_accepts_five_axis_plan_and_matches_ack(tmp_path):
     assert any("bad-racket#1" in e and "拍心世界水平速度" in e and "水平触球平面" not in e
                for e in errors)
     assert any("mirror#1" in e and "J1 前侧" in e for e in errors)
+
+
+# 上旋（spin_cross_v1）：臂 control/spin_ball.hpp 的 Cross 咬合碰撞原样移植。夹具走完整模型（含摩擦上限），
+# 报告端用「零旋等效（kt = 1−c）+ spin_c·R·(ω_in×n)」对账——咬合未打滑时两者逐式相等，夹具顺带对拍这一点。
+_SPIN_ALPHA = 0.58
+_SPIN_EX = 0.08
+_SPIN_MU = 0.40
+_SPIN_FIELDS = (
+    "collision_model", "spin_c",
+    "incoming_spin_wx", "incoming_spin_wy", "incoming_spin_wz",
+    "outgoing_spin_wx", "outgoing_spin_wy", "outgoing_spin_wz",
+)
+
+
+def _cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+
+def _cross_collide(incoming, spin, racket, normal, en, radius):
+    u = [vin - vr for vin, vr in zip(incoming, racket)]
+    un = sum(a * b for a, b in zip(u, normal))
+    assert un < 0.0  # 来球压向拍面
+    slip = [ui - radius * wi for ui, wi in zip(u, _cross(spin, normal))]
+    sn = sum(a * b for a, b in zip(slip, normal))
+    slip = [si - sn * ni for si, ni in zip(slip, normal)]
+    c = _SPIN_ALPHA * (1.0 + _SPIN_EX) / (1.0 + _SPIN_ALPHA)
+    dt = [-c * si for si in slip]
+    limit = _SPIN_MU * (1.0 + en) * (-un)
+    magnitude = math.sqrt(sum(d * d for d in dt))
+    grip = magnitude <= limit
+    if not grip:
+        dt = [d * limit / magnitude for d in dt]
+    dspin = _cross(normal, dt)
+    velocity = tuple(
+        vr + ui - (1.0 + en) * un * ni + di for vr, ui, ni, di in zip(racket, u, normal, dt)
+    )
+    spin_out = tuple(wi - ds / (_SPIN_ALPHA * radius) for wi, ds in zip(spin, dspin))
+    return velocity, spin_out, grip
+
+
+def _topspin_plan(
+    plan_id: str = "throw42", revision: int = 3, *, five_axis: bool = True, racket_vz: float = 5.0
+) -> dict:
+    """上旋方案（bot_center return_topspin_racket_vz_mps>0）：几何同零旋夹具，拍头竖直速度 racket_vz；
+    来球按弹地后滚动上旋 ω = (ẑ×v_h)/R；kt 写等效 1−c、spin_c 写 c（hit_plan_codec.cpp 同式）。"""
+    plan = _five_axis_plan(plan_id, revision) if five_axis else _plan(plan_id, revision)
+    radius = plan["tennis_ball_radius_m"]
+    spin_c = _SPIN_ALPHA * (1.0 + _SPIN_EX) / (1.0 + _SPIN_ALPHA)
+    incoming = tuple(plan[f"incoming_v{axis}"] for axis in "xyz")
+    spin_in = (-incoming[1] / radius, incoming[0] / radius, 0.0)
+    racket = (plan["racket_contact_vx"], plan["racket_contact_vy"], racket_vz)
+    normal = tuple(plan[f"face_normal_n{axis}"] for axis in "xyz")
+    outgoing, spin_out, grip = _cross_collide(
+        incoming, spin_in, racket, normal, plan["collision_en"], radius
+    )
+    assert grip
+    shape = "five_axis" if five_axis else "arm_center"
+    plan.update(
+        model_fingerprint=f"world3d_topspin_v1_{shape}_sweetspot:718619524b4bab8b",
+        collision_model="spin_cross_v1",
+        spin_c=spin_c,
+        collision_kt=1.0 - spin_c,
+        racket_contact_vz=racket_vz,
+        incoming_spin_wx=spin_in[0], incoming_spin_wy=spin_in[1], incoming_spin_wz=spin_in[2],
+        outgoing_spin_wx=spin_out[0], outgoing_spin_wy=spin_out[1], outgoing_spin_wz=spin_out[2],
+        outgoing_vx=outgoing[0], outgoing_vy=outgoing[1], outgoing_vz=outgoing[2],
+    )
+    return plan
+
+
+@pytest.mark.parametrize("five_axis", [True, False])
+def test_rk_extractor_accepts_topspin_plan(five_axis):
+    plan = _topspin_plan(five_axis=five_axis)
+    mapped = _report_prediction_payload(plan)
+    assert mapped is not None
+    assert [mapped[k] for k in ("rel_x", "rel_y", "rel_z")] == pytest.approx(
+        [plan["contact_rel_x"], plan["contact_rel_y"], plan["contact_rel_z"]]
+    )
+    assert mapped["spin_c"] == plan["spin_c"]
+
+
+def test_zero_spin_reconciliation_cannot_pass_a_topspin_plan():
+    # 去掉旋转字段按零旋对账就对不上（旋转项量级 m/s）：夹具确实用到了旋转碰撞，不是零旋换个指纹
+    plan = _topspin_plan()
+    normal = tuple(plan[f"face_normal_n{axis}"] for axis in "xyz")
+    spin_in = tuple(plan[f"incoming_spin_w{axis}"] for axis in "xyz")
+    transfer = [plan["spin_c"] * plan["tennis_ball_radius_m"] * v for v in _cross(spin_in, normal)]
+    assert math.sqrt(sum(v * v for v in transfer)) > 1.0
+    for key in _SPIN_FIELDS:
+        del plan[key]
+    plan["model_fingerprint"] = "world3d_effective_v3_five_axis_sweetspot:718619524b4bab8b"
+    assert _report_prediction_payload(plan) is None
+
+
+def test_zero_spin_plan_must_not_carry_a_collision_model():
+    plan = _five_axis_plan()
+    plan["collision_model"] = "spin_cross_v1"
+    assert _report_prediction_payload(plan) is None
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda p: p.pop("collision_model"),
+        lambda p: p.update(collision_model="spin_cross_v2"),
+        lambda p: p.update(spin_c=0.0),
+        lambda p: p.update(spin_c=1.0),
+        lambda p: p.pop("incoming_spin_wz"),
+        lambda p: p.update(outgoing_spin_wx=float("nan")),
+        # 旋转项对不上：来球转速差 1 rad/s ⇒ 出球差 spin_c·R ≈ 0.013 m/s
+        lambda p: p.update(incoming_spin_wx=p["incoming_spin_wx"] + 1.0),
+        lambda p: p.update(outgoing_vz=p["outgoing_vz"] + 0.001),
+        # 上旋方案贴零旋指纹：零旋方案不得带 collision_model
+        lambda p: p.update(
+            model_fingerprint="world3d_effective_v3_five_axis_sweetspot:718619524b4bab8b"),
+        lambda p: p.update(model_fingerprint="world3d_topspin_v2_five_axis_sweetspot:718619524b4bab8b"),
+    ],
+)
+def test_rk_extractor_rejects_invalid_topspin_plan(mutate):
+    plan = _topspin_plan()
+    mutate(plan)
+    assert _report_prediction_payload(plan) is None
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_report_accepts_topspin_plan_and_matches_ack(tmp_path):
+    good = _topspin_plan("tsgood", 1)
+    no_model = _topspin_plan("no-model", 1)
+    del no_model["collision_model"]
+    bad_spin = _topspin_plan("bad-spin", 1)
+    bad_spin["incoming_spin_wx"] += 1.0
+    flat_with_model = {**_five_axis_plan("flat-model", 1), "collision_model": "spin_cross_v1"}
+    events = [
+        {"t": 0.0, "topic": "/predict_hit_pos", "text": json.dumps(good)},
+        {"t": 0.01, "topic": "/predict_hit_pos", "text": json.dumps(no_model)},
+        {"t": 0.02, "topic": "/predict_hit_pos", "text": json.dumps(bad_spin)},
+        {"t": 0.03, "topic": "/predict_hit_pos", "text": json.dumps(flat_with_model)},
+        {"t": 0.05, "topic": "/tennis/status", "text":
+         f"accepted hit x={good['arm_target_rel_x']:.4f} z={good['arm_target_rel_z']:.4f} "
+         "duration=0.5500 plan_id=tsgood revision=1 contact_ht=100.600000 solve_ms=1.380"},
+    ]
+    result = _run_plan_parse(tmp_path, events)
+    assert result["plans"] == ["tsgood"]
+    assert result["acks"] == ["tsgood"]
+    assert result["ackErrors"] == []
+    errors = result["contractErrors"]
+    assert len(errors) == 3
+    assert any("no-model#1" in e and "collision_model与指纹不符" in e for e in errors)
+    assert any("bad-spin#1" in e and "碰撞前向复算一致性" in e for e in errors)
+    assert any("flat-model#1" in e and "collision_model与指纹不符" in e for e in errors)
