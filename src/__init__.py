@@ -7,7 +7,7 @@ src — 网球追踪系统核心模块。
   ball_detector  YOLO 网球检测（支持 TensorRT/ONNX/PyTorch 后端）
   ball_localizer 多视图三角测量 3D 定位（网球）
   car_localizer  AprilTag 多视图定位（车辆）
-  curve3         轨迹拟合与击球点预测
+  curve4         轨迹拟合与击球点预测（带空气阻力的 Curve4Tracker）
 
 标定模块已移至 calibration/ 子项目。
 """
@@ -25,11 +25,10 @@ from .ball_localizer import Ball3D, BallLocalizer
 from .car_localizer import CarDetection, CarLoc, CarLocalizer
 from .stationary_filter import StationaryObjectFilter
 from .tile_manager import TileManager, TileRect
-from .curve3 import (
-    BallObservation, PredictHitPos, Curve3Tracker, FittedCurve, fit_curve,
+from .curve4 import (
+    BallObservation, PredictHitPos, Curve4Tracker, DragFit, K_DRAG as K_DRAG_CURVE4, fit_curve,
     TrackerState, TrackerResult,
 )
-from .curve4 import Curve4Tracker, DragFit, K_DRAG as K_DRAG_CURVE4
 
 __all__ = [
     "Frame",
@@ -49,8 +48,6 @@ __all__ = [
     "StationaryObjectFilter",
     "BallObservation",
     "PredictHitPos",
-    "Curve3Tracker",
-    "FittedCurve",
     "fit_curve",
     "TrackerState",
     "TrackerResult",

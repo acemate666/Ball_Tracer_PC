@@ -44,7 +44,6 @@ import os
 import queue
 import re
 import shutil
-import socket
 import subprocess
 import sys
 import threading
@@ -345,78 +344,11 @@ class NullRos2Sink:
     def publish_car_loc(self, payload: dict) -> None:
         return None
 
-    def publish_predict_hit(self, payload: dict) -> None:
-        return None
-
     def clock_bridge(self) -> dict | None:
         return None
 
     def close(self) -> None:
         return None
-
-
-class UdpBridgeRos2Sink:
-    mode = "bridge"
-
-    def __init__(self) -> None:
-        self._sock_car = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock_hit = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._addr_car = ("127.0.0.1", 5858)
-        self._addr_hit = ("127.0.0.1", 5859)
-        self._proc_car: subprocess.Popen | None = None
-        self._proc_hit: subprocess.Popen | None = None
-
-        bat_car = _ROOT / "ros2" / "run_car_loc.bat"
-        if bat_car.exists():
-            try:
-                self._proc_car = subprocess.Popen(
-                    [str(bat_car)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
-                )
-                print(f"  ROS2 桥接已启动 (PID={self._proc_car.pid})")
-            except Exception as e:
-                print(f"  ROS2 桥接启动失败: {e}")
-        else:
-            print(f"  ROS2 桥接脚本不存在，跳过: {bat_car}")
-
-        bat_hit = _ROOT / "ros2" / "run_predict_hit.bat"
-        if bat_hit.exists():
-            try:
-                self._proc_hit = subprocess.Popen(
-                    [str(bat_hit)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
-                )
-                print(f"  ROS2 predict_hit 桥接已启动 (PID={self._proc_hit.pid})")
-            except Exception as e:
-                print(f"  ROS2 predict_hit 桥接启动失败: {e}")
-        else:
-            print(f"  ROS2 predict_hit 桥接脚本不存在，跳过: {bat_hit}")
-
-    def publish_car_loc(self, payload: dict) -> None:
-        try:
-            self._sock_car.sendto(json.dumps(payload).encode(), self._addr_car)
-        except OSError:
-            pass
-
-    def publish_predict_hit(self, payload: dict) -> None:
-        try:
-            self._sock_hit.sendto(json.dumps(payload).encode(), self._addr_hit)
-        except OSError:
-            pass
-
-    def clock_bridge(self) -> dict | None:
-        return None
-
-    def close(self) -> None:
-        self._sock_car.close()
-        self._sock_hit.close()
-        for proc in (self._proc_car, self._proc_hit):
-            _terminate_process_tree(proc)
-        print("  ROS2 桥接已关闭")
 
 
 class RosbagRecorderProcess:
@@ -762,9 +694,6 @@ class DirectRos2Sink:
             f"tag_id={payload.get('tag_id')}",
             flush=True,
         )
-
-    def publish_predict_hit(self, payload: dict) -> None:
-        return None
 
     def close(self) -> None:
         self._spin_stop.set()
@@ -2029,7 +1958,7 @@ def main() -> int:
         help="实时显示拼接画面（按 q 退出）")
     parser.add_argument(
         "--ros2-mode",
-        choices=("auto", "direct", "bridge", "off"),
+        choices=("direct", "off"),
         default="direct",
         help="ROS2 output mode",
     )
@@ -2897,22 +2826,6 @@ def main() -> int:
                         prediction=None,
                         state=tracker.tracker_state,
                     )
-
-                # ── 发布 /predict_hit_pos（线1 延迟敏感出口）──
-                if tracker_result.prediction is not None:
-                    p = tracker_result.prediction
-                    _ros2_sink.publish_predict_hit({
-                        "x": round(p.x, 4),
-                        "y": round(p.y, 4),
-                        "z": round(p.z, 4),
-                        "vx": round(p.vx, 4),
-                        "vy": round(p.vy, 4),
-                        "vz": round(p.vz, 4),
-                        "stage": p.stage,
-                        "ct": round(p.ct, 6),
-                        "ht": round(p.ht, 6),
-                        "duration": round(p.ht - p.ct, 4),
-                    })
 
                 # ── 投递归档线程（线3，非阻塞，只传业务数据）──
                 archive_thread.submit(ArchiveJob(
