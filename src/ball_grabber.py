@@ -26,7 +26,8 @@
 
 高速相机（相机配置 high_speed_camera，可选）：
   - 一台相机裁小 ROI、按 N 倍帧率跑（如 405 1328×680 @120 = 3×40），其余相机不动
-  - 靠 action 组掩码分频：高速相机认 group_mask|0x2，触发环每格发 0x2、每 N 格发全组
+  - 靠 action 组掩码分频：高速相机认 group_mask|0x2，触发环每格发 0x2、每 N 格发全组；
+    触发环在独立子进程里跑（ActionTriggerProcess），不跟 tracker 的线程抢 GIL
   - 它的每一帧经 ImageGrabber.frame_sink 进 HighSpeedStream（不走"只留最新"的排空），
     原样写盘（HighSpeedRecorder）；与其余相机同拍的那一帧按曝光时刻配进同步组，
     贴回全幅画布（pad_roi_frame），下游像素坐标与标定逐点一致
@@ -1085,6 +1086,124 @@ class ActionTriggerLoop(threading.Thread):
         return out
 
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+class ActionTriggerProcess:
+    """ActionTriggerLoop 搬到独立子进程（HIGH 优先级）里跑，接口同 ActionTriggerLoop（start/join/stats）。
+
+    tracker 进程里十几条线程抢 GIL，触发线程醒来常要等别人让出：2026-10-06 ASUS 真 tracker
+    （405 120Hz）同进程跑，每秒 ~9 格迟到超过 0.55 ms 被跳掉（8%），GIL 切换间隔压到 0.5 ms
+    也只是从 1454 格降到 593 格。子进程里只有这一条线程要 GIL，主线程阻塞在 stdin 上。
+
+    协议：stdin 第一行 = ActionTriggerLoop 参数（JSON）；子进程起好触发后回一行 ``ready``；
+    之后父进程写任意一行或关管道 = 停；子进程把 stats（JSON 一行）写到 stdout 后退出。
+    父进程死了管道就断，子进程读到 EOF 自己停，不会对着相机一直发。
+    """
+
+    def __init__(self, *, params: dict, dry_run: bool = False) -> None:
+        # 参数在父进程先校验一遍：配错了在开场就抛，别等子进程起来才发现
+        ActionTriggerLoop(stop_event=threading.Event(), **params)
+        self._params = dict(params)
+        self._dry_run = bool(dry_run)
+        self._proc: Optional[Any] = None
+        self._final: Optional[dict] = None
+
+    def start(self, *, ready_timeout_s: float = 20.0) -> None:
+        import subprocess
+
+        code = (
+            "import sys; sys.path.insert(0, {root!r}); "
+            "from src.ball_grabber import _action_trigger_child_main; _action_trigger_child_main()"
+        ).format(root=str(_REPO_ROOT))
+        self._proc = subprocess.Popen(
+            [sys.executable, "-u", "-c", code],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            # 不吃控制台 Ctrl+C：停只走 stdin 协议，保证父进程收尾时还能拿到统计
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        )
+        assert self._proc.stdin is not None and self._proc.stdout is not None
+        self._proc.stdin.write(json.dumps({**self._params, "dry_run": self._dry_run}) + "\n")
+        self._proc.stdin.flush()
+        ready: list[str] = []
+
+        def _wait_ready() -> None:
+            for line in self._proc.stdout:
+                if line.strip() == "ready":
+                    ready.append(line)
+                    return
+                print(f"[trigger-proc] {line.rstrip()}")
+
+        waiter = threading.Thread(target=_wait_ready, daemon=True)
+        waiter.start()
+        waiter.join(timeout=ready_timeout_s)
+        if not ready:
+            self._proc.kill()
+            raise RuntimeError(
+                f"触发子进程 {ready_timeout_s:g}s 内没回 ready（exit={self._proc.poll()}），看上面 stderr"
+            )
+
+    def join(self, timeout: float = 5.0) -> None:
+        if self._proc is None or self._final is not None:
+            return
+        import subprocess
+
+        try:
+            self._proc.stdin.write("stop\n")
+            self._proc.stdin.flush()
+        except OSError:
+            pass
+        try:
+            out, _ = self._proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+            out, _ = self._proc.communicate()
+        stats_lines = [line for line in (out or "").splitlines() if line.startswith("{")]
+        self._final = (
+            json.loads(stats_lines[-1]) if stats_lines
+            else {"error": f"trigger process exited {self._proc.returncode} without stats"}
+        )
+        self._final["process"] = "subprocess"
+
+    def is_alive(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def stats(self) -> dict:
+        return dict(self._final) if self._final is not None else {"running": self.is_alive()}
+
+
+def _action_trigger_child_main() -> None:
+    """ActionTriggerProcess 的子进程入口（见其文档里的协议）。"""
+    params = json.loads(sys.stdin.readline())
+    dry_run = bool(params.pop("dry_run", False))
+    if os.name == "nt":
+        try:
+            kernel32 = ctypes.windll.kernel32
+            kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), 0x00000080)  # HIGH_PRIORITY_CLASS
+        except Exception:
+            pass
+    if not dry_run:
+        MvCamera.MV_CC_Initialize()
+    stop = threading.Event()
+    loop = ActionTriggerLoop(stop_event=stop, **params)
+    if dry_run:
+        loop._issue = lambda _mask: None  # 单测：不往网上发 action 包
+    loop.start()
+    print("ready", flush=True)
+    try:
+        sys.stdin.readline()
+    except KeyboardInterrupt:
+        pass
+    stop.set()
+    loop.join(timeout=2.0)
+    print(json.dumps(loop.stats()), flush=True)
+    if not dry_run:
+        MvCamera.MV_CC_Finalize()
+
+
 # ───────────────── 高速相机 ─────────────────
 
 
@@ -1096,13 +1215,6 @@ HIGH_SPEED_GROUP_BIT = 0x2
 _HIGH_SPEED_PERIOD_MARGIN_S = 0.0001
 #: 同步组配高速帧时最多等多久。高速帧小（0.9 MB vs 2.85 MB），通常比普通帧先到。
 _HIGH_SPEED_SYNC_WAIT_S = 0.012
-#: 高速模式下整个采集期间的 GIL 切换间隔（Python 默认 5 ms），开相机之前就设、close 时恢复。
-#: 120Hz 每格只有 ~0.55 ms 迟到容忍，触发线程醒来等 GIL 要等到别人让出：2026-10-06 ASUS 实测
-#: 只加 1 条纯 Python 忙线程，默认 5 ms 下 120Hz 只发出 44Hz、几乎每格迟到 >2 ms；压到 0.5 ms
-#: 后 4 条忙线程仍 119.95Hz、20 s 只跳 3 格。必须在 grabber 启动之前设：各相机开流时的
-#: PC↔设备时钟校准（calibrate_time_offset 量往返）在 5 ms 下被忙线程拖偏几 ms，四台曝光时刻
-#: 对不齐、同步组整组被丢（同一实验只在触发环里压时，30 s 只拼出 6 组）。
-_HIGH_SPEED_GIL_SWITCH_INTERVAL_S = 0.0005
 
 
 @dataclass(frozen=True)
@@ -1470,15 +1582,10 @@ class SyncCapture:
         self._hs_stream: Optional[HighSpeedStream] = None
         self._hs_recorder: Optional[HighSpeedRecorder] = None
         self._hs_info: Optional[dict] = None
-        # 高速模式：开相机（及各 grabber 的时钟校准）之前压 GIL 切换间隔，close() 恢复
-        self._restore_switch_interval: Optional[float] = None
-        if hs is not None:
-            self._restore_switch_interval = sys.getswitchinterval()
-            sys.setswitchinterval(min(self._restore_switch_interval, _HIGH_SPEED_GIL_SWITCH_INTERVAL_S))
 
         self._cameras: dict[str, Any] = {}
         self._grabbers: dict[str, ImageGrabber] = {}
-        self._action_trigger: Optional[ActionTriggerLoop] = None
+        self._action_trigger: Optional[ActionTriggerLoop | ActionTriggerProcess] = None
         self._stop = threading.Event()
         self._exposure_spread_discards = 0
         self._arrival_spread_discards = 0
@@ -1593,9 +1700,9 @@ class SyncCapture:
                 else:
                     # 两条下限都按相机实测的 ResultingFrameRate 排，不按配置的 acquisition_frame_rate：
                     # 普通相机 ROI 1392 行时配置写 48、实际只给 41.21（单台 1GbE），按 48 排会把
-                    # 会被吞掉的触发当成合法的发出去
-                    self._action_trigger = ActionTriggerLoop(
-                        stop_event=self._stop,
+                    # 会被吞掉的触发当成合法的发出去。120Hz 每格迟到容忍只剩 ~0.55 ms，在本进程里
+                    # 抢不到 GIL，所以触发环放子进程（见 ActionTriggerProcess）。
+                    self._action_trigger = ActionTriggerProcess(params=dict(
                         fps=self._fps * hs.rate_multiplier,
                         acquisition_frame_rate=self._hs_info["resulting_fps"][hs.serial],
                         device_key=action_device_key,
@@ -1610,7 +1717,7 @@ class SyncCapture:
                         minimum_period_margin_s=_HIGH_SPEED_PERIOD_MARGIN_S,
                         broadcast_address=action_broadcast_address,
                         timeout_ms=action_timeout_ms,
-                    )
+                    ))
                 self._action_trigger.start()
         except Exception:
             self.close()
@@ -1889,7 +1996,8 @@ class SyncCapture:
         """停止所有 grabber 并关闭所有相机。"""
         self._stop.set()
         if self._action_trigger is not None:
-            self._action_trigger.join(timeout=1.0)
+            # 子进程版要走一趟 stdin 停止协议 + 回传统计，给足时间（线程版几 ms 就停）
+            self._action_trigger.join(timeout=5.0)
         for g in self._grabbers.values():
             g.stop()
         for g in self._grabbers.values():
@@ -1909,9 +2017,6 @@ class SyncCapture:
             MvCamera.MV_CC_Finalize()
         except Exception:
             pass
-        if self._restore_switch_interval is not None:
-            sys.setswitchinterval(self._restore_switch_interval)
-            self._restore_switch_interval = None
 
     def __enter__(self):
         return self

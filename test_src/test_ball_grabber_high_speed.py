@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import struct
-import sys
 import threading
 import time
 import types
@@ -20,6 +19,7 @@ from src.ball_grabber import (
     HIGH_SPEED_GROUP_BIT,
     HIGH_SPEED_INDEX_FORMAT,
     ActionTriggerLoop,
+    ActionTriggerProcess,
     Frame,
     HighSpeedConfig,
     HighSpeedRecorder,
@@ -348,9 +348,7 @@ def test_get_frames_puts_a_black_canvas_when_the_sync_frame_is_missing():
     assert abs(hs.exposure_start_pc - 10.0) < 0.001
 
 
-def test_close_restores_the_gil_switch_interval(monkeypatch):
-    """高速模式开相机前把 GIL 切换间隔压到 0.5 ms（见 _HIGH_SPEED_GIL_SWITCH_INTERVAL_S），
-    close 必须还原——tracker 进程后面的收尾/后处理不该被它拖着。"""
+def test_close_keeps_the_final_stats_after_everything_is_torn_down(monkeypatch):
     cap = _capture_with_high_speed(_slow_set(10.0), _stream_with([]))
     cap._stop = threading.Event()
     cap._action_trigger = None
@@ -358,15 +356,40 @@ def test_close_restores_the_gil_switch_interval(monkeypatch):
     cap._hs_recorder = None
     cap._final_stats = None
     monkeypatch.setattr(ball_grabber, "MvCamera", types.SimpleNamespace(MV_CC_Finalize=lambda: 0))
-    before = sys.getswitchinterval()
-    try:
-        sys.setswitchinterval(0.0005)
-        cap._restore_switch_interval = before
-        cap.close()
-        assert sys.getswitchinterval() == pytest.approx(before)
-        assert cap.stats()["high_speed"]["serial"] == "DB0260405"
-    finally:
-        sys.setswitchinterval(before)
+    cap.close()
+    cap.close()                                    # 第二次 close 不能把快照冲掉
+    assert cap._grabbers == {}
+    assert cap.stats()["high_speed"]["serial"] == "DB0260405"
+    assert set(cap.stats()["per_camera"]) == {"DB0260414", "DB0260373", "DB0260378", "DB0260405"}
+
+
+def _hs_trigger_params() -> dict:
+    return dict(
+        fps=120.0, acquisition_frame_rate=FAST_CEILING, device_key=1, group_key=1, group_mask=1,
+        broadcast_address="255.255.255.255", timeout_ms=0, sync_every=3,
+        fast_group_mask=HIGH_SPEED_GROUP_BIT, sync_minimum_period_s=1.0 / SLOW_CEILING + MARGIN,
+        minimum_period_margin_s=MARGIN,
+    )
+
+
+def test_trigger_subprocess_runs_the_grid_and_reports_back():
+    """子进程里跑真的 ActionTriggerLoop（dry_run：不往网上发 action 包），stdin 停、stdout 回统计。"""
+    proc = ActionTriggerProcess(params=_hs_trigger_params(), dry_run=True)
+    proc.start()
+    assert proc.is_alive()
+    time.sleep(0.5)
+    proc.join(timeout=10.0)
+    stats = proc.stats()
+    assert not proc.is_alive()
+    assert stats["process"] == "subprocess"
+    assert stats["issued"] >= 40                        # 0.5 s × 120 Hz ≈ 60
+    assert abs(stats["issued_sync"] - stats["issued"] / 3) <= 2
+    assert stats["slot_fps"] == 120.0
+
+
+def test_trigger_subprocess_rejects_bad_params_before_spawning():
+    with pytest.raises(ValueError, match="slow cameras"):
+        ActionTriggerProcess(params={**_hs_trigger_params(), "sync_every": 2})
 
 
 def test_open_camera_moves_offset_x_after_shrinking_width(monkeypatch):
