@@ -392,6 +392,47 @@ def test_trigger_subprocess_rejects_bad_params_before_spawning():
         ActionTriggerProcess(params={**_hs_trigger_params(), "sync_every": 2})
 
 
+class _ModelCamera:
+    """按 1006 实测模型报 ResultingFrameRate：min(117.5e6/(W·H), 1/(H·8.0µs+0.94ms))。"""
+
+    def __init__(self, **roi):
+        self.nodes = {"OffsetX": 720, "OffsetY": 268, "Width": 1328, "Height": 680, **roi}
+        self.width_min = 32
+
+    def MV_CC_GetIntValueEx(self, node, val):
+        val.nCurValue = self.nodes[node]
+        val.nMin = self.width_min if node == "Width" else 0
+        return 0
+
+    def MV_CC_SetIntValue(self, node, value):
+        self.nodes[node] = int(value)
+        return 0
+
+    def MV_CC_GetFloatValue(self, node, val):
+        assert node == "ResultingFrameRate"
+        w, h = self.nodes["Width"], self.nodes["Height"]
+        val.fCurValue = min(117.5e6 / (w * h), 1.0 / (h * 8.0e-6 + 0.94e-3))
+        return 0
+
+
+def test_sensor_frame_rate_is_read_with_the_link_out_of_the_way_and_roi_restored():
+    cam = _ModelCamera()
+    assert ball_grabber.read_resulting_frame_rate(cam, "405") == pytest.approx(117.5e6 / (1328 * 680), rel=1e-5)
+    assert ball_grabber.read_sensor_frame_rate(cam, "405") == pytest.approx(1 / (680 * 8.0e-6 + 0.94e-3), rel=1e-5)
+    assert cam.nodes == {"OffsetX": 720, "OffsetY": 268, "Width": 1328, "Height": 680}
+
+
+def test_sensor_frame_rate_refuses_to_leave_the_roi_changed():
+    class Stuck(_ModelCamera):
+        def MV_CC_SetIntValue(self, node, value):
+            if node == "OffsetX" and value == 720:     # 还原偏移被相机拒
+                return 0x80000102
+            return super().MV_CC_SetIntValue(node, value)
+
+    with pytest.raises(RuntimeError, match="没还原"):
+        ball_grabber.read_sensor_frame_rate(Stuck(), "405")
+
+
 def test_open_camera_moves_offset_x_after_shrinking_width(monkeypatch):
     calls = []
 
@@ -415,7 +456,12 @@ def test_open_camera_moves_offset_x_after_shrinking_width(monkeypatch):
             calls.append((node, value))
             return 0
 
+        def MV_CC_SetImageNodeNum(self, n):
+            calls.append(("ImageNodeNum", n))
+            return 0
+
         def MV_CC_StartGrabbing(self):
+            calls.append(("StartGrabbing", None))
             return 0
 
     device_info = ball_grabber.MV_CC_DEVICE_INFO()
@@ -426,8 +472,11 @@ def test_open_camera_moves_offset_x_after_shrinking_width(monkeypatch):
     monkeypatch.setattr(ball_grabber, "MvCamera", FakeCamera)
     monkeypatch.setattr(ball_grabber, "_serial_of", lambda *_args: "camera")
     ball_grabber.open_camera("camera", trigger_source=None, _st_dev_list=device_list,
-                             roi_offset_x=720, roi_width=1328, roi_offset_y=268, roi_height=680)
+                             roi_offset_x=720, roi_width=1328, roi_offset_y=268, roi_height=680,
+                             image_node_num=32)
     x_calls = [c for c in calls if c[0] in ("OffsetX", "Width")]
     y_calls = [c for c in calls if c[0] in ("OffsetY", "Height")]
     assert x_calls == [("OffsetX", 0), ("Width", 1328), ("OffsetX", 720)]
     assert y_calls == [("OffsetY", 0), ("Height", 680), ("OffsetY", 268)]
+    # SDK 缓存节点数必须在起流之前设
+    assert calls[-2:] == [("ImageNodeNum", 32), ("StartGrabbing", None)]

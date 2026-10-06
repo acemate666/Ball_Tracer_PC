@@ -372,6 +372,8 @@ def open_camera(
     reverse_y: Optional[bool] = None,
     # 广播触发的频率（不是 AcquisitionFrameRate）。给了就在开场校验传感器给得起。
     trigger_fps: float = 0.0,
+    # SDK 内部取流缓存节点数（0 = SDK 默认）。取流线程抢不到 GIL 时靠它攒几帧不丢
+    image_node_num: int = 0,
     _st_dev_list=None,
 ) -> Any:
     """
@@ -652,6 +654,9 @@ def open_camera(
         _check(cam.MV_CC_SetBoolValue("ReverseX", bool(reverse_x)), f"ReverseX={reverse_x}")
         _check(cam.MV_CC_SetBoolValue("ReverseY", bool(reverse_y)), f"ReverseY={reverse_y}")
 
+        if image_node_num > 0:
+            _check(cam.MV_CC_SetImageNodeNum(int(image_node_num)), f"SetImageNodeNum({image_node_num})")
+
         _check(cam.MV_CC_StartGrabbing(), f"StartGrabbing({serial})")
         return cam
 
@@ -696,6 +701,30 @@ def read_roi(cam: Any, serial: str) -> dict[str, int]:
         _check(cam.MV_CC_GetIntValueEx(node, val), f"{node}({serial})")
         out[node] = int(val.nCurValue)
     return out
+
+
+def read_sensor_frame_rate(cam: Any, serial: str) -> float:
+    """当前 ROI 高度下**传感器自己**的帧率上限：宽度临时压到最小、链路不再卡，读回
+    ResultingFrameRate，再还原 OffsetX/Width。只能在停流时调（改 Width 要停流）。
+
+    相机按它决定一次触发收不收：ResultingFrameRate 只是单台 1GbE 的**平均**上限，单次
+    两帧挨得近一点，只要传感器读得出来相机就先缓存着慢慢发。2026-10-06 ASUS 真 tracker：
+    405 按链路上限 130.07 fps 排触发，每格迟到 >0.55 ms 就跳，60 s 跳 593~1454 格；改按传感器
+    156.8 fps 排，0 跳格、相机照单全收。
+    """
+    roi = read_roi(cam, serial)
+    width = MVCC_INTVALUE_EX()
+    _check(cam.MV_CC_GetIntValueEx("Width", width), f"Width({serial})")
+    try:
+        _check(cam.MV_CC_SetIntValue("OffsetX", 0), f"OffsetX=0({serial})")
+        _check(cam.MV_CC_SetIntValue("Width", int(width.nMin)), f"Width={width.nMin}({serial})")
+        fps = read_resulting_frame_rate(cam, serial)
+    finally:
+        cam.MV_CC_SetIntValue("Width", roi["Width"])
+        cam.MV_CC_SetIntValue("OffsetX", roi["OffsetX"])
+    if read_roi(cam, serial) != roi:
+        raise RuntimeError(f"相机 {serial} 量完传感器帧率后 ROI 没还原：要 {roi}，实际 {read_roi(cam, serial)}")
+    return fps
 
 
 # ───────────────── Grabber ─────────────────
@@ -1215,6 +1244,11 @@ HIGH_SPEED_GROUP_BIT = 0x2
 _HIGH_SPEED_PERIOD_MARGIN_S = 0.0001
 #: 同步组配高速帧时最多等多久。高速帧小（0.9 MB vs 2.85 MB），通常比普通帧先到。
 _HIGH_SPEED_SYNC_WAIT_S = 0.012
+#: 高速模式下 SDK 取流缓存节点数（高速相机 / 其余相机），都约合 0.2~0.27 s 的帧。
+#: 1006 真 tracker 冒烟：SDK 默认节点下 405 每分钟 ~23 帧、其余 ~12 帧帧号跳号——取流线程
+#: 在 tracker 进程里等 GIL，SDK 缓存满了就丢。
+_HIGH_SPEED_IMAGE_NODES = 32
+_SLOW_IMAGE_NODES_WITH_HIGH_SPEED = 8
 
 
 @dataclass(frozen=True)
@@ -1644,6 +1678,7 @@ class SyncCapture:
                         cam_group_mask = int(action_group_mask) | HIGH_SPEED_GROUP_BIT
                         cam_frame_rate = hs.acquisition_frame_rate
                         cam_trigger_fps = self._fps * hs.rate_multiplier
+                        cam_image_nodes = _HIGH_SPEED_IMAGE_NODES
                     else:
                         roi_kwargs = dict(
                             roi_offset_y=params.get("roi_offset_y", 0),
@@ -1653,6 +1688,7 @@ class SyncCapture:
                         cam_group_mask = action_group_mask
                         cam_frame_rate = acquisition_frame_rate
                         cam_trigger_fps = self._fps
+                        cam_image_nodes = _SLOW_IMAGE_NODES_WITH_HIGH_SPEED if hs is not None else 0
                     self._cameras[sn] = open_camera(
                         sn,
                         trigger_source=action_trigger_source,
@@ -1668,6 +1704,7 @@ class SyncCapture:
                         pixel_format=pixel_format,
                         binning=params.get("binning", 1),
                         gev_scpd=gev_scpd,
+                        image_node_num=cam_image_nodes,
                         _st_dev_list=st_dev_list,
                         **roi_kwargs,
                     )
@@ -1698,13 +1735,12 @@ class SyncCapture:
                         timeout_ms=action_timeout_ms,
                     )
                 else:
-                    # 两条下限都按相机实测的 ResultingFrameRate 排，不按配置的 acquisition_frame_rate：
-                    # 普通相机 ROI 1392 行时配置写 48、实际只给 41.21（单台 1GbE），按 48 排会把
-                    # 会被吞掉的触发当成合法的发出去。120Hz 每格迟到容忍只剩 ~0.55 ms，在本进程里
-                    # 抢不到 GIL，所以触发环放子进程（见 ActionTriggerProcess）。
+                    # 高速格按 405 的传感器上限排（链路上限是平均值，相机会缓存，见
+                    # read_sensor_frame_rate）；全组格仍按其余相机读回的 ResultingFrameRate 把关。
+                    # 触发环放子进程，不跟本进程的线程抢 GIL（见 ActionTriggerProcess）。
                     self._action_trigger = ActionTriggerProcess(params=dict(
                         fps=self._fps * hs.rate_multiplier,
-                        acquisition_frame_rate=self._hs_info["resulting_fps"][hs.serial],
+                        acquisition_frame_rate=self._hs_info["sensor_fps"][hs.serial],
                         device_key=action_device_key,
                         group_key=action_group_key,
                         group_mask=action_group_mask,
@@ -1757,6 +1793,14 @@ class SyncCapture:
             sn: round(read_resulting_frame_rate(cam, sn), 3)
             for sn, cam in self._cameras.items()
         }
+        # 高速相机每格只有 1/120 s，触发下限得按传感器排（见 read_sensor_frame_rate）；
+        # 此时 grabber 还没起，停一下流量完再开
+        hs_cam = self._cameras[hs.serial]
+        _check(hs_cam.MV_CC_StopGrabbing(), f"StopGrabbing({hs.serial})")
+        try:
+            sensor_fps = round(read_sensor_frame_rate(hs_cam, hs.serial), 3)
+        finally:
+            _check(hs_cam.MV_CC_StartGrabbing(), f"StartGrabbing({hs.serial})")
         slot_fps = self._fps * hs.rate_multiplier
         self._hs_info = {
             "serial": hs.serial,
@@ -1771,7 +1815,9 @@ class SyncCapture:
             },
             "canvas": {"width": canvas_w, "height": canvas_h},
             "acquisition_frame_rate": hs.acquisition_frame_rate,
+            # 链路平均上限（ResultingFrameRate）与高速相机传感器上限（触发按它排）
             "resulting_fps": resulting,
+            "sensor_fps": {hs.serial: sensor_fps},
             "action_group_bits": {
                 "high_speed_only": HIGH_SPEED_GROUP_BIT,
             },
@@ -1780,8 +1826,9 @@ class SyncCapture:
         print(
             f"[high-speed] {hs.serial} ROI {hs.roi_width}x{hs.roi_height}"
             f"@({hs.roi_offset_x},{hs.roi_offset_y}) → {slot_fps:g} fps"
-            f"（上限 {resulting[hs.serial]:.2f}），每 {hs.rate_multiplier} 帧与其余相机同拍"
-            f"（其余上限 {min(resulting[sn] for sn in self._assembly_serials):.2f}）"
+            f"（链路上限 {resulting[hs.serial]:.2f}，传感器上限 {sensor_fps:.2f}），"
+            f"每 {hs.rate_multiplier} 帧与其余相机同拍"
+            f"（其余链路上限 {min(resulting[sn] for sn in self._assembly_serials):.2f}）"
         )
 
     def _high_speed_sync_frame(self, assembled: dict[str, Frame]) -> Frame:
