@@ -2302,9 +2302,22 @@ def main() -> int:
             key=lambda sn: order_rank.get(sn, len(order_rank)),
         )
         print(f"  运行相机顺序: {cam_serials}")
+        # 高速相机（camera 配置 high_speed_camera）：同步组里拿到的是小 ROI 贴回全幅的画布，
+        # ROI 外全黑。它只为黑标而裁，不参与球三角化和车定位（ROI 边上被截半的球/tag
+        # 会给出有偏的中心）；照常进拼接视频，黑标测量照旧用它。
+        hs_serial = cap.high_speed_serial
+        if hs_serial is not None:
+            _hs_info = cap.high_speed_info() or {}
+            _hs_roi = _hs_info.get("roi", {})
+            print(
+                f"  高速相机: {hs_serial} ROI {_hs_roi.get('width')}x{_hs_roi.get('height')}"
+                f"@({_hs_roi.get('offset_x')},{_hs_roi.get('offset_y')}) "
+                f"{_hs_info.get('slot_fps'):g} fps，每 {_hs_info.get('rate_multiplier')} 帧与其余相机同拍；"
+                "不参与球检测/车定位"
+            )
         ball_detection_disabled_serials = {
             sn for sn in cam_serials
-            if any(
+            if sn == hs_serial or any(
                 _serial_matches_selector(sn, selector)
                 for selector in ball_detection_disabled_serial_selectors
             )
@@ -2355,7 +2368,7 @@ def main() -> int:
 
         car_loc_disabled_serials = {
             sn for sn in cam_serials
-            if any(
+            if sn == hs_serial or any(
                 _serial_matches_selector(sn, selector)
                 for selector in car_loc_disabled_serial_selectors
             )
@@ -2609,6 +2622,16 @@ def main() -> int:
         signal.signal(signal.SIGTERM, _signal_handler)
         if hasattr(signal, 'SIGBREAK'):
             signal.signal(signal.SIGBREAK, _signal_handler)
+
+        # ── 高速相机每一帧原样写盘：<run_id>_hs_<serial>.{bayer,idx,json}，与主循环同时开始 ──
+        if hs_serial is not None:
+            if save_logs:
+                _hs_recorder = cap.start_high_speed_recording(
+                    output_dir / f"{run_id}_hs_{hs_serial}"
+                )
+                print(f"  高速相机录像: {_hs_recorder.raw_path}")
+            else:
+                print("  高速相机录像已禁用：--no-log")
 
         # ── 主循环 ────────────────────────────────────────────────────
         # Keep assembling synchronized groups while the main thread runs YOLO.
@@ -2957,6 +2980,8 @@ def main() -> int:
             # 回球段 v_img ~1400px/s 是全弹道最高，最先在那里成片漏检
             "camera_settings": camera_settings,
             "camera_capture_overrides": capture_overrides,
+            # 高速相机（ROI/画布/倍频/实测帧率上限/录像路径）；没配就是 null
+            "high_speed_camera": cap.high_speed_info(),
             "calib_config_path": str(Path(args.calib_config).resolve()),
             "car_config_path": str(Path(args.car_config).resolve()),
             "duration_s": processing_elapsed,
@@ -3199,6 +3224,23 @@ def main() -> int:
             "  触发环:     "
             f"issued={_trig['issued']}  skipped_slots={_trig['skipped_slots']}  "
             f"max_late={_trig['max_late_ms']:.1f}ms"
+            + (
+                f"  sync={_trig['issued_sync']}  sync_skipped={_trig['skipped_sync_slots']}"
+                f"  sync_downgraded={_trig['sync_downgraded']}"
+                if "issued_sync" in _trig else ""
+            )
+        )
+    _hs_stats = _cap_stats.get("high_speed")
+    if _hs_stats is not None:
+        _hs_cam = _cap_stats["per_camera"].get(_hs_stats["serial"], {})
+        _hs_rec = _hs_stats.get("recorder") or {}
+        print(
+            f"  高速相机:   {_hs_stats['serial']} received={_hs_cam.get('received')}"
+            f"  missing={_hs_cam.get('missing')}  lost_packets={_hs_cam.get('lost_packets')}"
+            f"  同拍配上={_hs_stats['stream']['sync_matched']}"
+            f"  没配上={_hs_stats['stream']['sync_missed']}"
+            f"  |dt|max={_hs_stats['stream']['sync_dt_ms_max']}ms"
+            f"  写盘={_hs_rec.get('written')} 丢={_hs_rec.get('dropped')}"
         )
     # 丢帧归因：issued 是发出的触发数，missing 是相机 nFrameNum 缺口（触发被拒/线上丢），
     # overwritten 是主机来不及消费。实际帧率低于 cfg 时先看这一行落在哪一段。

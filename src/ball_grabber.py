@@ -24,6 +24,13 @@
   4. 硬触发模式额外检查 exposure_start_pc spread ≤ 10ms（确保同一触发周期）
   5. 返回 {serial: Frame} 字典，或超时返回 None
 
+高速相机（相机配置 high_speed_camera，可选）：
+  - 一台相机裁小 ROI、按 N 倍帧率跑（如 405 1328×680 @120 = 3×40），其余相机不动
+  - 靠 action 组掩码分频：高速相机认 group_mask|0x2，触发环每格发 0x2、每 N 格发全组
+  - 它的每一帧经 ImageGrabber.frame_sink 进 HighSpeedStream（不走"只留最新"的排空），
+    原样写盘（HighSpeedRecorder）；与其余相机同拍的那一帧按曝光时刻配进同步组，
+    贴回全幅画布（pad_roi_frame），下游像素坐标与标定逐点一致
+
 像素格式：
   - 海康 Bayer 命名与 OpenCV 相反：BayerRG8 → cv2.COLOR_BayerBG2BGR
   - frame_to_numpy() 自动处理 Mono8 / BayerXX8 / RGB8 / BGR8
@@ -40,14 +47,17 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import math
 import os
+import queue
+import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 # 环境初始化（MvImport + DLL 路径），必须在 import SDK 之前
 import src.mvs_env as _env  # noqa: F401
@@ -351,6 +361,7 @@ def open_camera(
     gain_db: float = -1.0,
     digital_shift: Optional[float] = None,
     pixel_format: str = "",
+    roi_offset_x: int = 0,
     roi_offset_y: int = 0,
     roi_height: int = 0,
     roi_width: int = 0,
@@ -585,11 +596,14 @@ def open_camera(
                       f"(ret=0x{int(ret) & 0xFFFFFFFF:08x})")
             _try_set_float("DigitalShift", digital_shift, "")
 
-        # ── 自定义 ROI（X 轴：宽度裁剪）──
-        if roi_width > 0:
+        # ── 自定义 ROI（X 轴）── 先归零 OffsetX 再缩 Width，最后才挪 OffsetX（同 Y 轴）
+        if roi_offset_x > 0 or roi_width > 0:
             try:
                 cam.MV_CC_SetIntValue("OffsetX", 0)
-                cam.MV_CC_SetIntValue("Width", roi_width)
+                if roi_width > 0:
+                    cam.MV_CC_SetIntValue("Width", roi_width)
+                if roi_offset_x > 0:
+                    cam.MV_CC_SetIntValue("OffsetX", roi_offset_x)
             except Exception:
                 pass
 
@@ -659,6 +673,30 @@ def close_camera(cam: Any) -> None:
         pass
 
 
+def read_resulting_frame_rate(cam: Any, serial: str) -> float:
+    """相机按当前 ROI/曝光/链路算出的帧率上限（ResultingFrameRate）。
+
+    18F MV-CS032-60GC 实测 = min(117.5e6/(W·H), 1/(H·8.0µs+0.94ms))：全宽时卡在单台
+    1GbE，裁窄后才轮到传感器行读出（2026-10-06 对 405 逐 ROI 读回）。
+    """
+    val = MVCC_FLOATVALUE()
+    _check(cam.MV_CC_GetFloatValue("ResultingFrameRate", val), f"ResultingFrameRate({serial})")
+    fps = float(val.fCurValue)
+    if fps <= 0:
+        raise RuntimeError(f"ResultingFrameRate({serial}) returned {fps}")
+    return fps
+
+
+def read_roi(cam: Any, serial: str) -> dict[str, int]:
+    """读回相机实际生效的 ROI（OffsetX/OffsetY/Width/Height）。"""
+    out: dict[str, int] = {}
+    for node in ("OffsetX", "OffsetY", "Width", "Height"):
+        val = MVCC_INTVALUE_EX()
+        _check(cam.MV_CC_GetIntValueEx(node, val), f"{node}({serial})")
+        out[node] = int(val.nCurValue)
+    return out
+
+
 # ───────────────── Grabber ─────────────────
 
 
@@ -681,11 +719,14 @@ class ImageGrabber(threading.Thread):
         recalib_every: int = 10,
         fps: float = 0.0,
         tick_frequency_hz: int = 0,
+        # 给了就每帧直接交给它、不进队列（高速相机：一帧都不能被"只留最新"丢掉）
+        frame_sink: Optional[Callable[[Frame], None]] = None,
     ):
         super().__init__(daemon=True, name=f"Grabber-{serial}")
         self._cam = cam
         self.serial = serial
         self._timeout_ms = int(timeout_ms)
+        self._frame_sink = frame_sink
         self._queue: deque[Frame] = deque(maxlen=self.MAX_QUEUE)
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -701,6 +742,7 @@ class ImageGrabber(threading.Thread):
         self.frames_missing = 0
         self.lost_packets = 0
         self.frames_overwritten = 0
+        self.sink_errors = 0
         self._last_frame_num: Optional[int] = None
 
     def run(self) -> None:
@@ -753,9 +795,17 @@ class ImageGrabber(threading.Thread):
                         if 0 < gap < 1000:      # 1000+ = 相机重启/计数回绕，不算丢
                             self.frames_missing += gap
                     self._last_frame_num = frame.frame_num
-                    if len(self._queue) == self._queue.maxlen:
-                        self.frames_overwritten += 1
-                    self._queue.append(frame)
+                    if self._frame_sink is None:
+                        if len(self._queue) == self._queue.maxlen:
+                            self.frames_overwritten += 1
+                        self._queue.append(frame)
+                if self._frame_sink is not None:
+                    try:
+                        self._frame_sink(frame)
+                    except Exception as exc:  # 下游出错不能把取流线程带死
+                        self.sink_errors += 1
+                        if self.sink_errors == 1:
+                            print(f"[Grabber {self.serial}] frame_sink 出错（只报第一次）: {exc!r}")
             finally:
                 try:
                     self._cam.MV_CC_FreeImageBuffer(st_frame)
@@ -811,12 +861,15 @@ class ImageGrabber(threading.Thread):
 
     def stats(self) -> dict:
         with self._lock:
-            return {
+            out = {
                 "received": self.frames_received,
                 "missing": self.frames_missing,
                 "lost_packets": self.lost_packets,
                 "overwritten": self.frames_overwritten,
             }
+        if self._frame_sink is not None:
+            out["sink_errors"] = self.sink_errors
+        return out
 
 
 # ───────────────── 同步采集 ─────────────────
@@ -862,6 +915,15 @@ class ActionTriggerLoop(threading.Thread):
     out of ~39.6 Hz issued). Fixing slots keeps every gap an exact multiple of
     the period, so no trigger can arrive faster than the sensor accepts and a
     late wake-up costs one slot instead of shifting all later ones.
+
+    Multi-rate (one high-speed camera): with ``sync_every=N`` the grid runs at
+    N x the base rate. Ordinary slots send ``fast_group_mask`` (only the
+    high-speed camera listens to that bit); every N-th slot sends ``group_mask``
+    and fires every camera at once. The slow cameras keep their own floor,
+    ``sync_minimum_period_s``: if the previous all-camera fire was so late that
+    this one would land inside their readout, the slot is downgraded to
+    fast-only. A slow camera then loses one frame that we count, instead of
+    silently swallowing a trigger that no counter sees.
     """
 
     def __init__(
@@ -875,12 +937,17 @@ class ActionTriggerLoop(threading.Thread):
         group_mask: int,
         broadcast_address: str,
         timeout_ms: int,
+        sync_every: int = 1,
+        fast_group_mask: int = 0,
+        sync_minimum_period_s: float = 0.0,
+        minimum_period_margin_s: float = 0.00025,
     ) -> None:
         super().__init__(daemon=True, name="ActionTriggerLoop")
         self._stop_event = stop_event
         self._period = 1.0 / max(float(fps), 0.001)
         self._minimum_period = (
-            1.0 / max(float(acquisition_frame_rate), 0.001) + 0.00025
+            1.0 / max(float(acquisition_frame_rate), 0.001)
+            + float(minimum_period_margin_s)
         )
         if self._period < self._minimum_period:
             raise ValueError(
@@ -890,6 +957,23 @@ class ActionTriggerLoop(threading.Thread):
                 "silently reject triggers. Raise acquisition_frame_rate to at least "
                 f"{1.3 * float(fps):.0f} in the camera config."
             )
+        self._sync_every = int(sync_every)
+        if self._sync_every < 1:
+            raise ValueError(f"sync_every must be >= 1, got {sync_every!r}")
+        self._fast_group_mask = int(fast_group_mask)
+        self._sync_minimum_period = float(sync_minimum_period_s)
+        if self._sync_every > 1:
+            if self._fast_group_mask == 0 or self._fast_group_mask & int(group_mask):
+                raise ValueError(
+                    "sync_every > 1 needs a fast_group_mask disjoint from group_mask "
+                    f"(group_mask={group_mask:#x}, fast_group_mask={fast_group_mask:#x})"
+                )
+            if self._sync_every * self._period < self._sync_minimum_period:
+                raise ValueError(
+                    f"all-camera period {self._sync_every * self._period * 1000:.2f} ms is "
+                    f"shorter than the slow cameras' minimum "
+                    f"{self._sync_minimum_period * 1000:.2f} ms"
+                )
         self._device_key = int(device_key)
         self._group_key = int(group_key)
         self._group_mask = int(group_mask)
@@ -900,6 +984,22 @@ class ActionTriggerLoop(threading.Thread):
         self.issued = 0
         self.skipped_slots = 0
         self.max_late_s = 0.0
+        self.late_over_0_5ms = 0
+        self.late_over_1ms = 0
+        self.late_over_2ms = 0
+        self.issued_sync = 0
+        self.skipped_sync_slots = 0
+        self.sync_downgraded = 0
+
+    def _slot_kind(self, slot: int, fire_elapsed: float, last_sync_elapsed: float) -> str:
+        """'sync' (every camera), 'fast' (high-speed camera only) or 'downgraded'."""
+        if self._sync_every == 1:
+            return "sync"
+        if slot % self._sync_every:
+            return "fast"
+        if fire_elapsed - last_sync_elapsed < self._sync_minimum_period:
+            return "downgraded"
+        return "sync"
 
     def _next_slot(self, fired_slot: int, elapsed: float) -> int:
         """Grid slot for the next trigger, given how far we are past t0 now.
@@ -913,12 +1013,12 @@ class ActionTriggerLoop(threading.Thread):
             slot = int(math.ceil(earliest / self._period))
         return slot
 
-    def _issue(self) -> None:
+    def _issue(self, group_mask: int) -> None:
         info = MV_ACTION_CMD_INFO()
         results = MV_ACTION_CMD_RESULT_LIST()
         info.nDeviceKey = self._device_key
         info.nGroupKey = self._group_key
-        info.nGroupMask = self._group_mask
+        info.nGroupMask = int(group_mask)
         info.bActionTimeEnable = 0
         info.nActionTime = 0
         info.pBroadcastAddress = self._broadcast_address.encode("ascii")
@@ -931,6 +1031,7 @@ class ActionTriggerLoop(threading.Thread):
         with _HighResolutionTimers():
             t0 = time.perf_counter()
             slot = 1
+            last_sync_elapsed = -math.inf
             while not self._stop_event.is_set():
                 deadline = t0 + slot * self._period
                 while True:
@@ -941,20 +1042,349 @@ class ActionTriggerLoop(threading.Thread):
                         return
                     if remaining > _TRIGGER_SPIN_GUARD_S:
                         time.sleep(min(remaining - _TRIGGER_SPIN_GUARD_S, 0.002))
-                self._issue()
+                fire_elapsed = time.perf_counter() - t0
+                kind = self._slot_kind(slot, fire_elapsed, last_sync_elapsed)
+                self._issue(self._group_mask if kind == "sync" else self._fast_group_mask)
                 self.issued += 1
+                if kind == "sync":
+                    self.issued_sync += 1
+                    last_sync_elapsed = fire_elapsed
+                elif kind == "downgraded":
+                    self.sync_downgraded += 1
                 elapsed = time.perf_counter() - t0
-                self.max_late_s = max(self.max_late_s, elapsed - slot * self._period)
+                late = elapsed - slot * self._period
+                self.max_late_s = max(self.max_late_s, late)
+                self.late_over_0_5ms += late > 0.0005
+                self.late_over_1ms += late > 0.001
+                self.late_over_2ms += late > 0.002
                 next_slot = self._next_slot(slot, elapsed)
                 self.skipped_slots += next_slot - slot - 1
+                if self._sync_every > 1:
+                    self.skipped_sync_slots += sum(
+                        1 for s in range(slot + 1, next_slot) if s % self._sync_every == 0
+                    )
                 slot = next_slot
 
     def stats(self) -> dict:
-        return {
+        out = {
             "issued": self.issued,
             "skipped_slots": self.skipped_slots,
             "max_late_ms": round(self.max_late_s * 1000.0, 3),
+            "late_over_0_5ms": self.late_over_0_5ms,
+            "late_over_1ms": self.late_over_1ms,
+            "late_over_2ms": self.late_over_2ms,
         }
+        if self._sync_every > 1:
+            out.update({
+                "slot_fps": round(1.0 / self._period, 3),
+                "sync_every": self._sync_every,
+                "issued_sync": self.issued_sync,
+                "skipped_sync_slots": self.skipped_sync_slots,
+                "sync_downgraded": self.sync_downgraded,
+            })
+        return out
+
+
+# ───────────────── 高速相机 ─────────────────
+
+
+#: 高速相机在 action 组掩码里多认的一位。普通相机只认 action_group_mask（默认 1），
+#: 触发环平时只发这一位 → 只有高速相机曝光；每 N 格发全组 → 所有相机同拍。
+HIGH_SPEED_GROUP_BIT = 0x2
+#: 按实测 ResultingFrameRate 排触发时留的余量。action 包在交换机上的抖动是几十 µs 级，
+#: 普通流程那 0.25 ms 在 120Hz（周期 8.33 ms、相机下限 7.69 ms）下会白白吃掉四成迟到容忍。
+_HIGH_SPEED_PERIOD_MARGIN_S = 0.0001
+#: 同步组配高速帧时最多等多久。高速帧小（0.9 MB vs 2.85 MB），通常比普通帧先到。
+_HIGH_SPEED_SYNC_WAIT_S = 0.012
+#: 高速模式下整个采集期间的 GIL 切换间隔（Python 默认 5 ms），开相机之前就设、close 时恢复。
+#: 120Hz 每格只有 ~0.55 ms 迟到容忍，触发线程醒来等 GIL 要等到别人让出：2026-10-06 ASUS 实测
+#: 只加 1 条纯 Python 忙线程，默认 5 ms 下 120Hz 只发出 44Hz、几乎每格迟到 >2 ms；压到 0.5 ms
+#: 后 4 条忙线程仍 119.95Hz、20 s 只跳 3 格。必须在 grabber 启动之前设：各相机开流时的
+#: PC↔设备时钟校准（calibrate_time_offset 量往返）在 5 ms 下被忙线程拖偏几 ms，四台曝光时刻
+#: 对不齐、同步组整组被丢（同一实验只在触发环里压时，30 s 只拼出 6 组）。
+_HIGH_SPEED_GIL_SWITCH_INTERVAL_S = 0.0005
+
+
+@dataclass(frozen=True)
+class HighSpeedConfig:
+    """相机配置里的 high_speed_camera 段：哪台、几倍频、ROI（全幅像素坐标）。"""
+    serial: str
+    rate_multiplier: int
+    roi_offset_x: int
+    roi_offset_y: int
+    roi_width: int
+    roi_height: int
+    acquisition_frame_rate: float
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> "HighSpeedConfig":
+        keys = ("serial", "rate_multiplier", "roi_offset_x", "roi_offset_y",
+                "roi_width", "roi_height", "acquisition_frame_rate")
+        missing = [k for k in keys if k not in raw]
+        unknown = sorted(set(raw) - set(keys))
+        if missing or unknown:
+            raise ValueError(
+                f"high_speed_camera 配置不对：缺 {missing}，多 {unknown}（必填 {list(keys)}，没有默认值）"
+            )
+        cfg = cls(
+            serial=str(raw["serial"]).strip(),
+            rate_multiplier=int(raw["rate_multiplier"]),
+            roi_offset_x=int(raw["roi_offset_x"]),
+            roi_offset_y=int(raw["roi_offset_y"]),
+            roi_width=int(raw["roi_width"]),
+            roi_height=int(raw["roi_height"]),
+            acquisition_frame_rate=float(raw["acquisition_frame_rate"]),
+        )
+        if cfg.rate_multiplier < 2:
+            raise ValueError(f"high_speed_camera.rate_multiplier 至少 2，给的是 {cfg.rate_multiplier}")
+        if cfg.roi_offset_x % 2 or cfg.roi_offset_y % 2:
+            # 奇数偏移会把 Bayer 相位挪一格，贴回画布后整幅颜色错位
+            raise ValueError("high_speed_camera 的 roi_offset_x/roi_offset_y 必须是偶数（保持 Bayer 相位）")
+        if cfg.roi_width <= 0 or cfg.roi_height <= 0:
+            raise ValueError("high_speed_camera 的 roi_width/roi_height 必须 > 0")
+        return cfg
+
+
+_PAD_PIXEL_TYPES = (
+    PixelType_Gvsp_Mono8,
+    PixelType_Gvsp_BayerRG8,
+    PixelType_Gvsp_BayerBG8,
+    PixelType_Gvsp_BayerGR8,
+    PixelType_Gvsp_BayerGB8,
+)
+
+
+def pad_roi_frame(
+    frame: Frame,
+    *,
+    canvas_width: int,
+    canvas_height: int,
+    offset_x: int,
+    offset_y: int,
+) -> Frame:
+    """把 ROI 帧贴回全幅画布（ROI 外全 0），像素坐标与全幅标定逐点一致。
+
+    同步组里其余相机都是全宽、OffsetY=0 的画面；高速相机的小 ROI 贴回同样大小的画布后，
+    下游（切片、视频网格、黑标投影）都不用知道它裁过——0905 黑标整场归零就是因为
+    ROI 尺寸和标定 image_size 对不上又没人重映射（v04-grid-video-roi-height-vs-calib-0905）。
+    """
+    import numpy as np
+
+    if frame.pixel_type not in _PAD_PIXEL_TYPES:
+        raise ValueError(f"pad_roi_frame 只支持 8-bit 单通道（Bayer8/Mono8），给的是 0x{frame.pixel_type:08X}")
+    if offset_x % 2 or offset_y % 2:
+        raise ValueError("ROI 偏移必须是偶数（保持 Bayer 相位）")
+    if offset_x < 0 or offset_y < 0 or offset_x + frame.width > canvas_width or offset_y + frame.height > canvas_height:
+        raise ValueError(
+            f"ROI {frame.width}x{frame.height}@({offset_x},{offset_y}) 超出画布 {canvas_width}x{canvas_height}"
+        )
+    canvas = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
+    roi = np.frombuffer(frame.data, dtype=np.uint8, count=frame.width * frame.height)
+    canvas[offset_y:offset_y + frame.height, offset_x:offset_x + frame.width] = roi.reshape(frame.height, frame.width)
+    return replace(frame, data=canvas.tobytes(), width=canvas_width, height=canvas_height)
+
+
+class HighSpeedStream:
+    """高速相机的全部帧：短环形缓冲供同步帧配对，同时转给录像器。
+
+    帧由 ImageGrabber 线程经 frame_sink 直接推进来，不走 get_frames 的"只留最新"排空——
+    那条路会把 2/3 的高速帧当积压丢掉，还会把相邻一格（120Hz 下 8.3 ms）的非同步帧
+    错配进同步组（get_frames 的曝光门是 10 ms）。
+    """
+
+    def __init__(self, serial: str, *, slot_period_s: float, ring_size: int = 16) -> None:
+        self.serial = serial
+        # 半格：相邻高速帧差一整格，配对唯一
+        self._tolerance_s = float(slot_period_s) / 2.0
+        self._ring: deque[Frame] = deque(maxlen=int(ring_size))
+        self._cond = threading.Condition()
+        self._recorder: Optional["HighSpeedRecorder"] = None
+        self.received = 0
+        self.sync_matched = 0
+        self.sync_missed = 0
+        self.sync_dt_abs_max_s = 0.0
+        self._sync_dt_abs_sum_s = 0.0
+        self.sync_frame_nums: list[int] = []
+
+    def push(self, frame: Frame) -> None:
+        with self._cond:
+            self._ring.append(frame)
+            self.received += 1
+            recorder = self._recorder
+            self._cond.notify_all()
+        if recorder is not None:
+            recorder.submit(frame)
+
+    def attach_recorder(self, recorder: "HighSpeedRecorder") -> None:
+        with self._cond:
+            self._recorder = recorder
+
+    def detach_recorder(self) -> Optional["HighSpeedRecorder"]:
+        with self._cond:
+            recorder, self._recorder = self._recorder, None
+        return recorder
+
+    def match(self, exposure_pc: float, *, wait_s: float) -> Optional[Frame]:
+        """曝光时刻离 exposure_pc 最近（半格以内）的那一帧；没到就最多等 wait_s。"""
+        deadline = time.perf_counter() + float(wait_s)
+        with self._cond:
+            while True:
+                best: Optional[Frame] = None
+                best_dt = math.inf
+                newest = -math.inf
+                for f in self._ring:
+                    newest = max(newest, f.exposure_start_pc)
+                    dt = abs(f.exposure_start_pc - exposure_pc)
+                    if dt < best_dt:
+                        best, best_dt = f, dt
+                if best is not None and best_dt <= self._tolerance_s:
+                    self.sync_matched += 1
+                    self._sync_dt_abs_sum_s += best_dt
+                    self.sync_dt_abs_max_s = max(self.sync_dt_abs_max_s, best_dt)
+                    self.sync_frame_nums.append(best.frame_num)
+                    return best
+                remaining = deadline - time.perf_counter()
+                # 帧按序到：已经有比它晚半格以上的帧，说明同拍那一帧丢了，不必再等
+                if remaining <= 0 or newest > exposure_pc + self._tolerance_s:
+                    self.sync_missed += 1
+                    return None
+                self._cond.wait(remaining)
+
+    def stats(self) -> dict:
+        with self._cond:
+            n = self.sync_matched
+            return {
+                "received": self.received,
+                "sync_matched": n,
+                "sync_missed": self.sync_missed,
+                "sync_dt_ms_mean": round(self._sync_dt_abs_sum_s / n * 1000.0, 3) if n else None,
+                "sync_dt_ms_max": round(self.sync_dt_abs_max_s * 1000.0, 3) if n else None,
+            }
+
+
+#: 逐帧索引记录（<base>.idx）：numpy dtype
+#: [("frame_num","<i8"),("dev_timestamp","<u8"),("exposure_start_pc","<f8"),("arrival_perf","<f8"),("lost_packet","<i8")]
+HIGH_SPEED_INDEX_FORMAT = "<qQddq"
+
+
+class HighSpeedRecorder(threading.Thread):
+    """把高速相机每一帧原样（8-bit Bayer）顺序写盘。
+
+    - ``<base>.bayer``：各帧原始字节首尾相接，每帧 width*height 字节，第 i 帧在 i*width*height；
+    - ``<base>.idx``：每帧一条 40 字节定长记录（HIGH_SPEED_INDEX_FORMAT），随写随落盘，
+      进程崩了也能按记录数恢复时间戳；
+    - ``<base>.json``：ROI / 画布 / 帧率等元数据，开录写一次，收尾带统计再写一次。
+
+    不在采集机上编码：原始 108 MB/s 顺序写对 NVMe 是零负担，而且黑标要的是无损像素。
+    """
+
+    def __init__(self, base_path: Path, *, meta: dict, queue_max: int = 600) -> None:
+        super().__init__(daemon=True, name="HighSpeedRecorder")
+        base_path = Path(base_path)
+        self.raw_path = base_path.with_name(base_path.name + ".bayer")
+        self.index_path = base_path.with_name(base_path.name + ".idx")
+        self.json_path = base_path.with_name(base_path.name + ".json")
+        self._meta = dict(meta)
+        self._queue: queue.Queue[Optional[Frame]] = queue.Queue(maxsize=int(queue_max))
+        self.written = 0
+        self.dropped = 0
+        self.size_mismatch = 0
+        self.bytes_written = 0
+        self.queue_max_size = 0
+        self.frame_bytes: Optional[int] = None
+        self.frame_shape: Optional[tuple[int, int]] = None
+        self.pixel_type: Optional[int] = None
+        self.error: Optional[str] = None
+        self._write_json(status="recording")
+
+    def _write_json(self, *, status: str, extra: Optional[dict] = None) -> None:
+        doc = {
+            **self._meta,
+            "status": status,
+            "files": {
+                "raw": self.raw_path.name,
+                "index": self.index_path.name,
+                "index_format": HIGH_SPEED_INDEX_FORMAT,
+                "index_fields": ["frame_num", "dev_timestamp", "exposure_start_pc",
+                                 "arrival_perf", "lost_packet"],
+            },
+            **(extra or {}),
+        }
+        with open(self.json_path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(doc, f, ensure_ascii=False, indent=2)
+
+    def submit(self, frame: Frame) -> None:
+        """取流线程调用：非阻塞，满了就丢并计数（写盘跟不上不能拖住取流）。"""
+        try:
+            self._queue.put_nowait(frame)
+        except queue.Full:
+            self.dropped += 1
+            return
+        size = self._queue.qsize()
+        if size > self.queue_max_size:
+            self.queue_max_size = size
+
+    def run(self) -> None:
+        import struct
+
+        pack = struct.Struct(HIGH_SPEED_INDEX_FORMAT).pack
+        try:
+            with open(self.raw_path, "wb", buffering=8 << 20) as raw, \
+                    open(self.index_path, "wb", buffering=1 << 16) as idx:
+                while True:
+                    frame = self._queue.get()
+                    if frame is None:
+                        break
+                    if self.frame_bytes is None:
+                        self.frame_bytes = len(frame.data)
+                        self.frame_shape = (int(frame.height), int(frame.width))
+                        self.pixel_type = int(frame.pixel_type)
+                    elif len(frame.data) != self.frame_bytes:
+                        self.size_mismatch += 1
+                        continue
+                    raw.write(frame.data)
+                    idx.write(pack(
+                        int(frame.frame_num),
+                        int(frame.dev_timestamp),
+                        float(frame.exposure_start_pc),
+                        float(frame.arrival_perf),
+                        int(frame.lost_packet),
+                    ))
+                    self.written += 1
+                    self.bytes_written += len(frame.data)
+        except Exception as exc:
+            self.error = repr(exc)
+            print(f"[HighSpeedRecorder] 写盘出错，后续帧全部丢弃: {self.error}")
+            # 写线程挂了也要一直排空到哨兵，否则 close() 的哨兵塞不进满队列
+            while self._queue.get() is not None:
+                self.dropped += 1
+
+    def stats(self) -> dict:
+        return {
+            "written": self.written,
+            "dropped": self.dropped,
+            "size_mismatch": self.size_mismatch,
+            "bytes_written": self.bytes_written,
+            "frame_bytes": self.frame_bytes,
+            # (height, width) 与 GigE PFNC 像素格式码（18F 实测 0x01080008 = BayerGR8）
+            "frame_shape": list(self.frame_shape) if self.frame_shape else None,
+            "pixel_type": self.pixel_type,
+            "queue_max_size": self.queue_max_size,
+            "error": self.error,
+        }
+
+    def close(self, *, extra: Optional[dict] = None, timeout_s: float = 60.0) -> dict:
+        try:
+            self._queue.put(None, timeout=timeout_s)
+        except queue.Full:
+            self.error = self.error or "close: queue stuck full"
+        self.join(timeout=timeout_s)
+        stats = self.stats()
+        self._write_json(
+            status="complete" if not self.is_alive() and self.error is None else "incomplete",
+            extra={**(extra or {}), "recording": stats},
+        )
+        return stats
 
 
 class SyncCapture:
@@ -1002,6 +1432,8 @@ class SyncCapture:
         # 裁剪后的像素坐标与全幅逐点相同，标定内参和三角测量无需任何重映射。
         roi_height: int = 0,
         slave_params: Optional[dict[str, dict]] = None,
+        # 可选：一台相机裁小 ROI 按 rate_multiplier 倍帧率跑（见模块文档「高速相机」）
+        high_speed_camera: Optional[dict] = None,
     ):
         self._master = master_serial
         self._slaves = list(slave_serials)
@@ -1017,6 +1449,32 @@ class SyncCapture:
         self._fps = fps
         self._recalib_every = recalib_every
         self._sync_threshold_s = sync_threshold_ms / 1000.0
+
+        self._high_speed = (
+            HighSpeedConfig.from_dict(high_speed_camera) if high_speed_camera else None
+        )
+        hs = self._high_speed
+        if hs is not None:
+            if self._trigger_mode != "action":
+                raise ValueError("high_speed_camera 只支持 trigger_mode=action（靠 action 组掩码分频）")
+            if hs.serial not in self._sync_set:
+                raise ValueError(f"high_speed_camera.serial={hs.serial} 不在同步相机 {self._sync_serials} 里")
+            if int(action_group_mask) & HIGH_SPEED_GROUP_BIT:
+                raise ValueError(
+                    f"action_group_mask={action_group_mask:#x} 占了高速相机专用位 {HIGH_SPEED_GROUP_BIT:#x}"
+                )
+        # get_frames 从各 grabber 拼的相机；高速相机不在里面，拼好后按曝光时刻另配
+        self._assembly_serials = [
+            sn for sn in self._sync_serials if hs is None or sn != hs.serial
+        ]
+        self._hs_stream: Optional[HighSpeedStream] = None
+        self._hs_recorder: Optional[HighSpeedRecorder] = None
+        self._hs_info: Optional[dict] = None
+        # 高速模式：开相机（及各 grabber 的时钟校准）之前压 GIL 切换间隔，close() 恢复
+        self._restore_switch_interval: Optional[float] = None
+        if hs is not None:
+            self._restore_switch_interval = sys.getswitchinterval()
+            sys.setswitchinterval(min(self._restore_switch_interval, _HIGH_SPEED_GIL_SWITCH_INTERVAL_S))
 
         self._cameras: dict[str, Any] = {}
         self._grabbers: dict[str, ImageGrabber] = {}
@@ -1069,51 +1527,226 @@ class SyncCapture:
             else:
                 for sn in self._all_serials:
                     params = (slave_params or {}).get(sn, {})
+                    if hs is not None and sn == hs.serial:
+                        roi_kwargs = dict(
+                            roi_offset_x=hs.roi_offset_x,
+                            roi_offset_y=hs.roi_offset_y,
+                            roi_width=hs.roi_width,
+                            roi_height=hs.roi_height,
+                        )
+                        cam_group_mask = int(action_group_mask) | HIGH_SPEED_GROUP_BIT
+                        cam_frame_rate = hs.acquisition_frame_rate
+                        cam_trigger_fps = self._fps * hs.rate_multiplier
+                    else:
+                        roi_kwargs = dict(
+                            roi_offset_y=params.get("roi_offset_y", 0),
+                            roi_height=params.get("roi_height", roi_height),
+                            roi_width=params.get("roi_width", 0),
+                        )
+                        cam_group_mask = action_group_mask
+                        cam_frame_rate = acquisition_frame_rate
+                        cam_trigger_fps = self._fps
                     self._cameras[sn] = open_camera(
                         sn,
                         trigger_source=action_trigger_source,
                         action_device_key=action_device_key,
                         action_group_key=action_group_key,
-                        action_group_mask=action_group_mask,
-                        frame_rate=acquisition_frame_rate,
-                        trigger_fps=self._fps,
+                        action_group_mask=cam_group_mask,
+                        frame_rate=cam_frame_rate,
+                        trigger_fps=cam_trigger_fps,
                         full_frame=True,
                         exposure_us=exposure_us,
                         gain_db=gain_db,
                         digital_shift=digital_shift,
                         pixel_format=pixel_format,
-                        roi_offset_y=params.get("roi_offset_y", 0),
-                        roi_height=params.get("roi_height", roi_height),
-                        roi_width=params.get("roi_width", 0),
                         binning=params.get("binning", 1),
                         gev_scpd=gev_scpd,
                         _st_dev_list=st_dev_list,
+                        **roi_kwargs,
                     )
+                if hs is not None:
+                    self._setup_high_speed(hs)
 
             # 启动 grabber
             for sn, cam in self._cameras.items():
+                is_hs = hs is not None and sn == hs.serial
                 g = ImageGrabber(cam, sn, timeout_ms=1000,
                                  recalib_every=self._recalib_every,
-                                 fps=self._fps)
+                                 fps=self._fps * hs.rate_multiplier if is_hs else self._fps,
+                                 frame_sink=self._hs_stream.push if is_hs else None)
                 self._grabbers[sn] = g
                 g.start()
 
             if self._trigger_mode == "action":
                 time.sleep(0.2)
-                self._action_trigger = ActionTriggerLoop(
-                    stop_event=self._stop,
-                    fps=self._fps,
-                    acquisition_frame_rate=acquisition_frame_rate,
-                    device_key=action_device_key,
-                    group_key=action_group_key,
-                    group_mask=action_group_mask,
-                    broadcast_address=action_broadcast_address,
-                    timeout_ms=action_timeout_ms,
-                )
+                if hs is None:
+                    self._action_trigger = ActionTriggerLoop(
+                        stop_event=self._stop,
+                        fps=self._fps,
+                        acquisition_frame_rate=acquisition_frame_rate,
+                        device_key=action_device_key,
+                        group_key=action_group_key,
+                        group_mask=action_group_mask,
+                        broadcast_address=action_broadcast_address,
+                        timeout_ms=action_timeout_ms,
+                    )
+                else:
+                    # 两条下限都按相机实测的 ResultingFrameRate 排，不按配置的 acquisition_frame_rate：
+                    # 普通相机 ROI 1392 行时配置写 48、实际只给 41.21（单台 1GbE），按 48 排会把
+                    # 会被吞掉的触发当成合法的发出去
+                    self._action_trigger = ActionTriggerLoop(
+                        stop_event=self._stop,
+                        fps=self._fps * hs.rate_multiplier,
+                        acquisition_frame_rate=self._hs_info["resulting_fps"][hs.serial],
+                        device_key=action_device_key,
+                        group_key=action_group_key,
+                        group_mask=action_group_mask,
+                        fast_group_mask=HIGH_SPEED_GROUP_BIT,
+                        sync_every=hs.rate_multiplier,
+                        sync_minimum_period_s=(
+                            1.0 / min(self._hs_info["resulting_fps"][sn] for sn in self._assembly_serials)
+                            + _HIGH_SPEED_PERIOD_MARGIN_S
+                        ),
+                        minimum_period_margin_s=_HIGH_SPEED_PERIOD_MARGIN_S,
+                        broadcast_address=action_broadcast_address,
+                        timeout_ms=action_timeout_ms,
+                    )
                 self._action_trigger.start()
         except Exception:
             self.close()
             raise
+
+    def _setup_high_speed(self, hs: HighSpeedConfig) -> None:
+        """核对高速相机 ROI 真的按配置生效、画布尺寸，建 HighSpeedStream。"""
+        rois = {sn: read_roi(cam, sn) for sn, cam in self._cameras.items()}
+        want = {
+            "OffsetX": hs.roi_offset_x,
+            "OffsetY": hs.roi_offset_y,
+            "Width": hs.roi_width,
+            "Height": hs.roi_height,
+        }
+        if rois[hs.serial] != want:
+            # open_camera 写 ROI 失败是静默的（步进不对会被相机拒），这里必须拦：
+            # 偏移错了，贴回画布的位置就错了，黑标投影整体偏移而不报错
+            raise RuntimeError(
+                f"高速相机 {hs.serial} ROI 没按配置生效：要 {want}，相机实际 {rois[hs.serial]}"
+                "（Width/OffsetX 步进 4、Height/OffsetY 步进 2，先在 MVS 里确认）"
+            )
+        canvases = {
+            (rois[sn]["OffsetX"], rois[sn]["OffsetY"], rois[sn]["Width"], rois[sn]["Height"])
+            for sn in self._assembly_serials
+        }
+        if len(canvases) != 1:
+            raise RuntimeError(f"其余相机画幅不一致，没法定高速相机的画布：{rois}")
+        off_x, off_y, canvas_w, canvas_h = canvases.pop()
+        if off_x or off_y:
+            raise RuntimeError(f"其余相机 ROI 偏移必须为 0（标定按全幅像素），实际 ({off_x},{off_y})")
+        if hs.roi_offset_x + hs.roi_width > canvas_w or hs.roi_offset_y + hs.roi_height > canvas_h:
+            raise RuntimeError(
+                f"高速相机 ROI {hs.roi_width}x{hs.roi_height}@({hs.roi_offset_x},{hs.roi_offset_y}) "
+                f"超出其余相机画幅 {canvas_w}x{canvas_h}"
+            )
+        resulting = {
+            sn: round(read_resulting_frame_rate(cam, sn), 3)
+            for sn, cam in self._cameras.items()
+        }
+        slot_fps = self._fps * hs.rate_multiplier
+        self._hs_info = {
+            "serial": hs.serial,
+            "rate_multiplier": hs.rate_multiplier,
+            "base_fps": self._fps,
+            "slot_fps": slot_fps,
+            "roi": {
+                "offset_x": hs.roi_offset_x,
+                "offset_y": hs.roi_offset_y,
+                "width": hs.roi_width,
+                "height": hs.roi_height,
+            },
+            "canvas": {"width": canvas_w, "height": canvas_h},
+            "acquisition_frame_rate": hs.acquisition_frame_rate,
+            "resulting_fps": resulting,
+            "action_group_bits": {
+                "high_speed_only": HIGH_SPEED_GROUP_BIT,
+            },
+        }
+        self._hs_stream = HighSpeedStream(hs.serial, slot_period_s=1.0 / slot_fps)
+        print(
+            f"[high-speed] {hs.serial} ROI {hs.roi_width}x{hs.roi_height}"
+            f"@({hs.roi_offset_x},{hs.roi_offset_y}) → {slot_fps:g} fps"
+            f"（上限 {resulting[hs.serial]:.2f}），每 {hs.rate_multiplier} 帧与其余相机同拍"
+            f"（其余上限 {min(resulting[sn] for sn in self._assembly_serials):.2f}）"
+        )
+
+    def _high_speed_sync_frame(self, assembled: dict[str, Frame]) -> Frame:
+        """给拼好的同步组配上高速相机同拍的那一帧，贴回全幅画布。"""
+        assert self._hs_stream is not None and self._hs_info is not None
+        exposure_pc = sum(f.exposure_start_pc for f in assembled.values()) / len(assembled)
+        canvas_w = self._hs_info["canvas"]["width"]
+        canvas_h = self._hs_info["canvas"]["height"]
+        frame = self._hs_stream.match(exposure_pc, wait_s=_HIGH_SPEED_SYNC_WAIT_S)
+        if frame is None:
+            # 同拍那一帧丢了：给全黑画布占位（下游当这一拍没看到），绝不拿相邻一格的帧顶替
+            ref = next(iter(assembled.values()))
+            return Frame(
+                data=bytes(canvas_w * canvas_h),
+                width=canvas_w,
+                height=canvas_h,
+                frame_num=-1,
+                pixel_type=ref.pixel_type,
+                arrival_perf=time.perf_counter(),
+                exposure_start_pc=exposure_pc,
+            )
+        roi = self._hs_info["roi"]
+        return pad_roi_frame(
+            frame,
+            canvas_width=canvas_w,
+            canvas_height=canvas_h,
+            offset_x=roi["offset_x"],
+            offset_y=roi["offset_y"],
+        )
+
+    @property
+    def high_speed_serial(self) -> Optional[str]:
+        """配了高速相机就是它的序列号，否则 None。"""
+        return self._high_speed.serial if self._high_speed is not None else None
+
+    def high_speed_info(self) -> Optional[dict]:
+        """高速相机的静态配置 + 实测帧率上限 + 录像路径（写进 session json 的 config）。"""
+        if self._hs_info is None:
+            return None
+        info = dict(self._hs_info)
+        if self._hs_recorder is not None:
+            info["recording"] = {
+                "raw": str(self._hs_recorder.raw_path),
+                "index": str(self._hs_recorder.index_path),
+                "json": str(self._hs_recorder.json_path),
+            }
+        return info
+
+    def start_high_speed_recording(self, base_path: Path) -> HighSpeedRecorder:
+        """开始把高速相机每一帧写盘：<base>.bayer / .idx / .json。"""
+        if self._hs_stream is None:
+            raise RuntimeError("相机配置里没有 high_speed_camera")
+        if self._hs_recorder is not None:
+            raise RuntimeError("高速相机已经在录")
+        recorder = HighSpeedRecorder(Path(base_path), meta=self.high_speed_info() or {})
+        recorder.start()
+        self._hs_recorder = recorder
+        self._hs_stream.attach_recorder(recorder)
+        return recorder
+
+    def _finish_high_speed_recording(self) -> None:
+        if self._hs_recorder is None or self._hs_stream is None:
+            return
+        if self._hs_stream.detach_recorder() is None:
+            return  # 已经收过尾（close 被调了两次）
+        trigger = self._action_trigger.stats() if self._action_trigger is not None else None
+        self._hs_recorder.close(extra={
+            "stream": self._hs_stream.stats(),
+            "trigger": trigger,
+            # 进了同步组的那些高速帧（与其余相机同拍），按 frame_num 记
+            "sync_frame_nums": list(self._hs_stream.sync_frame_nums),
+        })
 
     def get_frames(self, timeout_s: float = 1.0) -> Optional[dict[str, Frame]]:
         """
@@ -1121,6 +1754,7 @@ class SyncCapture:
 
         仅返回 sync_serials 中的相机帧（Line 模式可不含仅用作触发源的主相机）。
         用 exposure_start_pc 判断是否属于同一触发周期（阈值 10ms）。
+        配了高速相机时，先拼其余相机，再按曝光时刻配上它同拍的那一帧（贴回全幅画布）。
 
         返回 {serial: Frame} 字典，或超时返回 None。
         """
@@ -1131,10 +1765,11 @@ class SyncCapture:
             for sn, g in self._grabbers.items():
                 f = g._drain_keep_latest()
                 # 仅收集 sync_serials 的帧；其他 grabber 照常排空
+                # （高速相机的帧走 frame_sink，它的队列恒空）
                 if f is not None and sn in self._sync_set:
                     latest[sn] = f
 
-            if len(latest) == len(self._sync_serials):
+            if len(latest) == len(self._assembly_serials):
                 # 粗同步检查：arrival_perf spread
                 arrivals = [f.arrival_perf for f in latest.values()]
                 spread = max(arrivals) - min(arrivals)
@@ -1148,6 +1783,8 @@ class SyncCapture:
                         del latest[oldest_sn]
                         time.sleep(0.001)
                         continue
+                    if self._hs_stream is not None:
+                        latest[self._high_speed.serial] = self._high_speed_sync_frame(latest)
                     return latest
                 # 帧不同步，丢弃最老的重新收集
                 self._arrival_spread_discards += 1
@@ -1181,6 +1818,13 @@ class SyncCapture:
         }
         if self._action_trigger is not None:
             out["trigger"] = self._action_trigger.stats()
+        if self._hs_stream is not None:
+            # received 按 ImageGrabber 计（per_camera 里也有）；sync_* 是配进同步组的情况
+            out["high_speed"] = {
+                "serial": self._high_speed.serial,
+                "stream": self._hs_stream.stats(),
+                "recorder": self._hs_recorder.stats() if self._hs_recorder is not None else None,
+            }
         return out
 
     @classmethod
@@ -1243,17 +1887,20 @@ class SyncCapture:
 
     def close(self) -> None:
         """停止所有 grabber 并关闭所有相机。"""
-        # 先把丢帧计数快照下来：run_tracker 的最终统计跑在 with 块之外，
-        # close() 之后 _grabbers/_action_trigger 都没了，不快照就只剩 0。
-        self._final_stats = self.stats()
         self._stop.set()
         if self._action_trigger is not None:
             self._action_trigger.join(timeout=1.0)
-            self._action_trigger = None
         for g in self._grabbers.values():
             g.stop()
         for g in self._grabbers.values():
             g.join(timeout=2.0)
+        # 高速录像等取流线程都停了再收尾，最后几帧才不会漏写
+        self._finish_high_speed_recording()
+        # 线程都停下之后把丢帧计数快照下来：run_tracker 的最终统计跑在 with 块之外，
+        # 下面一清 _grabbers/_action_trigger，不快照就只剩 0。
+        if self._final_stats is None:
+            self._final_stats = self.stats()
+        self._action_trigger = None
         for cam in self._cameras.values():
             close_camera(cam)
         self._cameras.clear()
@@ -1262,6 +1909,9 @@ class SyncCapture:
             MvCamera.MV_CC_Finalize()
         except Exception:
             pass
+        if self._restore_switch_interval is not None:
+            sys.setswitchinterval(self._restore_switch_interval)
+            self._restore_switch_interval = None
 
     def __enter__(self):
         return self

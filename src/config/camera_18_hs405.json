@@ -1,0 +1,28 @@
+{
+  "trigger_mode": "action",
+  "master_serial": "DB0260414",
+  "slave_serials": ["DB0260373", "DB0260405", "DB0260378"],
+  "fps": 40.0,
+  "acquisition_frame_rate": 48.0,
+  "roi_height": 1392,
+  "exposure_us": 2000.0,
+  "gain_db": 12.78,
+  "digital_shift": 16.5,
+  "action_trigger_source": "Action1",
+  "action_device_key": 1,
+  "action_group_key": 1,
+  "action_group_mask": 1,
+  "action_broadcast_address": "255.255.255.255",
+  "action_timeout_ms": 0,
+  "gev_scpd": 0,
+  "recalib_every": 2100,
+  "high_speed_camera": {
+    "serial": "DB0260405",
+    "rate_multiplier": 3,
+    "roi_offset_x": 720,
+    "roi_offset_y": 268,
+    "roi_width": 1328,
+    "roi_height": 680,
+    "acquisition_frame_rate": 160.0
+  }
+}
