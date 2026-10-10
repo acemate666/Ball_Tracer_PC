@@ -131,27 +131,38 @@ def _merge_racket_impact_json(
 
 # ---- /joint_states 关节时刻对齐（两相 CAN 调度） -------------------------------------------
 # arm_controller_cpp 的 /joint_states 一条消息里各轴不是同刻采的：header.stamp 是快照里**最新一帧**
-# 反馈的 CAN 到达时刻，而每个 tick(5ms) 只按两相调度发命令（control/tx_schedule.hpp；用哪个调度
-# 写在车型 yaml 的 control.tx_schedule），帧间 tx_gap≈0.5ms，每帧命令触发一条反馈：
-#   v0.4 two_phase_j1_j5：A 相 J1,J2,J3,J5,J4（5 帧）  B 相 J1,J5,J6（3 帧）
-#   v0.5 two_phase_j1   ：A 相 J1,J2,J3,J4（4 帧）     B 相 J1,滚转（2 帧；五轴臂没有槽 4，滚转在槽 5）
-# 所以 J1 每相第一个采，v0.4 比戳老 4g(A)/2g(B)≈2.2/1.2ms（v0.5 是 3g/1g）；J2/J3/J4 只在 A 相刷新，
+# 反馈的 CAN 到达时刻，而每个 tick(5ms) 只按两相调度发命令（control/tx_schedule.hpp），帧间 tx_gap≈0.5ms，
+# 每帧命令触发一条反馈。各车跑过的调度（车型 yaml control.tx_schedule 的历史值）：
+#   v0.4 two_phase_j1_j5：A 相 J1,J2,J3,J5,J4（5 帧）     B 相 J1,J5,J6（3 帧）
+#   v0.5 two_phase_j1   ：A 相 J1,J2,J3,J4（4 帧）        B 相 J1,滚转（2 帧；五轴臂没有槽 4，滚转在槽 5）——2026-10-10 前
+#   v0.5 two_phase_j1_j4：A 相 J1,J2,J3,J4,滚转（5 帧）   B 相 J1,J2,J3,J4（4 帧）——2026-10-10 起（J1–J4 200 Hz）
+# 所以 J1 每相第一个采，v0.4 比戳老 4g(A)/2g(B)≈2.2/1.2ms；two_phase_j1 下 J2/J3/J4 只在 A 相刷新，
 # B 相快照里是 5ms 前的旧值（槽 5 反之）。报告端按戳线性插值 FK 会让 J1 平均滞后 ~2ms、J2-J4 ~4ms（0905 实测，
 # memory/v04-fk-vs-vision-time-shift-0905.md）。这里在页面侧把每轴样本放回真实采样时刻，再把六轴
 # 都插值到该行的戳时刻，之后的 TCP/拍面角/拍速全部基于同刻六轴。只动 states，commands 原样
 # （其 stamp=tx_done，各轴生效时刻同样早 (n−k)·g，但那是零阶保持语义，不在本函数范围）。
-# 相位判定：优先看与上一行相比哪些轴变了（A：只在 A 相发的轴变、只在 B 相发的轴不变；B 反之），
-# 静止段没变化时用戳间隔（两车 A、B 相都差 2 帧：A→B≈5−2g≈4ms，B→A≈5+2g≈6ms）；g 由这两个间隔的中位数反解，
-# 不从 yaml 抄——实测 0828~0905 四场都是 0.52ms。识别不出两相结构（老 v0.3 单相节点、
-# 合成数据、行数太少）或本车不是两相调度，就原样返回 None，页面与从前完全一致。
+# **调度按每场数据自己认，不读当前 yaml**：yaml 只说现在用什么，换调度后旧场次照样要按旧调度对齐
+# （1010 改 two_phase_j1_j4 之前这里读 yaml，一改 yaml 所有历史场次都会静默失去对齐）。
+# 臂重启（/joint_states 断开 >1s）切段，逐段在本车跑过的调度里认：戳间隔两峰 A→B≈5−d·g、B→A≈5+d·g
+# （d = A、B 两相帧数差：j1_j5 / j1 是 2，j1_j4 是 1），两峰中位数之差反解出的 g 必须落在 0.40–0.70ms
+# （实测 0828~1010 各场 0.515~0.52ms）；再用"与上一行相比哪些轴变了"复核（只在 A 相发的轴只在 A 行变，B 反之）。
+# 每行的相位：变化模式优先，静止段没变化时用戳间隔。认不出的段（老 v0.3 单相节点、全轴 full 调度、
+# 合成数据、行数太少）原样不动；整场一段都认不出就返回 None，页面与从前完全一致。
 # 相表逐项抄臂端 tx_phase（偶数拍 A、奇数拍 B）；车上没有的槽发之前剔掉，与 tx_phase(present_mask) 同。
 _TX_SCHEDULE_PHASES = {
     "two_phase_j1_j5": {"A": (0, 1, 2, 4, 3), "B": (0, 4, 5)},
     "two_phase_j1": {"A": (0, 1, 2, 3), "B": (0, 4, 5)},
+    "two_phase_j1_j4": {"A": (0, 1, 2, 3, 4, 5), "B": (0, 1, 2, 3)},
+}
+# 各车跑过的调度。⚠ 车型 yaml 换调度时这里要加上新值（否则新场次认不出、不对齐，页面照常但会打提示）。
+_CAR_TX_SCHEDULES = {
+    "v04": ("two_phase_j1_j5",),
+    "v05": ("two_phase_j1", "two_phase_j1_j4"),
 }
 _REPLY_FRAME_MS = 0.15          # 反馈帧总线时长(~0.12) + 电机取样→发帧处理：样本时刻 = 到达戳 − 它
 _ALIGN_MAX_BRACKET_MS = 25.0    # 单轴相邻样本超过它视为反馈断档，不插值、保留原值
-_TX_GAP_RANGE_MS = (0.30, 0.80)  # 反解出的 g 不在此范围 ⇒ 不是我们认识的两相调度
+_TX_GAP_RANGE_MS = (0.40, 0.70)  # 反解出的 g 不在此范围 ⇒ 不是这个调度（d=1 与 d=2 的两峰距离因此不重叠）
+_ALIGN_SEGMENT_GAP_S = 1.0      # /joint_states 断开超过它 = 臂重启，前后分段各认调度
 
 # ---- 拍心点：v0.4 冻结柔度模型 F（2026-09-07 定案） -----------------------------------------
 # 原来这里把「拍心」当成 FK(q) 的刚性 TCP，拍速就是解析 Jacobian J(q)·q̇。0907 的黑标三场
@@ -219,41 +230,77 @@ def _head_effective_q(model: dict, q, qd, tau) -> list[float]:
     return qe
 
 
-def _tx_phase_order(car: str | None) -> tuple[str, dict, dict] | None:
-    """本车的两相调度 → (调度名, {相: 槽序（已剔除车上没有的槽）}, {槽: 关节标签 Jn})。
+def _tx_schedules(car: str | None) -> tuple[dict, dict] | None:
+    """本车跑过的两相调度 → ({调度名: {相: 槽序（已剔除车上没有的槽）}}, {槽: 关节标签 Jn})。
 
-    调度名读臂车型 yaml 的 control.tx_schedule（与 FK 同一份 arm_controller checkout）；
     标签按本车 ROS 关节名（v0.5 的滚转是 joint5 → J5，虽然它在槽 5）。
-    v0.3（单相节点、臂端已无 yaml）和单相 full 调度返回 None——不对齐。
+    v0.3（单相节点、臂端已无 yaml）与没登记调度的车返回 None——不对齐。
     """
     import extract_arm_bag as _eab
 
-    if car not in _eab.STANDARD_CARS:
-        return None
-    schedule = _eab.standard_kinematics(car).read_car_section(car, "control").get("tx_schedule")
-    table = _TX_SCHEDULE_PHASES.get(schedule)
-    if table is None:
+    if car not in _eab.STANDARD_CARS or car not in _CAR_TX_SCHEDULES:
         return None
     names = _eab.CAR_MODELS[car].slot_joint_names
     present = {j for j, name in enumerate(names) if name is not None}
-    phases = {p: tuple(j for j in order if j in present) for p, order in table.items()}
+    tables = {s: {p: tuple(j for j in order if j in present)
+                  for p, order in _TX_SCHEDULE_PHASES[s].items()}
+              for s in _CAR_TX_SCHEDULES[car]}
     labels = {j: "J" + names[j].removeprefix("joint") for j in present}
-    return schedule, phases, labels
+    return tables, labels
+
+
+def _detect_tx_phases(t: list[float], pos: list, ks: range, tables: dict) -> dict | None:
+    """一段连续行 ks 在候选调度里认调度与逐行相位 → 结果字典（含 phase: {行号: "A"|"B"}）或 None。"""
+    dts = [(t[k] - t[k - 1]) * 1000.0 for k in ks[1:]]
+    lo = sorted(d for d in dts if 3.0 <= d < 5.0)
+    hi = sorted(d for d in dts if 5.0 < d <= 7.0)
+    if len(lo) < 100 or len(hi) < 100 or len(lo) + len(hi) < 0.5 * len(dts):
+        return None
+    ab, ba = lo[len(lo) // 2], hi[len(hi) // 2]
+    best = None
+    for schedule, phases in tables.items():
+        a_only = set(phases["A"]) - set(phases["B"])     # 只在 A 相发的轴
+        b_only = set(phases["B"]) - set(phases["A"])     # 只在 B 相发的轴（j1_j4 没有）
+        d = len(phases["A"]) - len(phases["B"])          # A→B 间隔 = 5 − d·g，B→A = 5 + d·g
+        if d <= 0 or not (a_only or b_only):
+            continue
+        g = (ba - ab) / (2.0 * d)
+        if not (_TX_GAP_RANGE_MS[0] <= g <= _TX_GAP_RANGE_MS[1]):
+            continue
+        win = 0.65 * d * g                               # 两峰各 ±win 判相，5ms 附近留空带
+        phase: dict[int, str] = {}
+        by_change = by_interval = disagree = 0
+        for k in ks[1:]:
+            a_chg = any(pos[k][j] != pos[k - 1][j] for j in a_only)
+            b_chg = any(pos[k][j] != pos[k - 1][j] for j in b_only)
+            dk = (t[k] - t[k - 1]) * 1000.0
+            p_int = "B" if abs(dk - ab) <= win else ("A" if abs(dk - ba) <= win else None)
+            if a_chg != b_chg:
+                p = "A" if a_chg else "B"
+                by_change += 1
+                disagree += p_int is not None and p_int != p
+            else:
+                p = p_int
+                by_interval += p is not None
+            if p is not None:
+                phase[k] = p
+        if by_change and disagree > 0.05 * by_change:
+            continue   # 变化模式与间隔规律对不上：不是这个调度
+        score = disagree / max(1, by_change)
+        if best is None or score < best["score"]:
+            best = {"schedule": schedule, "g": g, "ab": ab, "ba": ba, "phase": phase, "score": score,
+                    "by_change": by_change, "by_interval": by_interval, "disagree": disagree}
+    return best
 
 
 def _time_align_joint_states(arm, car: str | None) -> dict | None:
     """就地把 arm.states 的 position/velocity/effort 对齐到各行戳时刻；返回溯源字典或 None（未对齐）。
-    car 决定两相调度的相表（见 _tx_phase_order）；本车不是两相调度就不动。"""
-    sched = _tx_phase_order(car)
+    car 决定候选调度与相表（见 _tx_schedules）；用的是哪个调度逐段从数据认（见文件上方注释）。"""
+    sched = _tx_schedules(car)
     if sched is None:
         return None
-    schedule, phase_order, labels = sched
-    a_only = set(phase_order["A"]) - set(phase_order["B"])    # 只在 A 相发的轴（两车都是 J2-J4）
-    b_only = set(phase_order["B"]) - set(phase_order["A"])    # 只在 B 相发的轴（槽 5）
-    frames_diff = len(phase_order["A"]) - len(phase_order["B"])   # A→B 间隔 = 5 − 它·g，B→A = 5 + 它·g
-    if not a_only or not b_only or frames_diff <= 0:
-        return None
-    slots = sorted(set(phase_order["A"]) | set(phase_order["B"]))   # 车上有的槽；空槽（v0.5 槽 4）恒 0、不动
+    tables, labels = sched
+    slots = sorted(labels)   # 车上有的槽；空槽（v0.5 槽 4）恒 0、不动
     states = arm.get("states") if isinstance(arm, dict) else None
     if not isinstance(states, list):
         return None
@@ -266,44 +313,41 @@ def _time_align_joint_states(arm, car: str | None) -> dict | None:
     t = [float(states[i]["t"]) for i in idx]
     pos = [states[i]["position"] for i in idx]
     n = len(idx)
-    # ① 相位：变化模式优先，戳间隔兜底
-    phase: list[str | None] = [None] * n
-    by_change = 0
-    for k in range(1, n):
-        chg = [pos[k][j] != pos[k - 1][j] for j in range(6)]
-        a_chg = any(chg[j] for j in a_only)
-        b_chg = any(chg[j] for j in b_only)
-        a_sig, b_sig = a_chg and not b_chg, b_chg and not a_chg
-        if a_sig != b_sig:
-            phase[k] = "A" if a_sig else "B"
-            by_change += 1
-    dts = [(t[k] - t[k - 1]) * 1000.0 for k in range(1, n)]
-    short = sorted(d for d in dts if 3.3 <= d <= 4.7)
-    long_ = sorted(d for d in dts if 5.3 <= d <= 6.7)
-    if len(short) < 100 or len(long_) < 100 or (len(short) + len(long_)) < 0.5 * len(dts):
+    # ① 切段（臂重启），逐段认调度与逐行相位
+    cuts = [0] + [k for k in range(1, n) if t[k] - t[k - 1] > _ALIGN_SEGMENT_GAP_S] + [n]
+    segments = []
+    unrecognized = 0
+    row_phase: list[tuple | None] = [None] * n   # (该相槽序, g)
+    for k0, k1 in zip(cuts, cuts[1:]):
+        if k1 - k0 < 200:
+            continue
+        det = _detect_tx_phases(t, pos, range(k0, k1), tables)
+        if det is None:
+            dts = [t[k] - t[k - 1] for k in range(k0 + 1, k1)]
+            unrecognized += sum(0.003 <= d <= 0.007 for d in dts) >= 0.5 * len(dts)   # 是 200Hz 命令流却认不出
+            continue
+        for k, p in det["phase"].items():
+            row_phase[k] = (tables[det["schedule"]][p], det["g"])
+        segments.append({"schedule": det["schedule"], "t_start": t[k0], "t_end": t[k1 - 1], "rows": k1 - k0,
+                         "tx_gap_ms": round(det["g"], 3), "interval_ab_ms": round(det["ab"], 3),
+                         "interval_ba_ms": round(det["ba"], 3),
+                         "phase_rows": {"A": sum(p == "A" for p in det["phase"].values()),
+                                        "B": sum(p == "B" for p in det["phase"].values()),
+                                        "unknown": k1 - k0 - len(det["phase"])},
+                         "phase_by_change": det["by_change"], "phase_by_interval": det["by_interval"],
+                         "phase_disagree": det["disagree"]})
+    if unrecognized:
+        print(f"[report] /joint_states 关节时刻对齐：{unrecognized} 段 200Hz 命令流认不出调度"
+              f"（{car} 候选 {'/'.join(tables)}），这些段未对齐。臂若换了调度，"
+              "在 generate_curve3_html._CAR_TX_SCHEDULES 登记新值。", file=sys.stderr)
+    if not segments:
         return None
-    ab, ba = short[len(short) // 2], long_[len(long_) // 2]
-    g = (ba - ab) / (2.0 * frames_diff)
-    if not (_TX_GAP_RANGE_MS[0] <= g <= _TX_GAP_RANGE_MS[1]):
-        return None
-    disagree = by_interval = 0
-    for k in range(1, n):
-        d = dts[k - 1]
-        p_int = "B" if 3.3 <= d <= 4.7 else ("A" if 5.3 <= d <= 6.7 else None)
-        if phase[k] is None:
-            phase[k] = p_int
-            by_interval += p_int is not None
-        elif p_int is not None and p_int != phase[k]:
-            disagree += 1
-    if by_change and disagree > 0.05 * by_change:
-        return None   # 变化模式与间隔规律对不上：不是两相调度，别乱动
     # ② 每轴样本放回真实采样时刻
     series: list[list[tuple[float, int]]] = [[] for _ in range(6)]   # (采样时刻, 行号)
     for k in range(n):
-        p = phase[k]
-        if p is None:
+        if row_phase[k] is None:
             continue
-        order = phase_order[p]
+        order, g = row_phase[k]
         m = len(order)
         for pos_in_phase, j in enumerate(order):
             ts = t[k] - ((m - 1 - pos_in_phase) * g + _REPLY_FRAME_MS) * 1e-3
@@ -353,21 +397,33 @@ def _time_align_joint_states(arm, car: str | None) -> dict | None:
                     out[j] = round(v, 5)
                     aligned[fi] += 1
             row[field] = out
-    lag_ms = {p: {labels[j]: round((len(order) - 1 - i) * g + _REPLY_FRAME_MS, 2)
+    main = max(segments, key=lambda s: s["rows"])
+    phases = tables[main["schedule"]]
+    lag_ms = {p: {labels[j]: round((len(order) - 1 - i) * main["tx_gap_ms"] + _REPLY_FRAME_MS, 2)
                   for i, j in enumerate(order)}
-              for p, order in phase_order.items()}
+              for p, order in phases.items()}
+    slow = "、".join(f"{'/'.join(labels[j] for j in phases[p] if j not in phases[o])} 只在 {p} 相刷新"
+                     for p, o in (("A", "B"), ("B", "A")) if set(phases[p]) - set(phases[o]))
+    summary = (f"{main['schedule']}（g={main['tx_gap_ms']}ms）：J1 比戳老 {lag_ms['A']['J1']}/"
+               f"{lag_ms['B']['J1']}ms（A/B 相），{slow}，另一相快照里是上一拍的旧值")
+    if len(segments) > 1:
+        summary += "；分段 " + "、".join(f"{s['schedule']} {s['rows']} 行" for s in segments)
     return {
-        "schedule": schedule,
-        "tx_gap_ms": round(g, 3),
+        "schedule": "+".join(dict.fromkeys(s["schedule"] for s in segments)),
+        "tx_gap_ms": main["tx_gap_ms"],
         "reply_frame_ms": _REPLY_FRAME_MS,
-        "interval_ab_ms": round(ab, 3),
-        "interval_ba_ms": round(ba, 3),
+        "interval_ab_ms": main["interval_ab_ms"],
+        "interval_ba_ms": main["interval_ba_ms"],
         "rows": n,
-        "phase_rows": {"A": phase.count("A"), "B": phase.count("B"), "unknown": phase.count(None)},
-        "phase_by_change": by_change,
-        "phase_by_interval": by_interval,
-        "phase_disagree": disagree,
+        "phase_rows": {p: sum(s["phase_rows"][p] for s in segments) + (p == "unknown") * (
+            n - sum(s["rows"] for s in segments)) for p in ("A", "B", "unknown")},
+        "phase_by_change": sum(s["phase_by_change"] for s in segments),
+        "phase_by_interval": sum(s["phase_by_interval"] for s in segments),
+        "phase_disagree": sum(s["phase_disagree"] for s in segments),
+        "segments": segments,
+        "unrecognized_segments": unrecognized,
         "sample_lag_before_stamp_ms": lag_ms,
+        "summary": summary,
         "components_aligned": dict(zip(fields, aligned)),
         "components_kept_raw": dict(zip(fields, kept_raw)),
         "note": "states 六轴已按各自 CAN 采样时刻插值到 header.stamp；commands 未动（stamp=tx_done）",
@@ -449,9 +505,7 @@ def _add_face_angles(arm, *, tracker_json_path: str | None = None, car: str | No
     if align:
         arm["joint_time_alignment"] = align
         arm["fk_source"] += "（关节时刻已按两相 CAN 调度对齐到戳，见 joint_time_alignment）"
-        lag = align["sample_lag_before_stamp_ms"]
-        print(f"[report] /joint_states 关节时刻对齐（{align['schedule']}）：g={align['tx_gap_ms']}ms，"
-              f"J1 比戳老 {lag['A']['J1']}/{lag['B']['J1']}ms(A/B)，J2-J4 在 B 相另老一拍；"
+        print(f"[report] /joint_states 关节时刻对齐：{align['summary']}；"
               f"states {align['rows']} 行（A {align['phase_rows']['A']} / B {align['phase_rows']['B']} / "
               f"未判 {align['phase_rows']['unknown']}），position 对齐 "
               f"{align['components_aligned']['position']} 分量、保留原值 "
@@ -2452,10 +2506,8 @@ const armFkCarNote = ARM
   ? ('FK 车型 '+(ARM.fk_car||'未知')+
      (ARM.fk_recomputed_from?'（本页按 '+ARM.fk_car+' 复算，arm JSON 原为 '+ARM.fk_recomputed_from+'）':'')+
      (ARM.joint_time_alignment
-       ? '；关节时刻已按两相 CAN 调度对齐到 /joint_states 戳（J1 原比戳老 '
-         +ARM.joint_time_alignment.sample_lag_before_stamp_ms.A.J1+'/'
-         +ARM.joint_time_alignment.sample_lag_before_stamp_ms.B.J1+'ms，J2-J4 在 B 相另老 5ms；'
-         +'页面 FK/拍面角/拍速均取对齐后六轴）'
+       ? '；关节时刻已按两相 CAN 调度对齐到 /joint_states 戳（'
+         +ARM.joint_time_alignment.summary+'；页面 FK/拍面角/拍速均取对齐后六轴）'
        : ''))
   : 'FK 车型 —';
 // 臂数据整体失效的两种模式，以前都只在折叠备注里留一行，页面主体只剩满屏 "—"，
