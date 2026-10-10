@@ -112,6 +112,7 @@ class HighSpeedRecording:
         t = self.exposure_pc
         gaps = np.diff(t) if len(t) > 1 else np.zeros(0)
         slot = 1.0 / float(self.meta.get("slot_fps") or 120.0)
+        step = int(self.meta.get("video_every_slots") or 1)     # swing_hs 录像：每 N 个触发格存一帧，帧号正常差 N
         fn = self.index["frame_num"]
         return {
             "frames": len(self),
@@ -122,7 +123,7 @@ class HighSpeedRecording:
             "gap_ms_p99": round(float(np.percentile(gaps, 99)) * 1000.0, 3) if len(gaps) else None,
             # 时间轴上的空档 = 跳格（触发没发或被拒）；frame_num 缺口 = 相机侧/线上丢帧
             "gaps_over_1_5_slots": int(np.sum(gaps > 1.5 * slot)),
-            "frame_num_gaps": int(np.sum(np.diff(fn) > 1)) if len(fn) > 1 else 0,
+            "frame_num_gaps": int(np.sum(np.diff(fn) > step)) if len(fn) > 1 else 0,
             "lost_packet_frames": int(np.sum(self.index["lost_packet"] > 0)),
             "sync_frames": len(self.meta.get("sync_frame_nums") or []),
         }

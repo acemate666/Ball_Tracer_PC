@@ -15,7 +15,8 @@
      不够 2 台就不开录。各相机目录里 roi_<serial>.jpg 画着 ROI、包络（绿）和 tag（紫）——--plan-only 到这里就停；
   3. ROS 桥（/joint_states 进、本工具话题出）+ rosbag（录全部话题，同 tracker）起来；
   4. 触发进程按 100 Hz 绝对栅格发 action command。每台相机每帧：帧时间（曝光中点）的关节角 + 车位姿 → FK 黑标锚 →
-     全分辨率截块找黑方块候选；tag 窗每 10 帧一块平均后认 tag（开场全幅样张也是 8 帧平均：夜里单帧太噪）；
+     全分辨率截块找黑方块候选（每台相机 1 个取流进程 + 2 个识别进程，识别不拖取流）；tag 窗每 10 帧一块平均后认 tag
+     （开场全幅样张也是 8 帧平均：夜里单帧太噪）；整幅 ROI 原始帧每 20 格存一帧（5 fps 录像）；
   5. 主进程按触发格把 4 台凑齐：多视图解黑标（marker_solver）、双 tag 刚体拟合解车位（CarLocalizer），
      写 marker.jsonl / car.jsonl，发 /swing_hs/racket_marker、/pc_car_loc、/swing_hs/status（都进 bag）；
   6. Ctrl+C / 停止文件 / 到时长 → 停触发 → 各相机把剩下的帧认完 → 停 ROS → meta.json（含自检汇总）。
@@ -33,8 +34,11 @@
   trigger.bin        每次触发 <qdd>：slot, 发出前 perf, 发出后 perf
   <session>_rosbag/  全部话题（含本工具发的三个）；ros_bridge.log；cyclonedds_swing_hs.xml（补了本机 peer 的 DDS 配置）
   cam_<serial>/      full_<serial>.png（全幅原始 Bayer 样张）、roi_<serial>.jpg、clock_<serial>.csv、
-                     patches_<serial>.bin（每帧锚点小块原始 Bayer，--no-patches 关）
-  --record-raw <dir> 另把整幅 ROI 原始帧写到 <dir>/<session>/hs_<serial>.{bayer,idx,json}（~60 MB/s/台，写 NVMe）
+                     patches_<serial>.bin（每帧锚点小块原始 Bayer，--no-patches 关）、
+                     hs_<serial>.{bayer,idx,json}：录像，整幅 ROI 原分辨率原始 Bayer，触发格号 % 20 == 0 的帧（5 fps，
+                     4 台同一批触发），4 台共 ~11 MB/s ≈ 40 GB/h；test_src/hs_recording.py 读 / 导 mp4（--play-fps 5 是原速）。
+                     用户 1011：「保存视频就按 5 FPS 保留原版的（不要降低分辨率）」——1011 01:01 那场 100 fps 全录，写盘跟不上丢了
+                     2–12% 的帧。--video-fps 改帧率（要整除触发帧率），0 不录
 
 用法（ASUS，仓库根，.venv_ros2 的 python；或 .\\run_swing_hs.ps1 -Car v05 -Side fore）：
   python swing_hs/run_swing_hs.py --car v05 --side fore
@@ -53,6 +57,7 @@ import multiprocessing as mp
 import os
 import queue
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -125,6 +130,61 @@ class SlotAssembler:
                 out.append((slot, self.pending.pop(slot)))
         self._closed.update(slot for slot, _ in out)
         return out
+
+
+class SeqReorder:
+    """一台相机的识别结果按交出顺序放行。一台相机几个识别进程共用一个任务队列，结果到主进程的先后会乱几个；按序号放行后
+    每台相机的消息仍按格号先后到，凑格、黑标「连续」判断、marker.jsonl 和话题都保持时间顺序。
+    序号只在任务交出成功后才占（camera_proc._submit），正常不缺号；真缺了攒到 max_hold 条就跳过去、计数。"""
+
+    def __init__(self, max_hold: int) -> None:
+        self.next = 0
+        self.max_hold = max_hold
+        self.held: dict[int, Any] = {}
+        self.skipped = 0
+
+    def push(self, seq: int, item: Any) -> list:
+        if seq < self.next:          # 跳号之后才到的：直接放（凑格那边已交出的格会按迟到丢）
+            return [item]
+        self.held[seq] = item
+        out = []
+        while True:
+            if self.next in self.held:
+                out.append(self.held.pop(self.next))
+                self.next += 1
+            elif len(self.held) > self.max_hold:
+                lowest = min(self.held)
+                self.skipped += lowest - self.next
+                self.next = lowest
+            else:
+                return out
+
+    def flush(self) -> list:
+        out = [self.held[seq] for seq in sorted(self.held)]
+        self.held.clear()
+        return out
+
+
+def merge_detect_stats(per_worker: dict) -> dict:
+    """一台相机几个识别进程的统计合成一份：计数相加，最大值取最大；积压是共用队列的长度，取最大。"""
+    out: dict[str, Any] = {"workers": len(per_worker), "processed": 0, "with_candidates": 0, "proc_ms_sum": 0.0,
+                           "proc_ms_max": 0.0, "tag_runs": 0, "tag_hits": 0, "backlog": 0, "backlog_max": 0}
+    for s in per_worker.values():
+        for key in ("processed", "with_candidates", "proc_ms_sum", "tag_runs", "tag_hits"):
+            out[key] += s.get(key, 0)
+        for key in ("proc_ms_max", "backlog", "backlog_max"):
+            out[key] = max(out[key], s.get(key, 0))
+    return out
+
+
+def video_every_slots(fps: float, video_fps: float) -> int:
+    """录像每几个触发格存一帧（0 = 不录）。必须整除：各相机按格号挑帧，4 台存的才是同一批触发，离线能多视图对上。"""
+    if video_fps <= 0.0:
+        return 0
+    every = int(round(fps / video_fps))
+    if every < 1 or abs(fps / every - video_fps) > 1e-6:
+        raise ValueError(f"录像帧率 {video_fps:g} 要整除触发帧率 {fps:g}（如 5、10、20、25、50）")
+    return every
 
 
 class CarPose:
@@ -394,7 +454,8 @@ def main() -> int:
                     help="开场认不到双 tag 时手给车位（世界 m / 度）定 ROI；录像中照样按 tag 更新")
     ap.add_argument("--no-ros", action="store_true", help="不起 ROS 桥和 rosbag（没有关节角就没有黑标，只用于相机自检）")
     ap.add_argument("--no-patches", action="store_true", help="不存每帧锚点小块")
-    ap.add_argument("--record-raw", default=None, metavar="DIR", help="另存整幅 ROI 原始帧到 DIR/<session>/（要 NVMe）")
+    ap.add_argument("--video-fps", type=float, default=None,
+                    help="覆盖配置的录像帧率（整幅 ROI 原分辨率原始帧，默认 5；要整除触发帧率；0 = 不录）")
     args = ap.parse_args()
 
     cfg = _load_json(Path(args.config))
@@ -419,6 +480,13 @@ def main() -> int:
     if args.j1_range is not None and len(sides) != 1:
         print("--j1-range 只能配单侧 --side", file=sys.stderr)
         return 2
+    try:
+        video_every = video_every_slots(fps, float(args.video_fps if args.video_fps is not None else cfg["video_fps"]))
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    video_fps = fps / video_every if video_every else 0.0
+    detect_workers = int(cfg["marker"]["detect_workers"])
 
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")   # 只用来起目录名
     session = f"swing_hs_{'plan_' if args.plan_only else 'probe_' if args.probe is not None else ''}{stamp}"
@@ -427,7 +495,6 @@ def main() -> int:
     session_dir.mkdir(parents=True, exist_ok=False)
     stop_file = out_root / STOP_FILE_NAME
     stop_file.unlink(missing_ok=True)
-    raw_dir = str(Path(args.record_raw) / session) if args.record_raw else None
 
     # 黑标包络（车体系）
     j1_ranges = {s: (tuple(args.j1_range) if args.j1_range is not None else tuple(cfg["sides"][s]["j1_range_deg"]))
@@ -443,7 +510,9 @@ def main() -> int:
 
     carloc = CarLocalizer(str(calib_path), str(vehicle_path))
     print(f"[swing_hs] {session}  车 {args.car}  侧 {args.side}  {fps:g} fps  曝光 {exposure_us:g} µs  "
-          f"黑标包络 {len(marker_car)} 点（J1 {j1_ranges}）")
+          f"黑标包络 {len(marker_car)} 点（J1 {j1_ranges}）  录像 "
+          + (f"{video_fps:g} fps（每 {video_every} 格一帧，原分辨率）" if video_every else "不录")
+          + f"  识别 {detect_workers} 进程/台")
 
     ctx = mp.get_context("spawn")
     out_q = ctx.Queue()
@@ -459,7 +528,8 @@ def main() -> int:
         "session": session, "args": vars(args), "config": cfg, "camera_config": cam_cfg, "fps": fps,
         "exposure_us": exposure_us, "car": args.car, "side": args.side, "j1_ranges_deg": j1_ranges,
         "calibration": str(calib_path), "vehicle_config": str(vehicle_path), "envelope": str(envelope_path),
-        "marker_z_offset_m": z_offset, "frame_time_reference": "exposure_center", "events": [],
+        "marker_z_offset_m": z_offset, "frame_time_reference": "exposure_center", "video_fps": video_fps,
+        "video_every_slots": video_every, "detect_workers": detect_workers, "events": [],
     }
     errors: list[str] = []
     snapshots: dict[str, dict] = {}
@@ -480,9 +550,9 @@ def main() -> int:
         elif kind in ("stats", "trigger"):
             latest[who] = payload
         elif kind == "dstats":
-            latest_det[who] = payload
+            latest_det.setdefault(who, {})[payload["worker"]] = payload
         elif kind == "ddone":
-            done_det[who] = payload
+            done_det.setdefault(who, {})[payload["worker"]] = payload
         elif kind == "warn":
             print(f"  [警告 {who}] {payload}")
             meta["events"].append({"warn": who, "msg": payload})
@@ -533,16 +603,18 @@ def main() -> int:
                 "crop_radius_px": int(cfg["marker"]["crop_radius_px"]),
                 "tag_every_frames": int(cfg["car_loc"]["tag_every_frames"]),
                 "tag_window_pad_px": float(cfg["car_loc"]["tag_window_pad_px"]),
-                "joint_port": camera_ports[sn], "record_patches": not args.no_patches, "raw_dir": raw_dir,
+                "joint_port": camera_ports[sn], "record_patches": not args.no_patches,
+                "video_every_slots": video_every, "detect_workers": detect_workers,
             }
             p = ctx.Process(target=camera_main,
                             args=(spec, out_q, ctrl_qs[sn], detect_qs[sn], shared_car, t0_shared, cam_stop, cam_start),
                             name=f"cam-{sn}")
             p.start()
             procs[sn] = p
-            p = ctx.Process(target=detect_main, args=(spec, detect_qs[sn], out_q), name=f"det-{sn}")
-            p.start()
-            procs[f"det-{sn}"] = p
+            for k in range(detect_workers):
+                p = ctx.Process(target=detect_main, args=(spec, k, detect_qs[sn], out_q), name=f"det-{sn}-{k}")
+                p.start()
+                procs[f"det-{sn}-{k}"] = p
         wait_for(snapshots, serials, 120.0, "相机开场（自动增益 + 全幅样张）")
         if errors:
             raise RuntimeError("; ".join(errors))
@@ -605,6 +677,15 @@ def main() -> int:
         if minimum_period > period:
             raise RuntimeError(f"触发周期 {1e3 * period:.2f} ms 短于相机最小 {1e3 * minimum_period:.2f} ms")
         print(f"  各相机 ROI 叠加图：{session_dir}\\cam_*\\roi_*.jpg")
+        if video_every:
+            rate = sum(int(p.roi[2]) * int(p.roi[3]) for p in plans.values()) * video_fps     # B/s（8-bit Bayer）
+            free = shutil.disk_usage(session_dir).free
+            meta["video_bytes_per_s"] = rate
+            print(f"  录像：整幅 ROI 原始帧 {video_fps:g} fps，{len(plans)} 台共 {rate / 1e6:.1f} MB/s"
+                  f"（{rate * 3600 / 1e9:.0f} GB/h），{session_dir.anchor} 剩 {free / 1e9:.0f} GB")
+            if not args.plan_only and rate * duration > 0.9 * free:
+                raise RuntimeError(f"录满 {duration:g} s 要 {rate * duration / 1e9:.0f} GB，盘上只剩 {free / 1e9:.0f} GB："
+                                   "清盘、缩 --duration，或 --video-fps 0")
         if args.plan_only:
             print("[swing_hs] --plan-only：到此为止")
             return 0
@@ -622,6 +703,7 @@ def main() -> int:
 
         marker_asm = SlotAssembler(set(serials), SLOT_TIMEOUT)
         tag_asm = SlotAssembler(tag_cameras, SLOT_TIMEOUT)
+        reorder = {sn: SeqReorder(DETECT_QUEUE_JOBS) for sn in serials}
         prev_rx: dict[str, int] = {}
         window = {"solved": 0, "slots": 0}
 
@@ -685,14 +767,19 @@ def main() -> int:
             if ros is not None:
                 ros.publish(topics["car_loc"], pc_car_loc_payload(loc))
 
-        def handle(kind: str, who: str, payload: Any) -> None:
+        def dispatch(kind: str, who: str, body: tuple) -> None:
             if kind == "f":
-                for slot, msgs in marker_asm.add(payload[0], who, payload):
+                for slot, msgs in marker_asm.add(body[0], who, body):
                     process_marker_slot(slot, msgs)
-            elif kind == "t":
-                if who in tag_asm.expected:
-                    for slot, msgs in tag_asm.add(payload[0], who, payload):
-                        process_tag_slot(slot, msgs)
+            elif who in tag_asm.expected:
+                for slot, msgs in tag_asm.add(body[0], who, body):
+                    process_tag_slot(slot, msgs)
+
+        def handle(kind: str, who: str, payload: Any) -> None:
+            if kind in ("f", "t"):
+                seq, body = payload
+                for k, b in reorder[who].push(seq, (kind, body)):
+                    dispatch(k, who, b)
             else:
                 handle_control(kind, who, payload)
 
@@ -772,11 +859,11 @@ def main() -> int:
                         continue
                     rate = (s["received"] - prev_rx.get(sn, 0)) / dt
                     prev_rx[sn] = s["received"]
-                    d = latest_det.get(sn) or {}
-                    proc = max(1, d.get("processed", 0))
+                    d = merge_detect_stats(latest_det.get(sn) or {})
+                    proc = max(1, d["processed"])
                     parts.append(f"{sn[-3:]} {rate:5.1f}fps 丢{s['proc_dropped'] + s['missing'] + s['detect_dropped']} "
-                                 f"积压{d.get('backlog', 0):<3d} 候选{100 * d.get('with_candidates', 0) / proc:3.0f}% "
-                                 f"{d.get('proc_ms_sum', 0.0) / proc:4.1f}ms")
+                                 f"积压{d['backlog']:<3d} 候选{100 * d['with_candidates'] / proc:3.0f}% "
+                                 f"{d['proc_ms_sum'] / proc:4.1f}ms")
                 solved = 100.0 * window["solved"] / max(1, window["slots"])
                 window["solved"] = window["slots"] = 0
                 tr = latest.get("trigger") or {}
@@ -812,10 +899,11 @@ def main() -> int:
             for sn in serials:
                 if sn in procs and not procs[sn].is_alive() and sn not in sentinel_sent:
                     sentinel_sent.add(sn)
-                    try:
-                        detect_qs[sn].put(None, timeout=1.0)
-                    except queue.Full:
-                        pass
+                    for _ in range(detect_workers):
+                        try:
+                            detect_qs[sn].put(None, timeout=1.0)
+                        except queue.Full:
+                            break
             return any(procs[k].is_alive() for k in procs if k.startswith("det-"))
 
         while time.perf_counter() < deadline and (
@@ -843,6 +931,9 @@ def main() -> int:
         except (queue.Empty, EOFError, OSError):
             pass
         if streaming and marker_writer is not None:
+            for sn in serials:
+                for k, b in reorder[sn].flush():
+                    dispatch(k, sn, b)
             for slot, msgs in marker_asm.expire(force=True):
                 process_marker_slot(slot, msgs)
             for slot, msgs in tag_asm.expire(force=True):
@@ -862,6 +953,7 @@ def main() -> int:
         meta["done"] = done
         meta["done_detect"] = done_det
         meta["late_messages"] = {"marker": marker_asm.late if streaming else 0, "tag": tag_asm.late if streaming else 0}
+        meta["reorder_skipped"] = {sn: reorder[sn].skipped for sn in serials} if streaming else {}
         if streaming:
             meta["summary"] = summarize(meta, counters, car, fusion, done, latest, done_det, latest_det, main_joints)
             print(json.dumps(meta["summary"], ensure_ascii=False, indent=2))
@@ -882,24 +974,25 @@ def summarize(meta: dict, counters: dict, car: CarPose, fusion: MarkerFusion, do
     for sn, s in done.items():
         if sn == "trigger":
             continue
-        d = done_det.get(sn) or latest_det.get(sn) or {}
+        d = merge_detect_stats({**(latest_det.get(sn) or {}), **(done_det.get(sn) or {})})
         prep = max(1, int(s.get("prepared", 0)))
-        proc = max(1, int(d.get("processed", 0)))
+        proc = max(1, int(d["processed"]))
         cams[sn] = {
             "received": s.get("received"), "vs_issued": round(s.get("received", 0) / issued, 4) if issued else None,
             "missing": s.get("missing"), "lost_packet_frames": s.get("lost_packet_frames"),
             "proc_dropped": s.get("proc_dropped"), "detect_dropped": s.get("detect_dropped"),
-            "prepared": s.get("prepared"), "processed": d.get("processed"),
-            "with_candidates": round(d.get("with_candidates", 0) / proc, 4),
+            "prepared": s.get("prepared"), "processed": d["processed"], "detect_workers": d["workers"],
+            "with_candidates": round(d["with_candidates"] / proc, 4),
             "out_of_roi": round(s.get("out_of_roi", 0) / prep, 4),
             "no_joint_state": round(s.get("no_joint_state", 0) / prep, 4),
             "no_car_pose": round(s.get("no_car_pose", 0) / prep, 4),
             "prep_ms_mean": round(s.get("prep_ms_sum", 0.0) / prep, 2), "prep_ms_max": round(s.get("prep_ms_max", 0.0), 1),
-            "detect_ms_mean": round(d.get("proc_ms_sum", 0.0) / proc, 2),
-            "detect_ms_max": round(d.get("proc_ms_max", 0.0), 1), "detect_backlog_max": d.get("backlog_max"),
+            "detect_ms_mean": round(d["proc_ms_sum"] / proc, 2),
+            "detect_ms_max": round(d["proc_ms_max"], 1), "detect_backlog_max": d["backlog_max"],
             "joint_wait_ms_mean": round(s.get("joint_wait_ms_sum", 0.0) / prep, 2),
-            "tag_blocks": s.get("tag_blocks"), "tag_hits": d.get("tag_hits"), "tag_runs": d.get("tag_runs"),
-            "patches_written": s.get("patches_written"), "raw_written": s.get("raw_written"),
+            "tag_blocks": s.get("tag_blocks"), "tag_hits": d["tag_hits"], "tag_runs": d["tag_runs"],
+            "patches_written": s.get("patches_written"), "video_frames": s.get("video_frames"),
+            "video_dropped": s.get("video_dropped"),
             "joint_name_mismatch": s.get("joint_name_mismatch"),
         }
     out["cameras"] = cams

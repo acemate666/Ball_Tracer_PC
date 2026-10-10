@@ -22,7 +22,9 @@ from swing_hs.camera_proc import (  # noqa: E402
 )
 from swing_hs.joints import JointBuffer  # noqa: E402
 from swing_hs.marker_solver import FastMarkerSolver, MarkerFusion, SessionOffset  # noqa: E402
-from swing_hs.run_swing_hs import CarPose, SlotAssembler, pc_car_loc_payload, pose_from_tag_lists  # noqa: E402
+from swing_hs.run_swing_hs import (  # noqa: E402
+    CarPose, SeqReorder, SlotAssembler, merge_detect_stats, pc_car_loc_payload, pose_from_tag_lists, video_every_slots,
+)
 from swing_hs.trigger_proc import next_trigger_slot  # noqa: E402
 
 CALIB = REPO / "src" / "config" / "four_camera_calib_18.json"
@@ -383,3 +385,44 @@ def test_slot_assembler_completes_and_expires():
     out = asm.add(6, "a", 4)
     assert out == [(2, {"a": 3})]
     assert asm.expire(force=True) == [(6, {"a": 4})]
+
+
+def test_seq_reorder_restores_submit_order():
+    r = SeqReorder(max_hold=5)
+    assert r.push(1, "b") == []
+    assert r.push(0, "a") == ["a", "b"]
+    assert r.push(3, "d") == []
+    assert r.push(2, "c") == ["c", "d"]
+    assert r.flush() == [] and r.skipped == 0
+
+
+def test_seq_reorder_skips_missing_after_max_hold():
+    r = SeqReorder(max_hold=2)
+    assert r.push(1, "b") == []
+    assert r.push(2, "c") == []
+    assert r.push(3, "d") == ["b", "c", "d"]     # 0 号一直没来：攒到 3 条 > max_hold 就跳过去
+    assert r.skipped == 1
+    assert r.push(0, "a") == ["a"]               # 跳号之后才到的直接放
+    assert r.push(5, "f") == []
+    assert r.flush() == ["f"]
+
+
+def test_merge_detect_stats_sums_counts_and_keeps_peaks():
+    merged = merge_detect_stats({
+        0: {"worker": 0, "processed": 10, "with_candidates": 8, "proc_ms_sum": 80.0, "proc_ms_max": 12.0,
+            "tag_runs": 1, "tag_hits": 1, "backlog": 3, "backlog_max": 7},
+        1: {"worker": 1, "processed": 9, "with_candidates": 9, "proc_ms_sum": 70.0, "proc_ms_max": 15.0,
+            "tag_runs": 0, "tag_hits": 0, "backlog": 2, "backlog_max": 9},
+    })
+    assert (merged["workers"], merged["processed"], merged["with_candidates"]) == (2, 19, 17)
+    assert (merged["proc_ms_sum"], merged["proc_ms_max"]) == (150.0, 15.0)
+    assert (merged["backlog"], merged["backlog_max"], merged["tag_runs"]) == (3, 9, 1)
+    assert merge_detect_stats({})["processed"] == 0
+
+
+def test_video_every_slots():
+    assert video_every_slots(100.0, 5.0) == 20
+    assert video_every_slots(100.0, 100.0) == 1
+    assert video_every_slots(100.0, 0.0) == 0
+    with pytest.raises(ValueError):
+        video_every_slots(100.0, 3.0)

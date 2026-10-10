@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""swing_hs 相机侧：每台相机一个取流进程（CameraWorker）+ 一个黑标识别进程（detect_main）。
+"""swing_hs 相机侧：每台相机一个取流进程（CameraWorker）+ detect_workers 个黑标识别进程（detect_main）。
 
 为什么拆进程：Python 有 GIL，4 × 100 fps 取帧 + 识别挤在一个进程里会互相饿死（1006 hs405_trial 实测
 4 条忙线程把 40 fps 同步组拖到 5 fps；record_swing_hs.py 一台一个进程 100 fps 0 丢帧）。黑标候选检测夜里每块
@@ -15,9 +15,12 @@
      准备线程每帧：帧时间的关节角（ROS 桥 UDP 转来）+ 车位姿（主进程共享）→ FK 黑标锚 → 投到本相机 → 在原始
      Bayer ROI 帧上截 ±(48+4) px 小块；tag 窗按触发格每 tag_every 帧一块累加平均（车静止，平均压夜里的噪声）。
      小块 / tag 平均图发给本相机的识别进程：解码 → 黑方块候选（与 tracker 在线黑标、收场工具同一个
-     racket_ht_black_marker._marker_candidates）/ 认 tag，结果小消息发主进程三角化 / 解车位；
-  4. 可选：每帧小块原样存盘（patches_<serial>.bin，离线换算法重认）、整幅 ROI 原始帧存盘（hs_<serial>.*，
-     与 HighSpeedRecorder / test_src/hs_recording.py 同格式）。
+     racket_ht_black_marker._marker_candidates）/ 认 tag，结果小消息发主进程三角化 / 解车位。
+     一台相机配 detect_workers 个识别进程，共用一个任务队列（挥拍时夜里每块 8–10 ms，一个进程贴着 100 fps 的 10 ms 预算）；
+     任务带本相机的序号，结果到主进程的先后会乱几个，主进程按序号放行；
+  4. 存盘：每帧小块原样存（patches_<serial>.bin，离线换算法重认，可关）；录像 = 整幅 ROI 原分辨率原始 Bayer，
+     每 video_every 个触发格存一帧（默认 100/20 = 5 fps，用户 1011：「保存视频就按 5 FPS 保留原版的，不要降低分辨率」；
+     按格号挑帧，4 台存的是同一批触发；hs_<serial>.*，与 HighSpeedRecorder / test_src/hs_recording.py 同格式）。
 """
 
 from __future__ import annotations
@@ -58,10 +61,10 @@ PATCH_BORDER_PX = 4
 JOINT_WAIT_S = 0.08
 #: 待准备帧队列上限（帧）：准备线程跟不上时丢最老的，计数
 PROCESS_QUEUE_FRAMES = 200
-#: 识别进程任务队列上限（2 s）：满了就丢这一帧的任务、计数，不阻塞取流
+#: 识别任务队列上限（2 s；本相机几个识别进程共用）：满了就丢这一帧的任务、计数，不阻塞取流
 DETECT_QUEUE_JOBS = 200
-#: 原始帧写盘队列上限（帧）
-RAW_QUEUE_FRAMES = 3000
+#: 录像写盘队列上限（帧；5 fps 时 60 s）
+VIDEO_QUEUE_FRAMES = 300
 #: 开录前设备时钟锁存次数（取往返最短的作初始偏移），之后每秒一次
 CLOCK_LATCH_INITIAL = 7
 CLOCK_LATCH_PERIOD_S = 1.0
@@ -338,12 +341,15 @@ class CameraWorker:
         self._frames: deque = deque()
         self._frames_cv = threading.Condition()
         self._grab_done = threading.Event()
-        self._raw_q: "queue.Queue[Optional[tuple]]" = queue.Queue(maxsize=RAW_QUEUE_FRAMES)
+        self.video_every = int(spec["video_every_slots"])      # 录像每几个触发格存一帧，0 = 不录
+        self.detect_workers = int(spec["detect_workers"])
+        self._seq = 0                                          # 交给识别进程的任务序号（主进程按它恢复本相机的先后）
+        self._video_q: "queue.Queue[Optional[tuple]]" = queue.Queue(maxsize=VIDEO_QUEUE_FRAMES)
         self._patch_q: "queue.Queue[Optional[tuple]]" = queue.Queue(maxsize=4000)
         self.stats: dict[str, Any] = {
             "received": 0, "missing": 0, "lost_packets": 0, "lost_packet_frames": 0, "size_mismatch": 0,
             "proc_dropped": 0, "prepared": 0, "detect_dropped": 0, "no_car_pose": 0, "no_joint_state": 0,
-            "out_of_roi": 0, "tag_blocks": 0, "raw_written": 0, "raw_dropped": 0,
+            "out_of_roi": 0, "tag_blocks": 0, "video_frames": 0, "video_dropped": 0,
             "patches_written": 0, "patches_dropped": 0, "prep_ms_sum": 0.0, "prep_ms_max": 0.0,
             "joint_wait_ms_sum": 0.0, "queue_max": 0, "before_trigger": 0,
         }
@@ -610,7 +616,7 @@ class CameraWorker:
         cam = self.cam
         st = cph.MV_FRAME_OUT()
         frame_bytes = None
-        record_raw = bool(self.spec.get("raw_dir"))
+        video_every = self.video_every
         stats = self.stats
         try:
             while True:
@@ -648,19 +654,19 @@ class CameraWorker:
                 if n != frame_bytes:
                     stats["size_mismatch"] += 1
                     continue
-                if record_raw:
-                    try:
-                        # 原始帧索引同 HighSpeedRecorder 格式（字段就叫 exposure_start_pc），只给 test_src/hs_recording.py 读
-                        self._raw_q.put_nowait(((fnum, dev, exposure_start_pc, arrival, lost), data))
-                    except queue.Full:
-                        stats["raw_dropped"] += 1
                 t0 = self.t0.value
                 if t0 == 0.0:          # 触发进程还没起：不该有帧（触发模式），有也不知道是哪一格
                     stats["before_trigger"] += 1
                     continue
+                slot = slot_of(frame_t, t0, self.period)
+                if video_every and slot % video_every == 0:
+                    try:
+                        # 索引同 HighSpeedRecorder 格式（字段就叫 exposure_start_pc），test_src/hs_recording.py 直接读
+                        self._video_q.put_nowait(((fnum, dev, exposure_start_pc, arrival, lost), data))
+                    except queue.Full:
+                        stats["video_dropped"] += 1
                 h, w = self.frame_shape
                 raw = np.frombuffer(data, dtype=np.uint8, count=w * h).reshape(h, w)
-                slot = slot_of(frame_t, t0, self.period)
                 with self._frames_cv:
                     if len(self._frames) >= PROCESS_QUEUE_FRAMES:
                         self._frames.popleft()
@@ -696,13 +702,15 @@ class CameraWorker:
             time.sleep(0.002)
         return time.perf_counter() - start
 
-    def _submit(self, job: tuple) -> bool:
+    def _submit(self, kind: str, payload: tuple) -> bool:
+        """交给识别进程，带本相机的任务序号（交出成功才占号，序号连续）。"""
         try:
-            self.detect_q.put_nowait(job)
-            return True
+            self.detect_q.put_nowait((kind, self._seq, payload))
         except queue.Full:
             self.stats["detect_dropped"] += 1
             return False
+        self._seq += 1
+        return True
 
     def _prepare_loop(self) -> None:
         """每帧：等关节角 → FK 黑标锚 → 截块，连同帧信息交给识别进程；tag 窗按块累加平均，满一块交给识别进程。"""
@@ -747,15 +755,15 @@ class CameraWorker:
                             self._patch_q.put_nowait((slot, fnum, frame_t, patch))
                         except queue.Full:
                             stats["patches_dropped"] += 1
-            self._submit(("m", slot, fnum, frame_t, status, anchor_mm,
-                          None if q is None else [round(float(v), 6) for v in q], patch_job))
+            self._submit("m", (slot, fnum, frame_t, status, anchor_mm,
+                               None if q is None else [round(float(v), 6) for v in q], patch_job))
             if pose is not None and self.tags_in_roi:
                 block = self.tag_avg.add(
                     slot, frame_t, raw,
                     lambda: tag_windows(self.camera, pose, self.tag_corners, self.roi, self.tag_pad))
                 if block is not None:
                     stats["tag_blocks"] += 1
-                    self._submit(("t", *block, roi_origin, pixel_type))
+                    self._submit("t", (*block, roi_origin, pixel_type))
             stats["prepared"] += 1
             dt_ms = 1e3 * (time.perf_counter() - t_start)
             stats["prep_ms_sum"] += dt_ms
@@ -763,7 +771,7 @@ class CameraWorker:
         block = self.tag_avg.flush()
         if block is not None:
             stats["tag_blocks"] += 1
-            self._submit(("t", *block, roi_origin, pixel_type))
+            self._submit("t", (*block, roi_origin, pixel_type))
 
     # ── 写盘 ──
     def _patch_writer(self) -> None:
@@ -779,38 +787,42 @@ class CameraWorker:
                 f.write(patch.tobytes())
                 self.stats["patches_written"] += 1
 
-    def _raw_writer(self) -> None:
-        base = Path(self.spec["raw_dir"]) / f"hs_{self.serial}"
+    def _video_writer(self) -> None:
+        base = self.out_dir / f"hs_{self.serial}"
         pack = struct.Struct(INDEX_FORMAT).pack
-        with open(base.with_suffix(".bayer"), "wb", buffering=16 << 20) as fr, \
+        with open(base.with_suffix(".bayer"), "wb", buffering=4 << 20) as fr, \
                 open(base.with_suffix(".idx"), "wb", buffering=1 << 16) as fi:
-            n = 0
             while True:
-                item = self._raw_q.get()
+                item = self._video_q.get()
                 if item is None:
                     break
                 rec, data = item
                 fr.write(data)
                 fi.write(pack(*rec))
-                self.stats["raw_written"] += 1
-                n += 1
-                if n % 200 == 0:
+                self.stats["video_frames"] += 1
+                if self.stats["video_frames"] % 10 == 0:      # 5 fps 时每 2 s 落一次盘，进程崩了也只丢 2 s
+                    fr.flush()
                     fi.flush()
 
-    def _write_raw_meta(self) -> None:
-        if not self.spec.get("raw_dir"):
+    def _write_video_meta(self) -> None:
+        if not self.video_every:
             return
         ox, oy, w, h = self.roi
-        write_json(Path(self.spec["raw_dir"]) / f"hs_{self.serial}.json", {
+        fps = float(self.spec["fps"])
+        write_json(self.out_dir / f"hs_{self.serial}.json", {
             "serial": self.serial,
             "roi": {"offset_x": ox, "offset_y": oy, "width": w, "height": h},
-            "slot_fps": float(self.spec["fps"]),
+            # slot_fps = 录像自己的帧栅格（hs_recording.py 的 summary 按它数跳格）：每 video_every_slots 个触发格一帧
+            "slot_fps": fps / self.video_every,
+            "trigger_fps": fps,
+            "video_every_slots": self.video_every,
             "readback": self.readback,
             "files": {"index_format": INDEX_FORMAT,
-                      "index_fields": ["frame_num", "dev_timestamp", "exposure_start_pc", "arrival_perf", "lost_packet"]},
+                      "index_fields": ["frame_num", "dev_timestamp", "exposure_start_pc", "arrival_perf", "lost_packet"],
+                      "frame_time": "曝光中点 = exposure_start_pc + readback.exposure_us / 2；同一帧在 marker.jsonl 里按 frame_num 找"},
             "recording": {"frame_shape": list(self.frame_shape) if self.frame_shape else None,
-                          "pixel_type": self.pixel_type, "written": self.stats["raw_written"],
-                          "dropped": self.stats["raw_dropped"]},
+                          "pixel_type": self.pixel_type, "written": self.stats["video_frames"],
+                          "dropped": self.stats["video_dropped"]},
         })
 
     def _write_clock_csv(self) -> None:
@@ -845,8 +857,6 @@ class CameraWorker:
 
     def run(self) -> None:
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        if self.spec.get("raw_dir"):
-            Path(self.spec["raw_dir"]).mkdir(parents=True, exist_ok=True)
         self.open()
         try:
             self._send("snapshot", self.auto_gain_and_snapshot())
@@ -869,8 +879,8 @@ class CameraWorker:
             ]
             if self.spec.get("record_patches"):
                 threads.append(threading.Thread(target=self._patch_writer, name=f"patch-{self.serial}", daemon=True))
-            if self.spec.get("raw_dir"):
-                threads.append(threading.Thread(target=self._raw_writer, name=f"raw-{self.serial}", daemon=True))
+            if self.video_every:
+                threads.append(threading.Thread(target=self._video_writer, name=f"video-{self.serial}", daemon=True))
             clock_stop = threading.Event()
             threads.append(threading.Thread(target=self._clock_loop, args=(clock_stop,), name=f"clock-{self.serial}",
                                             daemon=True))
@@ -884,18 +894,20 @@ class CameraWorker:
             threads[1].join(timeout=30.0)
             clock_stop.set()
             self._patch_q.put(None)
-            self._raw_q.put(None)
+            self._video_q.put(None)
             for th in threads[2:]:
                 th.join(timeout=60.0)
             listener_stop.set()
-            try:
-                self.detect_q.put(None, timeout=30.0)    # 识别进程把剩下的任务做完就退（主进程兜底也会放）
-            except queue.Full:
-                pass
+            for _ in range(self.detect_workers):
+                try:
+                    # 每个识别进程一个结束标记，排在所有任务后面：剩下的任务做完就退（主进程兜底也会放）
+                    self.detect_q.put(None, timeout=30.0)
+                except queue.Full:
+                    break
             for _ in range(3):
                 self.latch_clock()
             self._write_clock_csv()
-            self._write_raw_meta()
+            self._write_video_meta()
             self._send("done", {**self.stats_snapshot(), "readback": self.readback})
         finally:
             try:
@@ -919,21 +931,21 @@ def camera_main(spec: dict, out_q, ctrl_q, detect_q, shared_car, t0, stop_evt, s
         out_q.put(("error", str(spec.get("serial")), f"{exc!r}\n{traceback.format_exc()}"))
 
 
-def detect_main(spec: dict, detect_q, out_q) -> None:
-    """一台相机的黑标识别进程：取流进程交来的小块 → 黑方块候选（"f" 消息）、tag 平均图 → 认 tag（"t" 消息），发主进程。
-    收到 None（取流进程收尾时放的；主进程兜底也会放）就退。"""
+def detect_main(spec: dict, worker: int, detect_q, out_q) -> None:
+    """一台相机的一个黑标识别进程（本相机几个识别进程共用 detect_q）：取流进程交来的小块 → 黑方块候选（"f" 消息）、
+    tag 平均图 → 认 tag（"t" 消息），带任务序号发主进程。收到 None（取流进程收尾时每个识别进程放一个；主进程兜底也会放）就退。"""
     import cv2
 
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     serial = str(spec["serial"])
     try:
-        cv2.setNumThreads(1)       # 97 px 小块上 OpenCV 内部多线程只有调度开销，4 个识别进程还会互相抢核
+        cv2.setNumThreads(1)       # 97 px 小块上 OpenCV 内部多线程只有调度开销，8 个识别进程还会互相抢核
         geometry.load_test_src("racket_ht_black_marker")
         tag_detector = make_tag_detector(full_frame=False)
         tag_ids = set(geometry.tag_corners_car(geometry.load_vehicle_reference(Path(spec["vehicle_path"])), 1.0))
         radius = int(spec["crop_radius_px"])
-        stats: dict[str, Any] = {"processed": 0, "with_candidates": 0, "proc_ms_sum": 0.0, "proc_ms_max": 0.0,
-                                 "tag_runs": 0, "tag_hits": 0, "backlog": 0, "backlog_max": 0}
+        stats: dict[str, Any] = {"worker": int(worker), "processed": 0, "with_candidates": 0, "proc_ms_sum": 0.0,
+                                 "proc_ms_max": 0.0, "tag_runs": 0, "tag_hits": 0, "backlog": 0, "backlog_max": 0}
         last_report = time.perf_counter()
 
         def report(kind: str) -> None:
@@ -955,21 +967,22 @@ def detect_main(spec: dict, detect_q, out_q) -> None:
             if job is None:
                 break
             t_start = time.perf_counter()
-            if job[0] == "m":
-                _, slot, fnum, frame_t, status, anchor_mm, q, patch_job = job
+            kind, seq, body = job
+            if kind == "m":
+                slot, fnum, frame_t, status, anchor_mm, q, patch_job = body
                 rows: list[tuple] = []
                 if patch_job is not None:
                     gx, gy, au, av, block, pixel_type = patch_job
                     rows = marker_candidates_in_patch(block, (gx, gy), (au, av), bayer_code(pixel_type), radius=radius)
                     if rows:
                         stats["with_candidates"] += 1
-                out_q.put(("f", serial, (slot, fnum, frame_t, status, anchor_mm, q, rows)))
+                out_q.put(("f", serial, (seq, (slot, fnum, frame_t, status, anchor_mm, q, rows))))
                 stats["processed"] += 1
                 dt_ms = 1e3 * (time.perf_counter() - t_start)
                 stats["proc_ms_sum"] += dt_ms
                 stats["proc_ms_max"] = max(stats["proc_ms_max"], dt_ms)
             else:
-                _, slot0, t_mean, windows, (ox, oy), pixel_type = job
+                slot0, t_mean, windows, (ox, oy), pixel_type = body
                 code = bayer_code(pixel_type)
                 found: list[tuple[int, list]] = []
                 for x0, y0, avg in windows:
@@ -979,7 +992,7 @@ def detect_main(spec: dict, detect_q, out_q) -> None:
                     found = []
                 stats["tag_runs"] += 1
                 stats["tag_hits"] += bool(found)
-                out_q.put(("t", serial, (slot0, t_mean, found)))
+                out_q.put(("t", serial, (seq, (slot0, t_mean, found))))
         report("ddone")
     except BaseException as exc:  # noqa: BLE001
-        out_q.put(("error", f"detect-{serial}", f"{exc!r}\n{traceback.format_exc()}"))
+        out_q.put(("error", f"detect-{serial}-{worker}", f"{exc!r}\n{traceback.format_exc()}"))

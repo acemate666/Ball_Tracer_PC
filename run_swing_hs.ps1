@@ -7,10 +7,11 @@
     .\run_swing_hs.ps1 -Car v05 -Side fore                 正手，录到 Ctrl+C（或建 tracker_output\.stop_swing_hs）
     .\run_swing_hs.ps1 -Car v05 -Side both -PlanOnly       只开相机定车位、出 ROI 规划和 roi_*.jpg
     .\run_swing_hs.ps1 -Car v05 -Side fore -Probe 20       自检 20 s
-其余参数原样转给 run_swing_hs.py（如 '--j1-range' -60 45、'--car-pose' 0.1 2.5 0；双横线参数要加引号）。
+其余参数原样转给 run_swing_hs.py（如 '--j1-range' -60 45、'--car-pose' 0.1 2.5 0、'--video-fps' 0；双横线参数要加引号）。
 
 发 /pc_car_loc（同 tracker 契约）+ /swing_hs/racket_marker + /swing_hs/status；挥拍时不起 bot_center（臂用面板 / swing_replay 挥）。
-rosbag 录全部话题，不连球拍 IMU。
+rosbag 录全部话题，不连球拍 IMU。录像：整幅 ROI 原分辨率原始帧 5 fps（cam_*\hs_*.bayer，4 台共 ~40 GB/h），
+导 mp4：python test_src\hs_recording.py tracker_output\<场次>\cam_<序列号>\hs_<序列号> --mp4 out.mp4 --play-fps 5
 #>
 param(
     [Parameter(Mandatory = $true, HelpMessage = "Pick the car: v04 or v05")]
@@ -25,7 +26,6 @@ param(
     [double]$ExposureUs = 0,
     [switch]$NoPatches,
     [switch]$NoRos,
-    [string]$RecordRaw = '',
     # 其余参数原样转给 run_swing_hs.py
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$Extra = @()
@@ -60,7 +60,6 @@ if ($PlanOnly) { $pyArgs += '--plan-only' }
 if ($ExposureUs -gt 0) { $pyArgs += @('--exposure-us', $ExposureUs) }
 if ($NoPatches) { $pyArgs += '--no-patches' }
 if ($NoRos) { $pyArgs += '--no-ros' }
-if (-not [string]::IsNullOrWhiteSpace($RecordRaw)) { $pyArgs += @('--record-raw', $RecordRaw) }
 $pyArgs += $Extra
 
 Push-Location $PSScriptRoot
