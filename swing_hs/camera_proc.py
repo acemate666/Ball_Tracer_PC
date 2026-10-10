@@ -11,8 +11,8 @@
   3. 开录：取帧线程 + 识别线程。帧时间 = 曝光开始 + 读回曝光 / 2（曝光中点），取到帧时算这一次，下游
      （关节角插值、格号、发给主进程的时间、小块记录）一律直接用、不再补半曝光（同 tracker，用户 1010 定）。
      识别线程每帧：帧时间的关节角（ROS 桥 UDP 转来）+ 车位姿（主进程共享）→ FK 黑标锚 → 投到本相机 → 在原始 Bayer ROI 帧上截 ±(48+4) px 小块解码 → 找黑方块候选
-     （与 tracker 在线黑标、收场工具同一个 racket_ht_black_marker._marker_candidates）；每 tag_every 帧在
-     tag 窗里认一次 tag。结果是小消息，发主进程三角化；
+     （与 tracker 在线黑标、收场工具同一个 racket_ht_black_marker._marker_candidates）；tag 窗按触发格每
+     tag_every 帧一块累加平均后认一次 tag（车静止，平均压夜里的噪声）。结果是小消息，发主进程三角化；
   4. 可选：每帧小块原样存盘（patches_<serial>.bin，离线换算法重认）、整幅 ROI 原始帧存盘（hs_<serial>.*，
      与 HighSpeedRecorder / test_src/hs_recording.py 同格式）。
 """
@@ -63,6 +63,10 @@ CLOCK_LATCH_PERIOD_S = 1.0
 #: 自动增益（同 src/ball_grabber.SyncCapture.auto_gain）
 AUTO_GAIN_TOLERANCE_DB = 1.0
 AUTO_GAIN_MAX_ROUNDS = 8
+#: 开场全幅样张取几帧平均再认 tag。夜里 0.8 ms 曝光增益顶满（36.8 dB），单帧噪声大：1011 00:42 ASUS 车在
+#: (0.52, 2.46)、tag 边长 ~45 px，单帧 tag1 四台都认不出（连四边形都提不出），中值 / 双边滤波后才解得出 1 号。
+#: 车静止，平均 8 帧噪声降到 ~1/2.8
+SNAPSHOT_AVERAGE_FRAMES = 8
 
 
 def bayer_code(pixel_type: int) -> int:
@@ -168,44 +172,88 @@ def tag_windows(
     return [tuple(m) for m in merged]
 
 
-def detect_tags(carloc, image_bgr: np.ndarray, origin: tuple[int, int], tag_ids: set[int]) -> list[tuple[int, list]]:
-    """全幅样张：CarLocalizer 的 ArUco 检测（同 tracker，含暗光救援）认 tag；同一 tag 出现两次作废。"""
-    detections = carloc.detect(image_bgr)
-    found = [d for d in detections if d.tag_id in tag_ids]
-    ids = [d.tag_id for d in found]
-    if len(ids) != len(set(ids)):
-        return []
-    gx, gy = origin
-    return [(d.tag_id, [[float(u) + gx, float(v) + gy] for u, v in np.asarray(d.corners).reshape(4, 2)]) for d in found]
+class TagWindowAverager:
+    """tag 窗按触发格分块累加：格号 // every 相同的帧算一块（各相机格号同源 ⇒ 块边界一致，主进程能按块凑齐），
+    块内逐帧把 tag 窗的原始 Bayer 加起来，换块时出平均图再认 tag——车静止，平均 every 帧噪声降到 1/√every
+    （夜里单帧认不出，见 SNAPSHOT_AVERAGE_FRAMES）。窗位置在每块第一帧按当时的车位姿定、块内不变。
+    窗左上角是偶数（tag_windows 保证），平均图的 Bayer 相位不变。"""
+
+    def __init__(self, every: int) -> None:
+        self.every = max(1, int(every))
+        self._block: Optional[int] = None
+        self._windows: list[tuple[int, int, int, int]] = []
+        self._sums: list[np.ndarray] = []
+        self._times: list[float] = []
+
+    def add(self, slot: int, frame_t: float, raw: np.ndarray, windows_fn) -> Optional[tuple]:
+        """加一帧；跨进新块时返回上一块的 (块首格号, 平均帧时间, [(x0, y0, 平均原始图), …])，否则 None。
+        windows_fn() 给当前车位姿下的 tag 窗（ROI 像素 (x0, y0, x1, y1)），只在每块第一帧调用。"""
+        block = slot // self.every
+        done = None
+        if self._block is not None and block != self._block:
+            done = self.flush()
+        if self._block is None:
+            self._block = block
+            self._windows = list(windows_fn())
+            self._sums = [np.zeros((y1 - y0, x1 - x0), np.float32) for x0, y0, x1, y1 in self._windows]
+            self._times = []
+        for acc, (x0, y0, x1, y1) in zip(self._sums, self._windows):
+            acc += raw[y0:y1, x0:x1]
+        self._times.append(frame_t)
+        return done
+
+    def flush(self) -> Optional[tuple]:
+        if self._block is None or not self._times:
+            self._block = None
+            return None
+        n = float(len(self._times))
+        out = (
+            self._block * self.every,
+            float(np.mean(self._times)),
+            [(x0, y0, np.clip(np.rint(acc / n), 0, 255).astype(np.uint8))
+             for acc, (x0, y0, _, _) in zip(self._sums, self._windows)],
+        )
+        self._block = None
+        return out
 
 
-def make_window_tag_detector():
-    """tag 窗用的 ArUco 检测器：参数同 src/car_localizer，只是不设 maxMarkerPerimeterRate=0.6——那是相对整幅
-    2048 px 的比例（周长上限 ~1229 px），tag 窗只有 ~200 px，50 px 的 tag 周长率 ~1，会被当成太大扔掉（1010 假相机实测）。"""
+def make_tag_detector(*, full_frame: bool):
+    """AprilTag 36h11 检测器，参数同 src/car_localizer。全幅（开场样张）连 maxMarkerPerimeterRate=0.6 也一样；tag 窗不设它：
+    那是相对图像长边的比例，整幅 2048 px 时上限 ~1229 px，~200 px 的窗里 50 px 的 tag 周长率 ~1，会被当成太大扔掉（1010 假相机实测）。"""
     import cv2
 
     params = cv2.aruco.DetectorParameters()
     params.perspectiveRemovePixelPerCell = 8
     params.perspectiveRemoveIgnoredMarginPerCell = 0.3
+    if full_frame:
+        params.maxMarkerPerimeterRate = 0.6
     params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
     return cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11), params)
 
 
-def detect_tags_in_window(detector, gray: np.ndarray, origin: tuple[int, int], tag_ids: set[int]) -> list[tuple[int, list]]:
-    """tag 窗里认 tag：原图认不出配置里的 tag 就拉一次局部对比度再认（同 CarLocalizer 的暗光救援，同一个增强），
-    角点换回全幅像素；同一 tag 出现两次整窗作废。"""
+def detect_tags(detector, gray: np.ndarray, origin: tuple[int, int], tag_ids: set[int]) -> list[tuple[int, list]]:
+    """认 tag：原图 → 3×3 中值去噪 → 拉局部对比度（CarLocalizer 的暗光增强，同一个函数）依次试，前面认到的不被后面覆盖，
+    配置里的 tag 都齐了就停；同一张图里同一 id 出现两次的那个 id 作废。角点换回全幅像素（加 origin）。
+    中值那一档是 1011 00:42 ASUS 夜场实测加的：增益顶满、单帧噪声大时 tag1 原图和增强图都认不出，中值 / 双边滤波后才解得出。"""
+    import cv2
+    from collections import Counter
+
     from src.car_localizer import CarLocalizer
 
-    corners, ids, _ = detector.detectMarkers(gray)
-    if ids is None or not any(int(i) in tag_ids for i in ids.ravel()):
-        corners, ids, _ = detector.detectMarkers(CarLocalizer._enhance_for_low_light(gray))
-    if ids is None:
-        return []
-    found = [(int(i), np.asarray(c, dtype=np.float64).reshape(4, 2)) for i, c in zip(ids.ravel(), corners) if int(i) in tag_ids]
-    if len({tid for tid, _ in found}) != len(found):
-        return []
+    found: dict[int, np.ndarray] = {}
+    for prepare in (lambda g: g, lambda g: cv2.medianBlur(g, 3), CarLocalizer._enhance_for_low_light):
+        corners, ids, _ = detector.detectMarkers(prepare(gray))
+        if ids is not None:
+            got = [(int(i), np.asarray(c, dtype=np.float64).reshape(4, 2)) for i, c in zip(ids.ravel(), corners)
+                   if int(i) in tag_ids]
+            counts = Counter(tid for tid, _ in got)
+            for tid, c in got:
+                if counts[tid] == 1 and tid not in found:
+                    found[tid] = c
+        if set(found) >= tag_ids:
+            break
     gx, gy = origin
-    return [(tid, [[float(u) + gx, float(v) + gy] for u, v in c]) for tid, c in found]
+    return [(tid, [[float(u) + gx, float(v) + gy] for u, v in c]) for tid, c in sorted(found.items())]
 
 
 class CameraWorker:
@@ -251,13 +299,11 @@ class CameraWorker:
         vehicle = geometry.load_vehicle_reference(Path(spec["vehicle_path"]))
         self.tag_corners = geometry.tag_corners_car(vehicle, 1.0)
         self.tag_ids = set(self.tag_corners)
-        from src.car_localizer import CarLocalizer
-
-        self.carloc = CarLocalizer(spec["calib_path"], spec["vehicle_path"])
-        self.tag_detector = make_window_tag_detector()
+        self.full_tag_detector = make_tag_detector(full_frame=True)
+        self.tag_detector = make_tag_detector(full_frame=False)
         self.joints = JointBuffer(eab.CAR_MODELS[self.car].slot_joint_names)
         self.radius = int(spec["crop_radius_px"])
-        self.tag_every = max(1, int(spec["tag_every_frames"]))
+        self.tag_avg = TagWindowAverager(int(spec["tag_every_frames"]))
         self.tag_pad = float(spec["tag_window_pad_px"])
         self.tags_in_roi = True
         # 取帧 → 识别
@@ -422,16 +468,21 @@ class CameraWorker:
                 self._set_float("DigitalShift", new_total - analog)
                 total = new_total
             self._grab_soft()
-            raw, pixel_type = self._grab_soft()
+            frames = []
+            for _ in range(SNAPSHOT_AVERAGE_FRAMES):
+                frame, pixel_type = self._grab_soft()
+                frames.append(frame)
         finally:
             self.cam.MV_CC_StopGrabbing()
-        median = float(np.median(raw[::4, ::4]))
+        median = float(np.median(frames[-1][::4, ::4]))
         err_db = 20.0 * math.log10(target / max(median, 1.0))
+        # 平均图（原始 Bayer 逐像素平均，线性运算、相位不变）认 tag、存样张
+        raw = np.clip(np.rint(np.mean(np.stack(frames).astype(np.float32), axis=0)), 0, 255).astype(np.uint8)
         cv2.imwrite(str(self.out_dir / f"full_{self.serial}.png"), raw)
         self.pixel_type = pixel_type
         bgr = cv2.cvtColor(raw, bayer_code(pixel_type))
         self.snapshot_bgr = bgr
-        tags = detect_tags(self.carloc, bgr, (0, 0), self.tag_ids)
+        tags = detect_tags(self.full_tag_detector, cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), (0, 0), self.tag_ids)
         return {
             "t": time.perf_counter(),
             "median_first": first, "median": median, "target": target,
@@ -665,28 +716,37 @@ class CameraWorker:
                 slot, fnum, frame_t, status, anchor_mm,
                 None if q is None else [round(float(v), 6) for v in q], rows,
             )))
-            if pose is not None and self.tags_in_roi and slot % self.tag_every == 0:
-                self._detect_tags(raw, pose, slot, frame_t, code)
+            if pose is not None and self.tags_in_roi:
+                block = self.tag_avg.add(
+                    slot, frame_t, raw,
+                    lambda: tag_windows(self.camera, pose, self.tag_corners, self.roi, self.tag_pad))
+                if block is not None:
+                    self._detect_tags(block, code)
             stats["processed"] += 1
             dt_ms = 1e3 * (time.perf_counter() - t_start)
             stats["proc_ms_sum"] += dt_ms
             stats["proc_ms_max"] = max(stats["proc_ms_max"], dt_ms)
+        block = self.tag_avg.flush()
+        if block is not None:
+            self._detect_tags(block, code)
 
-    def _detect_tags(self, raw: np.ndarray, pose, slot: int, frame_t: float, code: int) -> None:
+    def _detect_tags(self, block: tuple, code: int) -> None:
+        """一块（tag_every 帧）平均后的 tag 窗认 tag，按块首格号发主进程。"""
         import cv2
 
+        slot0, t_mean, windows = block
         self.stats["tag_runs"] += 1
         found: list[tuple[int, list]] = []
         ox, oy = self.roi[0], self.roi[1]
-        for x0, y0, x1, y1 in tag_windows(self.camera, pose, self.tag_corners, self.roi, self.tag_pad):
-            gray = cv2.cvtColor(cv2.cvtColor(np.ascontiguousarray(raw[y0:y1, x0:x1]), code), cv2.COLOR_BGR2GRAY)
-            found.extend(detect_tags_in_window(self.tag_detector, gray, (ox + x0, oy + y0), self.tag_ids))
+        for x0, y0, avg in windows:
+            gray = cv2.cvtColor(cv2.cvtColor(avg, code), cv2.COLOR_BGR2GRAY)
+            found.extend(detect_tags(self.tag_detector, gray, (ox + x0, oy + y0), self.tag_ids))
         ids = [tid for tid, _ in found]
         if len(ids) != len(set(ids)):
             found = []
         if found:
             self.stats["tag_hits"] += 1
-        self.out_q.put(("t", self.serial, (slot, frame_t, found)))
+        self.out_q.put(("t", self.serial, (slot0, t_mean, found)))
 
     # ── 写盘 ──
     def _patch_writer(self) -> None:
@@ -751,7 +811,6 @@ class CameraWorker:
         s["joint_offset_s"] = self.joints.offset()
         if self.joints.name_mismatch is not None:
             s["joint_name_mismatch"] = self.joints.name_mismatch
-        s["low_light_retries"] = int(getattr(self.carloc, "low_light_retries", 0))
         return s
 
     # ── 主流程 ──

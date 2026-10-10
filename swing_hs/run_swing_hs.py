@@ -15,7 +15,7 @@
      不够 2 台就不开录。各相机目录里 roi_<serial>.jpg 画着 ROI、包络（绿）和 tag（紫）——--plan-only 到这里就停；
   3. ROS 桥（/joint_states 进、本工具话题出）+ rosbag（录全部话题，同 tracker）起来；
   4. 触发进程按 100 Hz 绝对栅格发 action command。每台相机每帧：帧时间（曝光中点）的关节角 + 车位姿 → FK 黑标锚 →
-     全分辨率截块找黑方块候选；每 10 帧在 tag 窗里认 tag；
+     全分辨率截块找黑方块候选；tag 窗每 10 帧一块平均后认 tag（开场全幅样张也是 8 帧平均：夜里单帧太噪）；
   5. 主进程按触发格把 4 台凑齐：多视图解黑标（marker_solver）、双 tag 刚体拟合解车位（CarLocalizer），
      写 marker.jsonl / car.jsonl，发 /swing_hs/racket_marker、/pc_car_loc、/swing_hs/status（都进 bag）；
   6. Ctrl+C / 停止文件 / 到时长 → 停触发 → 各相机把剩下的帧认完 → 停 ROS → meta.json（含自检汇总）。

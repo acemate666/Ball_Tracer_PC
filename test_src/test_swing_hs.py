@@ -17,7 +17,8 @@ if str(REPO) not in sys.path:
 
 from swing_hs import geometry, udp_msgs  # noqa: E402
 from swing_hs.camera_proc import (  # noqa: E402
-    PATCH_BORDER_PX, bayer_code, detect_marker_in_roi, slot_of, tag_windows,
+    PATCH_BORDER_PX, TagWindowAverager, bayer_code, detect_marker_in_roi, detect_tags, make_tag_detector, slot_of,
+    tag_windows,
 )
 from swing_hs.joints import JointBuffer  # noqa: E402
 from swing_hs.marker_solver import FastMarkerSolver, MarkerFusion, SessionOffset  # noqa: E402
@@ -285,6 +286,50 @@ def test_tag_windows_cover_tags(cameras, vehicle):
                        for x0, y0, x1, y1 in wins)
             for x0, y0, _, _ in wins:
                 assert x0 % 2 == 0 and y0 % 2 == 0
+
+
+def test_tag_window_averager_blocks_and_averages():
+    rng = np.random.default_rng(3)
+    pattern = np.full((40, 60), 100.0)
+    pattern[10:30, 20:40] = 20.0
+    avg = TagWindowAverager(10)
+    calls = []
+
+    def windows():
+        calls.append(1)
+        return [(4, 6, 64, 46)]
+
+    out = []
+    for slot in [*range(0, 10), *range(12, 20), 20]:     # 第二块缺两帧
+        frame = np.zeros((60, 80), np.uint8)
+        frame[6:46, 4:64] = np.clip(pattern + rng.normal(0, 20, pattern.shape), 0, 255).astype(np.uint8)
+        done = avg.add(slot, 100.0 + 0.01 * slot, frame, windows)
+        if done is not None:
+            out.append(done)
+    out.append(avg.flush())
+    assert [o[0] for o in out] == [0, 10, 20]
+    assert out[0][1] == pytest.approx(100.045)
+    assert len(calls) == 3                       # 每块只定一次窗
+    x0, y0, img = out[0][2][0]
+    assert (x0, y0) == (4, 6) and img.shape == (40, 60) and img.dtype == np.uint8
+    assert np.abs(img.astype(float) - pattern).std() < 9.0      # 单帧噪声 20 → 10 帧平均 ~6
+    assert avg.flush() is None
+
+
+def test_detect_tags_finds_ids_and_offsets_corners():
+    import cv2
+
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
+    img = np.full((240, 400), 200, np.uint8)
+    for tid, x in ((0, 40), (1, 230)):
+        img[60:180, x:x + 120] = cv2.aruco.generateImageMarker(dictionary, tid, 120, borderBits=1)
+    found = dict(detect_tags(make_tag_detector(full_frame=False), img, (1000, 500), {0, 1}))
+    assert set(found) == {0, 1}
+    c0 = np.asarray(found[0])
+    assert c0[:, 0].min() == pytest.approx(1040, abs=2) and c0[:, 1].min() == pytest.approx(560, abs=2)
+    # 同一 id 在一张图里出现两次：作废
+    img[60:180, 230:350] = cv2.aruco.generateImageMarker(dictionary, 0, 120, borderBits=1)
+    assert dict(detect_tags(make_tag_detector(full_frame=False), img, (0, 0), {0, 1})) == {}
 
 
 def test_car_pose_median_and_shared():
