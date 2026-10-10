@@ -176,10 +176,12 @@ DB0260405 / DB0260373）均值发布。同一抛 1.2s 内只发第一条（Conta
 
 ## PC 侧的消费（订阅）
 
-PC 主进程（`DirectRos2Sink`）订阅 3 条 RK topic，全部只服务内部功能、不再转发：
+PC 主进程（`DirectRos2Sink`）订阅 4 条 RK topic，全部只服务内部功能、不再转发：
 `/bot_state`（时钟桥采样）、`/ball_world_topic`（挥拍触球锚点反解）、
-`/predict_hit_pos`（记录首条 stage0 时刻做锚点对照）。其余整个局域网的 topic
-（RK 球轨迹/预测、底盘、`/joint_states`、`/tennis/*` 等）由独立的 **rosbag 录制进程**
+`/predict_hit_pos`（记录首条 stage0 时刻做锚点对照）、`/joint_states`（黑标在线识别：
+车定位帧按曝光时刻取关节角做 FK 定截块位置，`src/racket_marker_online.py`；只在
+`post_run.measure_racket` 开着时订阅）。其余整个局域网的 topic
+（RK 球轨迹/预测、底盘、`/tennis/*` 等）由独立的 **rosbag 录制进程**
 （`src/rosbag_recorder.py`，tracker 启动时自动拉起）全量录制到
 `tracker_output/{run_id}/{run_id}_rosbag/`，事后经 `test_src/extract_arm_bag.py` /
 `test_src/extract_rk_tracking_bag.py` 提取供报告使用。

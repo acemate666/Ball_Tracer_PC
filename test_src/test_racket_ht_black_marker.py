@@ -39,13 +39,7 @@ def _write_inputs(tmp_path: Path, *, align_err: float = 0.01, tab_errors=None):
             {
                 "config": {
                     "car_config_path": "vehicle_v04.json",
-                    "video_frame_mapping_exact": True,
-                    "video_output": {
-                        "layout": "grid",
-                        "grid_cols": 2,
-                        "grid_rows": 2,
-                        "serial_order": SERIALS,
-                    },
+                    "serials": SERIALS,
                     "camera_settings": {
                         serial: {"exposure_us": 9000.0} for serial in SERIALS
                     },

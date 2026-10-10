@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
-"""Measure the V04/V05 fixed black racket-centre marker around report final HTs."""
+"""Measure the V04/V05 fixed black racket-centre marker around report final HTs.
+
+候选（黑方块 2D 位置）不再从半分辨率拼接录像里找：tracker 在线在全分辨率图上截小块找好、
+写进 <run>_racket_marker.json（src/racket_marker_online.py）；这里只用报告对时后的
+精确 FK 锚在这些候选里三角化、选点、做本场「黑标 − FK」偏差校正。
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
 import math
-import os
 import time
-from concurrent.futures import ProcessPoolExecutor
-from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -344,22 +346,30 @@ def _component_candidates(
 
 
 def _marker_candidates(
-    image: np.ndarray, anchor_uv: tuple[float, float]
+    image: np.ndarray,
+    anchor_uv: tuple[float, float],
+    *,
+    local_radius: int = 55,
+    broad_radius: int | None = MARKER_ROI_RADIUS_PX,
 ) -> list[MarkerCandidate]:
+    """锚点附近的黑方块候选：贴锚小块（local_radius，就近优先）+ 大范围按分数补找（broad_radius）。
+
+    tracker 在线识别锚点准（同帧车位姿 + 同一曝光时刻关节角），只截小块：broad_radius=None。
+    """
     if not np.all(np.isfinite(anchor_uv)):
         return []
     height, width = image.shape[:2]
     if (
-        anchor_uv[0] < -55
-        or anchor_uv[0] >= width + 55
-        or anchor_uv[1] < -55
-        or anchor_uv[1] >= height + 55
+        anchor_uv[0] < -local_radius
+        or anchor_uv[0] >= width + local_radius
+        or anchor_uv[1] < -local_radius
+        or anchor_uv[1] >= height + local_radius
     ):
         return []
-    x0 = max(0, int(anchor_uv[0]) - 55)
-    y0 = max(0, int(anchor_uv[1]) - 55)
-    x1 = min(width, int(anchor_uv[0]) + 56)
-    y1 = min(height, int(anchor_uv[1]) + 56)
+    x0 = max(0, int(anchor_uv[0]) - local_radius)
+    y0 = max(0, int(anchor_uv[1]) - local_radius)
+    x1 = min(width, int(anchor_uv[0]) + local_radius + 1)
+    y1 = min(height, int(anchor_uv[1]) + local_radius + 1)
     local_gray = cv2.cvtColor(image[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
     adaptive = (
         list(np.percentile(local_gray, [5, 10, 15, 20, 25, 30]))
@@ -369,22 +379,26 @@ def _marker_candidates(
     local = _component_candidates(
         image,
         anchor_uv,
-        radius=55,
+        radius=local_radius,
         thresholds=sorted(
             set(float(v) for v in [8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 56] + adaptive)
         ),
-        anchor_limit_px=45.0,
+        anchor_limit_px=local_radius - 10.0,
         result_limit=12,
         prefer_near=True,
         dedupe_px=3.0,
     )
-    broad = _component_candidates(
-        image,
-        anchor_uv,
-        radius=MARKER_ROI_RADIUS_PX,
-        thresholds=[8.0, 12.0, 16.0, 20.0, 24.0, 28.0, 32.0],
-        anchor_limit_px=None,
-        result_limit=32,
+    broad = (
+        []
+        if broad_radius is None
+        else _component_candidates(
+            image,
+            anchor_uv,
+            radius=broad_radius,
+            thresholds=[8.0, 12.0, 16.0, 20.0, 24.0, 28.0, 32.0],
+            anchor_limit_px=None,
+            result_limit=32,
+        )
     )
     combined = [*local, *broad]
     combined.sort(
@@ -806,120 +820,6 @@ def _grid_panels(
     return panels
 
 
-def _read_video_frame(
-    capture: cv2.VideoCapture, position: int | None, video_index: int
-) -> tuple[np.ndarray, int]:
-    """读第 video_index 帧：往后 60 帧内顺着解码，否则 seek。返回 (画面, 读后位置)。"""
-    if position is None or video_index < position or video_index - position > 60:
-        if not capture.set(cv2.CAP_PROP_POS_FRAMES, video_index):
-            raise RuntimeError(f"could not seek to video frame {video_index}")
-        actual_position = capture.get(cv2.CAP_PROP_POS_FRAMES)
-        if abs(actual_position - video_index) > 0.5:
-            raise RuntimeError(
-                f"video seek landed at {actual_position}, expected {video_index}"
-            )
-        position = video_index
-    while position < video_index:
-        if not capture.grab():
-            raise RuntimeError(f"could not decode through video frame {position}")
-        position += 1
-    ok, image = capture.read()
-    if not ok:
-        raise RuntimeError(f"could not read video frame {video_index}")
-    return image, video_index + 1
-
-
-def _frame_candidates(
-    image: np.ndarray,
-    serials: list[str],
-    cameras: dict[str, CameraModel],
-    anchor: np.ndarray,
-) -> dict[str, list[MarkerCandidate]]:
-    panels = _grid_panels(image, serials, cameras)
-    return {
-        serial: _marker_candidates(
-            panels[serial], tuple(_project_raw(cameras[serial], anchor))
-        )
-        for serial in serials
-    }
-
-
-def _default_workers() -> int:
-    # 收尾时 tracker 主循环已停，借一半逻辑核（ASUS 32 → 16）；--workers 1 = 原来的单进程
-    return max(1, min(16, (os.cpu_count() or 2) // 2))
-
-
-# 并行子进程状态：每帧的解码/候选/求解与单进程同一套函数、同一份输入，结果与单进程一致；
-# 子进程各开一个 VideoCapture，按「一抛的帧窗」接活
-_WORKER: dict[str, Any] = {}
-
-
-def _worker_init(
-    video_path: str,
-    serials: list[str],
-    cameras: dict[str, CameraModel],
-    loo_max_mm: float | None,
-) -> None:
-    cv2.setNumThreads(1)
-    _WORKER.update(
-        video_path=video_path,
-        serials=serials,
-        cameras=cameras,
-        loo_max_mm=loo_max_mm,
-        capture=None,
-        position=None,
-    )
-
-
-def _worker_fk_pass(
-    window: list[tuple[int, int, np.ndarray]],
-) -> list[tuple[int, dict[str, list[MarkerCandidate]], tuple | None]]:
-    """第一遍：一抛帧窗内逐帧解码 + 候选 + 对 FK 锚求解。window = [(job_id, 视频帧号, FK 锚)]。"""
-    state = _WORKER
-    if state["capture"] is None:
-        # 后端选择同主进程（CAP_ANY）；解码只开 1 线程：默认按核数开，多进程并行时只占内存。
-        # 线程数不改解码结果（0929 场逐帧哈希对过）
-        capture = cv2.VideoCapture(
-            state["video_path"], cv2.CAP_ANY, [cv2.CAP_PROP_N_THREADS, 1]
-        )
-        if not capture.isOpened():
-            raise RuntimeError(f"could not open video {state['video_path']}")
-        state["capture"] = capture
-    results = []
-    for job_id, video_index, fk_expected in window:
-        image, state["position"] = _read_video_frame(
-            state["capture"], state["position"], video_index
-        )
-        candidates = _frame_candidates(
-            image, state["serials"], state["cameras"], fk_expected
-        )
-        solved = _attempt_solve(
-            candidates, state["cameras"], state["serials"], fk_expected, None,
-            loo_max_mm=state["loo_max_mm"],
-        )
-        results.append((job_id, candidates, solved))
-    return results
-
-
-def _abandon_pool(pool: ProcessPoolExecutor, exc: BaseException) -> None:
-    """子进程异常退出（如内存不够）：这一遍改回单进程从头做，黑标照出，只是慢。"""
-    print(f"[racket] worker pool broke ({exc}); redoing this pass in one process", flush=True)
-    pool.shutdown(cancel_futures=True)
-    return None
-
-
-def _worker_reanchor_solve(
-    task: tuple[int, dict[str, list[MarkerCandidate]], np.ndarray, AnchorGate],
-) -> tuple[int, tuple | None]:
-    """第一遍补（校正锚点）：候选沿用第一遍，只重解。"""
-    job_id, candidates, fk_anchor, gate = task
-    state = _WORKER
-    return job_id, _attempt_solve(
-        candidates, state["cameras"], state["serials"], fk_anchor, None,
-        loo_max_mm=state["loo_max_mm"], fk_gate=gate,
-    )
-
-
 def _measurement_context(
     tracker_path: Path,
     arm_path: Path,
@@ -938,15 +838,7 @@ def _measurement_context(
         str(config.get("car_config_path", ""))
     ).stem.lower():
         raise ValueError("fixed black-marker HT measurement is supported only for V04/V05")
-    video_output = config.get("video_output") or {}
-    if (
-        video_output.get("layout") != "grid"
-        or int(video_output.get("grid_cols", 0)) != 2
-        or int(video_output.get("grid_rows", 0)) != 2
-        or config.get("video_frame_mapping_exact") is not True
-    ):
-        raise ValueError("fixed black-marker HT measurement requires exact 2x2 grid video")
-    serials = list(video_output.get("serial_order") or config.get("serials") or [])
+    serials = list(config.get("serials") or [])
     if len(serials) != 4 or len(set(serials)) != 4:
         raise ValueError("fixed black-marker HT measurement requires four unique cameras")
     settings = config.get("camera_settings") or {}
@@ -1040,14 +932,28 @@ def _measurement_context(
     return tracker, arm, rk, serials, exposure_center_offset_s, z_offset, targets
 
 
+def _online_candidates(frame: dict) -> dict[str, list[MarkerCandidate]]:
+    """_racket_marker.json 一帧的在线候选（每台 [u, v, score, area, x, y, w, h]，全分辨率 px）→ MarkerCandidate。"""
+    return {
+        serial: [
+            MarkerCandidate(
+                uv=(float(row[0]), float(row[1])),
+                score=float(row[2]),
+                area=int(row[3]),
+                bbox_xywh=(int(row[4]), int(row[5]), int(row[6]), int(row[7])),
+            )
+            for row in rows
+        ]
+        for serial, rows in frame["candidates"].items()
+    }
+
+
 def measure(
     tracker_path: Path,
-    video_path: Path,
+    marker_path: Path,
     arm_path: Path,
     rk_path: Path,
     tables_path: Path,
-    *,
-    workers: int = 1,
 ) -> dict:
     started = time.perf_counter()
     (
@@ -1065,16 +971,22 @@ def measure(
     calibration_path = _session_path(config["calib_config_path"], tracker_path)
     cameras = _load_cameras(calibration_path, serials)
     tracker_t0 = float(config["first_frame_exposure_pc"])
+    # 车定位线算过的帧才有在线候选（tracker.json car_localizer.sample_every_frames）
     frames = sorted(
         [
             row
-            for row in tracker.get("frames", [])
+            for row in _load_json(marker_path).get("frames", [])
             if isinstance(row, dict)
-            and isinstance(row.get("video_frame_idx"), int)
+            and isinstance(row.get("candidates"), dict)
             and _finite(row.get("exposure_pc"))
         ],
-        key=lambda row: int(row["video_frame_idx"]),
+        key=lambda row: float(row["exposure_pc"]),
     )
+    video_frame_idx = {
+        row["idx"]: row.get("video_frame_idx")
+        for row in tracker.get("frames", [])
+        if isinstance(row, dict) and "idx" in row
+    }
     arm_states = arm_states_with_marker(arm)
     car_locs = sorted(
         [row for row in tracker.get("car_locs", []) if _finite(row.get("elapsed_s"))],
@@ -1087,7 +999,9 @@ def measure(
     ]
     car_yaw_rows = [row for row in car_locs if _finite(row.get("yaw"))]
     if not frames or not arm_states or not car_pos_rows or not car_yaw_rows:
-        raise ValueError("session lacks video frames, arm states, or car locations")
+        raise ValueError(
+            "session lacks online racket-marker candidates, arm states, or car locations"
+        )
 
     rk_t0 = float(rk["t0"])
     windows: list[tuple[dict, list[dict]]] = []
@@ -1114,7 +1028,6 @@ def measure(
         flush=True,
     )
 
-    # jobs[row][video_index] = per-frame state carried across the passes
     jobs: list[dict] = []
     for target, target_frames in windows:
         for frame in target_frames:
@@ -1124,7 +1037,6 @@ def measure(
                 {
                     "target": target,
                     "frame": frame,
-                    "video_index": int(frame["video_frame_idx"]),
                     "center_abs_pc": center_abs_pc,
                     "center_elapsed": center_elapsed,
                     "fk_expected": _expected_world_mm(
@@ -1140,32 +1052,10 @@ def measure(
                         car_yaw_rows, center_elapsed, CAR_LOC_MAX_GAP_S
                     ),
                     "fk_anchor": None,
-                    "candidates": None,
+                    "candidates": _online_candidates(frame),
                     "accepted": None,
                 }
             )
-
-    video_position: list[int | None] = [None]
-    decoded_count = [0]
-
-    def count_decoded(n: int) -> None:
-        before = decoded_count[0]
-        decoded_count[0] += n
-        for mark in range((before // 60 + 1) * 60, decoded_count[0] + 1, 60):
-            print(f"[racket] decoded {mark} frames", flush=True)
-
-    def read_frames(capture: cv2.VideoCapture, wanted: list[dict]) -> None:
-        position = video_position[0]
-        for job in sorted(wanted, key=lambda item: item["video_index"]):
-            count_decoded(1)
-            image, position = _read_video_frame(capture, position, job["video_index"])
-            anchor = (
-                job["fk_expected"]
-                if job["fk_expected"] is not None
-                else job.get("traj_expected")
-            )
-            job["candidates"] = _frame_candidates(image, serials, cameras, anchor)
-        video_position[0] = position
 
     def accept(job: dict, solved: tuple[MarkerFit, int, str, str | None]) -> None:
         fit, n_cam, anchor_name, dropped = solved
@@ -1186,8 +1076,8 @@ def measure(
             "z": float(fit.point.xyz_mm[2] / 1000.0),
             "t": job["center_abs_pc"],
             "elapsed_s": job["center_elapsed"],
-            "frame_idx": int(job["frame"]["idx"]),
-            "video_frame_idx": job["video_index"],
+            "frame_idx": int(job["frame"]["frame_idx"]),
+            "video_frame_idx": video_frame_idx.get(job["frame"]["frame_idx"]),
             "report_row": job["target"]["report_row"],
             "final_ht_pc_elapsed_s": job["target"]["final_ht_pc_elapsed_s"],
             "dt_ht_ms": dt_ms,
@@ -1227,179 +1117,103 @@ def measure(
         ]
         return sorted(fits, key=lambda item: item[0])
 
-    capture = cv2.VideoCapture(str(video_path))
-    if not capture.isOpened():
-        raise RuntimeError(f"could not open video {video_path}")
-    # 第一遍与第一遍补逐帧独立，分给子进程；第二遍要串着用相邻帧的解，留在主进程
-    pool: ProcessPoolExecutor | None = None
-    if workers > 1:
-        print(f"[racket] parallel: {workers} worker processes", flush=True)
-        pool = ProcessPoolExecutor(
-            max_workers=workers,
-            initializer=_worker_init,
-            initargs=(str(video_path), serials, cameras, policy.loo_max_mm),
+    # Pass 1: solve every frame that has an FK anchor.
+    anchored = [job for job in jobs if job["fk_expected"] is not None]
+    for job in anchored:
+        solved = _attempt_solve(
+            job["candidates"], cameras, serials, job["fk_expected"], None,
+            loo_max_mm=policy.loo_max_mm,
         )
-    try:
-        # Pass 1: decode every frame that has an FK anchor; solve against it.
-        anchored = [job for job in jobs if job["fk_expected"] is not None]
-        pass1_done = False
-        if pool is not None:
-            job_ids = {id(job): index for index, job in enumerate(jobs)}
-            throw_windows: dict[int, list[dict]] = {}
-            for job in anchored:
-                throw_windows.setdefault(id(job["target"]), []).append(job)
-            work = [
-                [
-                    (job_ids[id(job)], job["video_index"], job["fk_expected"])
-                    for job in sorted(window, key=lambda item: item["video_index"])
-                ]
-                for window in throw_windows.values()
-            ]
-            try:
-                for results in pool.map(_worker_fk_pass, work):
-                    count_decoded(len(results))
-                    for job_id, candidates, solved in results:
-                        jobs[job_id]["candidates"] = candidates
-                        if solved is not None:
-                            accept(jobs[job_id], solved)
-                pass1_done = True
-            except BrokenProcessPool as exc:
-                pool = _abandon_pool(pool, exc)
-                for job in anchored:
-                    job["candidates"] = None
-                    job["accepted"] = None
-        if not pass1_done:
-            read_frames(capture, anchored)
-            for job in anchored:
-                solved = _attempt_solve(
-                    job["candidates"], cameras, serials, job["fk_expected"], None,
-                    loo_max_mm=policy.loo_max_mm,
-                )
-                if solved is not None:
-                    accept(job, solved)
+        if solved is not None:
+            accept(job, solved)
 
-        # Pass 1b（policy.reanchor）：第一遍解估本场「黑标 − FK」车体系偏差，以 FK+偏差为锚、
-        # 深度/横向分开设门全部重解（候选沿用第一遍，不重新解码）。估不出偏差 = 第一遍本身
-        # 不可信，整场不出观测，不拿假点凑数。
-        if policy.reanchor:
-            samples = [
-                _world_to_car(
-                    job["car_yaw"],
-                    1000.0
-                    * np.asarray(
-                        [job["accepted"][key] for key in ("x", "y", "z")],
-                        dtype=np.float64,
-                    )
-                    - job["fk_expected"],
+    # Pass 1b（policy.reanchor）：第一遍解估本场「黑标 − FK」车体系偏差，以 FK+偏差为锚、
+    # 深度/横向分开设门全部重解（候选不变）。估不出偏差 = 第一遍本身不可信，整场不出观测，
+    # 不拿假点凑数。
+    if policy.reanchor:
+        samples = [
+            _world_to_car(
+                job["car_yaw"],
+                1000.0
+                * np.asarray(
+                    [job["accepted"][key] for key in ("x", "y", "z")],
+                    dtype=np.float64,
                 )
-                for job in anchored
-                if job["accepted"] is not None and job["car_yaw"] is not None
-            ]
-            estimate = _session_marker_offset(samples)
-            reanchor_summary = {"pass1_fits": len(samples)}
-            for job in anchored:
-                job["accepted"] = None
-            if estimate is None:
-                print(
-                    f"[racket] re-anchor unavailable ({len(samples)} pass-1 fits): "
-                    "no black-marker observations for this session",
-                    flush=True,
-                )
-            else:
-                offset, inliers = estimate
-                reanchor_summary.update(
-                    offset_car_mm=[round(float(value), 1) for value in offset],
-                    inliers=inliers,
-                )
-                print(
-                    f"[racket] re-anchor: marker - FK = car ({offset[0]:+.1f}, "
-                    f"{offset[1]:+.1f}, {offset[2]:+.1f}) mm from {inliers}/"
-                    f"{len(samples)} pass-1 fits",
-                    flush=True,
-                )
-                regated: list[tuple[dict, AnchorGate]] = []
-                for job in anchored:
-                    if job["car_yaw"] is None:
-                        continue
-                    job["fk_anchor"] = job["fk_expected"] + _car_to_world(
-                        job["car_yaw"], offset
-                    )
-                    gate = AnchorGate(
-                        _mean_view_dir(cameras, serials, job["fk_anchor"]),
-                        REANCHOR_MAX_LATERAL_MM,
-                        REANCHOR_MAX_DEPTH_MM,
-                    )
-                    regated.append((job, gate))
-                solutions: list | None = None
-                if pool is not None:
-                    tasks = [
-                        (index, job["candidates"], job["fk_anchor"], gate)
-                        for index, (job, gate) in enumerate(regated)
-                    ]
-                    try:
-                        solutions = [
-                            solved
-                            for _, solved in pool.map(
-                                _worker_reanchor_solve, tasks, chunksize=8
-                            )
-                        ]
-                    except BrokenProcessPool as exc:
-                        pool = _abandon_pool(pool, exc)
-                if solutions is None:
-                    solutions = [
-                        _attempt_solve(
-                            job["candidates"], cameras, serials, job["fk_anchor"], None,
-                            loo_max_mm=policy.loo_max_mm, fk_gate=gate,
-                        )
-                        for job, gate in regated
-                    ]
-                for (job, _), solved in zip(regated, solutions):
-                    if solved is not None:
-                        accept(job, solved)
+                - job["fk_expected"],
+            )
+            for job in anchored
+            if job["accepted"] is not None and job["car_yaw"] is not None
+        ]
+        estimate = _session_marker_offset(samples)
+        reanchor_summary = {"pass1_fits": len(samples)}
+        for job in anchored:
+            job["accepted"] = None
+        if estimate is None:
+            print(
+                f"[racket] re-anchor unavailable ({len(samples)} pass-1 fits): "
+                "no black-marker observations for this session",
+                flush=True,
+            )
         else:
-            reanchor_summary = None
-        if pool is not None:
-            pool.shutdown()
-            pool = None
-
-        # Pass 2: chain neighbour fits as trajectory anchors. Candidate-bearing
-        # frames retry without video; anchorless frames (car-loc holes) decode
-        # on demand once a trajectory anchor exists. The FK ladder already ran
-        # in pass 1, so pass 2 solves against the trajectory anchor only, and
-        # skips a frame whose anchor has not moved since its last attempt.
-        for _ in range(6):
-            progress = False
-            for job in jobs:
-                if job["accepted"] is not None:
+            offset, inliers = estimate
+            reanchor_summary.update(
+                offset_car_mm=[round(float(value), 1) for value in offset],
+                inliers=inliers,
+            )
+            print(
+                f"[racket] re-anchor: marker - FK = car ({offset[0]:+.1f}, "
+                f"{offset[1]:+.1f}, {offset[2]:+.1f}) mm from {inliers}/"
+                f"{len(samples)} pass-1 fits",
+                flush=True,
+            )
+            for job in anchored:
+                if job["car_yaw"] is None:
                     continue
-                traj = _traj_predict(
-                    row_fits(job["target"]["report_row"]), job["center_elapsed"]
+                job["fk_anchor"] = job["fk_expected"] + _car_to_world(
+                    job["car_yaw"], offset
                 )
-                if traj is None:
-                    continue
-                tried = job.get("traj_tried_mm")
-                if tried is not None and float(np.linalg.norm(traj - tried)) < 2.0:
-                    continue
-                job["traj_expected"] = traj
-                job["traj_tried_mm"] = traj
-                if job["candidates"] is None:
-                    read_frames(capture, [job])
+                gate = AnchorGate(
+                    _mean_view_dir(cameras, serials, job["fk_anchor"]),
+                    REANCHOR_MAX_LATERAL_MM,
+                    REANCHOR_MAX_DEPTH_MM,
+                )
                 solved = _attempt_solve(
-                    job["candidates"], cameras, serials, None, traj,
-                    loo_max_mm=policy.loo_max_mm,
+                    job["candidates"], cameras, serials, job["fk_anchor"], None,
+                    loo_max_mm=policy.loo_max_mm, fk_gate=gate,
                 )
                 if solved is not None:
                     accept(job, solved)
-                    progress = True
-            if not progress:
-                break
-    finally:
-        if pool is not None:
-            pool.shutdown(cancel_futures=True)
-        capture.release()
+    else:
+        reanchor_summary = None
+
+    # Pass 2: chain neighbour fits as trajectory anchors. The FK ladder already
+    # ran in pass 1, so pass 2 solves against the trajectory anchor only, and
+    # skips a frame whose anchor has not moved since its last attempt.
+    for _ in range(6):
+        progress = False
+        for job in jobs:
+            if job["accepted"] is not None:
+                continue
+            traj = _traj_predict(
+                row_fits(job["target"]["report_row"]), job["center_elapsed"]
+            )
+            if traj is None:
+                continue
+            tried = job.get("traj_tried_mm")
+            if tried is not None and float(np.linalg.norm(traj - tried)) < 2.0:
+                continue
+            job["traj_tried_mm"] = traj
+            solved = _attempt_solve(
+                job["candidates"], cameras, serials, None, traj,
+                loo_max_mm=policy.loo_max_mm,
+            )
+            if solved is not None:
+                accept(job, solved)
+                progress = True
+        if not progress:
+            break
 
     observations = [job["accepted"] for job in jobs if job["accepted"] is not None]
-    attempted = sum(1 for job in jobs if job["candidates"] is not None)
     for target, target_frames in windows:
         row_accepted = sum(
             1
@@ -1416,7 +1230,7 @@ def measure(
     rows_with_observations = {row["report_row"] for row in observations}
     elapsed = time.perf_counter() - started
     print(
-        f"[racket] fixed black marker: {len(observations)}/{attempted} frames, "
+        f"[racket] fixed black marker: {len(observations)}/{len(jobs)} frames, "
         f"{len(rows_with_observations)}/{len(targets)} report rows, {elapsed:.1f}s"
     )
     n_traj = sum(1 for row in observations if row.get("anchor") == "traj")
@@ -1429,9 +1243,9 @@ def measure(
                 f"{exposure_center_offset_s * 1000.0:.3f} ms"
             ),
             "selection": (
-                f"video frames from report raw final HT {-PRE_WINDOW_S:g}s to "
-                f"{POST_WINDOW_S:+g}s (per-throw zPhase applied); "
-                f"max reprojection {MARKER_MAX_REPROJ_PX:g} px; "
+                "tracker online full-resolution candidates (car-loc frames) from report "
+                f"raw final HT {-PRE_WINDOW_S:g}s to {POST_WINDOW_S:+g}s "
+                f"(per-throw zPhase applied); max reprojection {MARKER_MAX_REPROJ_PX:g} px; "
                 + (
                     f"leave-one-out < {policy.loo_max_mm:g} mm; "
                     if policy.loo_max_mm is not None
@@ -1459,7 +1273,7 @@ def measure(
         },
         "summary": {
             "racket_observations_3d": len(observations),
-            "racket_frames_processed": attempted,
+            "racket_frames_processed": len(jobs),
             "racket_min_cams": 3,
             "racket_obs_traj_anchor": n_traj,
             "racket_obs_3cam": n_3cam,
@@ -1473,26 +1287,22 @@ def measure(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True, help="tracker session JSON")
-    parser.add_argument("--video", type=Path, required=True, help="2x2 grid session video")
+    parser.add_argument(
+        "--marker-json", type=Path, required=True,
+        help="tracker online black-marker candidates (<run>_racket_marker.json)",
+    )
     parser.add_argument("--arm-json", type=Path, required=True)
     parser.add_argument("--rk-tracking-json", type=Path, required=True)
     parser.add_argument("--tables-json", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=_default_workers(),
-        help="worker processes for the per-frame passes (1 = single process)",
-    )
     args = parser.parse_args()
     try:
         payload = measure(
             args.input,
-            args.video,
+            args.marker_json,
             args.arm_json,
             args.rk_tracking_json,
             args.tables_json,
-            workers=args.workers,
         )
     except NothingToMeasure as exc:
         # 不写 --output：调用方（run_tracker 后处理）据此知道本场没有视觉拍心可合入报告。

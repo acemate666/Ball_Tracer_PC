@@ -48,7 +48,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, TypeVar
 
@@ -78,6 +78,7 @@ from src import (
     StationaryObjectFilter,
 )
 from src.ball_grabber import frame_bayer_roi_to_numpy
+from src.racket_marker_online import JointStateBuffer, RacketMarkerLocator
 from src.curve4 import (
     BallObservation,
     Curve4Tracker,
@@ -248,7 +249,9 @@ class CarLocJob:
     frame_idx: int
     exposure_pc: float
     elapsed_s: float | None
-    images: dict[str, np.ndarray]
+    images: dict[str, np.ndarray]  # 全部相机的全分辨率 BGR：车定位自己去掉禁用相机，黑标四台都用
+    # 黑标要截块的帧 (frame_idx, exposure_pc, images)：上一个车定位帧之后没做车定位的帧 + 本帧
+    marker_frames: list = field(default_factory=list)
 
 
 @dataclass
@@ -283,6 +286,8 @@ class CarLocEvent:
     elapsed_s: float | None
     status: str  # "hit" / "miss" / "dropped"
     car_loc: Optional[CarLoc] = None
+    # 本车定位帧及其前面各帧的拍上黑标在线候选（RacketMarkerLocator.process），收进 <run>_racket_marker.json
+    racket_markers: list[dict] = field(default_factory=list)
 
 
 _QueueItem = TypeVar("_QueueItem")
@@ -423,7 +428,12 @@ class RosbagRecorderProcess:
 class DirectRos2Sink:
     mode = "direct"
 
-    def __init__(self, *, enable_time_alignment: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        enable_time_alignment: bool = False,
+        joint_states: JointStateBuffer | None = None,
+    ) -> None:
         ensure_ros2_environment()
         import rclpy
         from rclpy.executors import SingleThreadedExecutor
@@ -461,6 +471,14 @@ class DirectRos2Sink:
         self._bridge_sub = self._node.create_subscription(
             String, _CLOCK_BRIDGE_TOPIC, self._on_bridge_msg, make_best_effort_qos()
         )
+        # 黑标在线识别要同一曝光时刻的关节角（src/racket_marker_online.py）
+        self._joint_states = joint_states
+        if joint_states is not None:
+            from sensor_msgs.msg import JointState
+
+            self._joint_sub = self._node.create_subscription(
+                JointState, "/joint_states", self._on_joint_state, make_best_effort_qos(depth=50)
+            )
         if self._time_aligner is not None:
             self._world_ball_pub = self._node.create_publisher(
                 String, "/pc_world_ball_loc", make_best_effort_qos()
@@ -532,6 +550,13 @@ class DirectRos2Sink:
             return
         with self._bridge_lock:
             self._bridge_offsets.append(recv_pc - float(rk_t))
+
+    def _on_joint_state(self, msg) -> None:
+        recv_pc = time.perf_counter()
+        stamp = msg.header.stamp
+        self._joint_states.add(
+            stamp.sec + 1e-9 * stamp.nanosec, list(msg.name), list(msg.position), recv_pc
+        )
 
     def _on_ball_world_msg(self, msg) -> None:
         arrival_pc = time.perf_counter()
@@ -743,12 +768,22 @@ class DirectRos2Sink:
             raise RuntimeError("; ".join(close_errors))
 
 
-def _create_ros2_sink(mode: str, *, enable_time_alignment: bool = False):
+def _create_ros2_sink(
+    mode: str,
+    *,
+    enable_time_alignment: bool = False,
+    joint_states: JointStateBuffer | None = None,
+):
     if mode == "off":
         return NullRos2Sink()
-    if enable_time_alignment:
-        return DirectRos2Sink(enable_time_alignment=True)
-    return DirectRos2Sink()
+    return DirectRos2Sink(
+        enable_time_alignment=enable_time_alignment, joint_states=joint_states
+    )
+
+
+def _racket_marker_json_path(json_path: Path) -> Path:
+    """黑标在线候选文件：<run>_racket_marker.json，与 tracker JSON 同目录。"""
+    return json_path.with_name(f"{json_path.stem}_racket_marker.json")
 
 
 def _report_tool_env() -> dict[str, str]:
@@ -959,16 +994,19 @@ def _generate_post_run_artifacts(
     racket_candidate = json_path.with_name(f"{json_path.stem}_racket.json")
     if measure_racket:
         racket_candidate.unlink(missing_ok=True)
+        marker_json_path = _racket_marker_json_path(json_path)
         prerequisites = (
             generate_html
-            and video_path is not None
-            and video_path.exists()
+            and marker_json_path.exists()
             and arm_json_path is not None
             and rk_tracking_json_path is not None
             and car != "v03"
         )
         if not prerequisites:
-            print("[post] Skip fixed black-marker racket: grid video/arm/RK/report missing")
+            print(
+                "[post] Skip fixed black-marker racket: "
+                "online marker candidates/arm/RK/report missing"
+            )
         else:
             tables_path = html_path.with_name(f"{html_path.stem}_tables.json")
             tables_path.unlink(missing_ok=True)
@@ -980,8 +1018,8 @@ def _generate_post_run_artifacts(
                 str(_ROOT / "test_src" / "racket_ht_black_marker.py"),
                 "--input",
                 str(json_path),
-                "--video",
-                str(video_path),
+                "--marker-json",
+                str(marker_json_path),
                 "--arm-json",
                 str(arm_json_path),
                 "--rk-tracking-json",
@@ -1719,6 +1757,8 @@ class ArchiveThread:
         self._log_predictions: list[dict] = []
         self._log_car_locs: list[dict] = []
         self._log_state_transitions: list[dict] = []
+        # 黑标在线候选单独成文件（紧凑写）：放进 frames 会让 tracker JSON 与内嵌它的报告 HTML 翻倍
+        self._log_racket_markers: list[dict] = []
         self._frame_entry_by_idx: dict[int, dict] = {}
         # 归档线程消费 ArchiveJob 和 CarLocEvent 两种消息。car_loc worker
         # 处理较快时，CarLocEvent 可能先于对应的 ArchiveJob 到达队列（主线程
@@ -1748,6 +1788,7 @@ class ArchiveThread:
             "log_predictions": self._log_predictions,
             "log_car_locs": self._log_car_locs,
             "log_state_transitions": self._log_state_transitions,
+            "log_racket_markers": self._log_racket_markers,
             "frame_entry_by_idx": self._frame_entry_by_idx,
             "car_loc_missed_frames": self._car_loc_missed,
         }
@@ -1881,6 +1922,7 @@ class ArchiveThread:
         self._apply_car_loc(entry, ev)
 
     def _apply_car_loc(self, entry: dict, ev: CarLocEvent) -> None:
+        self._log_racket_markers.extend(ev.racket_markers)
         if ev.status == "dropped":
             if entry.get("car_loc_status") == "pending":
                 entry["car_loc_status"] = "dropped"
@@ -2113,7 +2155,8 @@ def main() -> int:
     post_run_annotated_video_no_racket = post_run_cfg.get(
         "annotated_video_no_racket", True
     )
-    # V04/V05 四相机固定黑标拍心：结束后围绕报告 raw final HT 重扫视频，写入北极星表。
+    # V04/V05 四相机固定黑标拍心：车定位线在线截全分辨率候选（racket_marker_online），
+    # 结束后围绕报告 raw final HT 在候选里解三维，写入北极星表。
     post_run_measure_racket = bool(post_run_cfg.get("measure_racket", False))
     post_run_measure_racket_impact = racket_impact_enabled
 
@@ -2209,14 +2252,31 @@ def main() -> int:
     else:
         print("  小车定位: disabled")
 
+    # 拍上黑标在线识别（收场黑标测量的候选来源）：要本帧车位姿（车定位）+ 关节角（ROS /joint_states）
+    marker_car = next(
+        (car for car, name in CAR_LAYOUT_CONFIGS.items() if name == Path(args.car_config).name),
+        None,
+    )
+    racket_marker_joints = (
+        JointStateBuffer(marker_car)
+        if save_logs
+        and post_run_measure_racket
+        and car_localizer is not None
+        and args.ros2_mode != "off"
+        and marker_car in ("v04", "v05")
+        else None
+    )
+    print(
+        "  黑标在线识别: "
+        + ("on（车定位帧，全分辨率截块）" if racket_marker_joints is not None else "off")
+    )
+
     # ── ROS2 边车子进程（rosbag 录制 / 发送 sink）──
-    if args.online_time_align:
-        _ros2_sink = _create_ros2_sink(
-            args.ros2_mode,
-            enable_time_alignment=True,
-        )
-    else:
-        _ros2_sink = _create_ros2_sink(args.ros2_mode)
+    _ros2_sink = _create_ros2_sink(
+        args.ros2_mode,
+        enable_time_alignment=bool(args.online_time_align),
+        joint_states=racket_marker_joints,
+    )
 
     if save_logs:
         _rosbag_proc = RosbagRecorderProcess(bag_dir=output_dir / f"{run_id}_rosbag")
@@ -2378,6 +2438,19 @@ def main() -> int:
                 )
             print(f"  车定位相机: {car_loc_serials}")
 
+        # 黑标在线候选用四台相机的全分辨率图（高速相机贴回全幅的画布也用：它的 ROI 就是为黑标裁的）
+        racket_marker = (
+            RacketMarkerLocator(
+                car=marker_car,
+                calib_path=args.calib_config,
+                serials=cam_serials,
+                exposure_us=camera_settings[cam_serials[0]]["exposure_us"],
+                joint_states=racket_marker_joints,
+            )
+            if racket_marker_joints is not None
+            else None
+        )
+
         print("  等待相机稳定 (1s)...")
         time.sleep(1.0)
 
@@ -2505,7 +2578,13 @@ def main() -> int:
                     job = _car_job_queue.get()
                     if job is None:
                         break
-                    loc = car_localizer.locate(job.images, t=job.exposure_pc)
+                    loc = car_localizer.locate(
+                        {
+                            sn: im for sn, im in job.images.items()
+                            if sn not in car_loc_disabled_serials
+                        },
+                        t=job.exposure_pc,
+                    )
                     if loc is not None:
                         _ros2_sink.publish_car_loc({
                             "topic": "car_loc",
@@ -2518,12 +2597,18 @@ def main() -> int:
                             "tag_id": loc.tag_id,
                             "tag_ids": loc.tag_ids,
                         })
+                    # 先发 /pc_car_loc 再截黑标块：本帧车位姿的发布不等黑标
                     archive_thread.submit(CarLocEvent(
                         frame_idx=job.frame_idx,
                         exposure_pc=job.exposure_pc,
                         elapsed_s=job.elapsed_s,
                         status="hit" if loc is not None else "miss",
                         car_loc=loc,
+                        racket_markers=(
+                            racket_marker.process(loc, job.marker_frames)
+                            if racket_marker is not None
+                            else []
+                        ),
                     ))
 
             _car_thread = threading.Thread(
@@ -2544,6 +2629,8 @@ def main() -> int:
             def _full_frame_worker():
                 nonlocal _full_decode_time_sum, _full_decode_count
                 nonlocal car_loc_dropped_frames
+                # 黑标每帧都截：没做车定位的帧攒着，跟下一个车定位帧一起交给车定位线
+                marker_frames: list[tuple[int, float, dict]] = []
                 with ThreadPoolExecutor(max_workers=len(cam_serials)) as pool:
                     while True:
                         job = _full_job_queue.get()
@@ -2561,6 +2648,10 @@ def main() -> int:
                         }
                         _full_decode_time_sum += time.perf_counter() - t0
                         _full_decode_count += 1
+                        if racket_marker is not None:
+                            marker_frames.append((job.frame_idx, job.exposure_pc, images))
+                            # 车定位帧被挤掉时不让它越攒越多（每帧四张全分辨率图 ~34 MB）
+                            del marker_frames[:-car_loc_sample_every_frames]
 
                         if job.car_loc_sampled:
                             assert _car_job_queue is not None
@@ -2570,12 +2661,11 @@ def main() -> int:
                                     frame_idx=job.frame_idx,
                                     exposure_pc=job.exposure_pc,
                                     elapsed_s=job.elapsed_s,
-                                    images={
-                                        sn: im for sn, im in images.items()
-                                        if sn not in car_loc_disabled_serials
-                                    },
+                                    images=images,
+                                    marker_frames=marker_frames,
                                 ),
                             )
+                            marker_frames = []
                             if stale is not None:
                                 car_loc_dropped_frames += 1
                                 archive_thread.submit(CarLocEvent(
@@ -2734,13 +2824,13 @@ def main() -> int:
                 _t_decode_sum += _t1 - _t0
 
                 # 全图线与 GPU 推理并行，不进入 YOLO 关键路径。
-                # video_sampled=False 的帧不进视频，全图也就没人要——连解码一起省掉。
+                # 不进视频、不做车定位、也不截黑标的帧，全图没人要——连解码一起省掉。
                 video_sampled = (
                     writer_thread is not None
                     and (frame_idx % video_write_every_frames) == 0
                 )
                 if _full_job_queue is not None and (
-                    video_sampled or car_loc_sampled
+                    video_sampled or car_loc_sampled or racket_marker is not None
                 ):
                     full_job = FullFrameJob(
                         video_sampled=video_sampled,
@@ -2928,6 +3018,7 @@ def main() -> int:
         log_predictions = archive_result["log_predictions"]
         log_car_locs = archive_result["log_car_locs"]
         log_state_transitions = archive_result["log_state_transitions"]
+        log_racket_markers = archive_result["log_racket_markers"]
         frame_entry_by_idx = archive_result["frame_entry_by_idx"]
         car_loc_missed_frames = archive_result["car_loc_missed_frames"]
         # 将视频帧序号回填到对应 frame_entry
@@ -3127,6 +3218,16 @@ def main() -> int:
                 getattr(car_localizer, "single_tag_frames", 0)
                 if car_localizer is not None else 0
             ),
+            # 黑标在线候选：车定位帧数 / 有候选的帧 / 缺车位姿 / 缺关节角；
+            # joint_name_mismatch = 收到的 /joint_states 关节名不是本车型那一组（车型选错，整场不出）
+            "racket_marker": (
+                {
+                    **racket_marker.stats,
+                    "joint_name_mismatch": racket_marker_joints.name_mismatch,
+                }
+                if racket_marker is not None
+                else None
+            ),
             "state_transitions": len(log_state_transitions),
             # 形状门统计：被 max_box_aspect_ratio 拦掉的网球框有多少、平均/最大长宽比多少。
             # rejected 占比高 = 曝光太长、球被拖影拉长（回球段最严重），该降曝光而不是放宽门。
@@ -3154,6 +3255,13 @@ def main() -> int:
     if save_logs:
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
+        if racket_marker is not None:
+            with open(_racket_marker_json_path(json_path), "w", encoding="utf-8") as f:
+                json.dump(
+                    {"frames": sorted(log_racket_markers, key=lambda row: row["frame_idx"])},
+                    f,
+                    separators=(",", ":"),
+                )
     if save_logs and post_run_enabled:
         # full_res 模式下产出多个独立 mp4，标注视频脚本只识别拼接 grid，所以跳过它
         post_run_video_path = (
@@ -3191,6 +3299,13 @@ def main() -> int:
         f"dropped={car_loc_dropped_frames}  "
         f"single_tag={getattr(car_localizer, 'single_tag_frames', 0)}"
     )
+    if racket_marker is not None:
+        print("  黑标在线:   " + "  ".join(f"{k}={v}" for k, v in racket_marker.stats.items()))
+        if racket_marker_joints.name_mismatch is not None:
+            print(
+                f"  ⚠ /joint_states 关节名 {racket_marker_joints.name_mismatch} "
+                f"不是 {marker_car} 的，本场没有黑标候选"
+            )
     print(f"  状态转换:   {len(log_state_transitions)}")
     print(f"  超时次数:   {timeout_count}")
     print(f"  延迟(ms):   avg={lat_avg:.0f}  min={lat_min:.0f}  max={lat_max:.0f}")
