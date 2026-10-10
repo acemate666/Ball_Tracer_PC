@@ -3,11 +3,11 @@
 
 等价于手动：
     ssh asus
-    (.venv_ros2) PS D:\robot\Ball_Tracer_PC> .\run_tracker_with_predict.ps1 -Car v05 -Duration 500 -ExposureUs 2000
+    (.venv_ros2) PS D:\robot\Ball_Tracer_PC> .\run_tracker_with_predict.ps1 -Car v05 -Duration 500
 
 用法（除下面几个本脚本自己的参数外，其余原样转给 ASUS 上的 run_tracker_with_predict.ps1；
 -Car 必填、没有默认值，理由同 run_tracker.ps1）：
-    .\run_tracker_asus.ps1 -Car v05 -Duration 500 -ExposureUs 2000
+    .\run_tracker_asus.ps1 -Car v05 -Duration 500                     曝光默认 0.8 ms（run_tracker.ps1），亮度由开场自动增益定
     .\run_tracker_asus.ps1 -PullOnly                                    只拉 ASUS 上最新一场
     .\run_tracker_asus.ps1 -PullOnly -Session tracker_20261001_234800   拉指定场（拉取中断后续传也用它）
     -AsusHost asus@10.50.65.130   不在 ASUS 局域网时走 ZeroTier（见 tennis-man memory/asus-ssh-access.md）

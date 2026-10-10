@@ -12,14 +12,15 @@ param(
     [string]$PreferredEnv = 'auto',
     [int]$RosDomainId = 2,
     [string]$CameraConfig = '',
-    # 曝光临时覆盖（不改配置文件）。0 / 负数 = 用配置文件里的值。
+    # 曝光（不改配置文件）。默认 800μs：1010 用户定 tracker 与 100 fps 挥拍识别（run_swing_hs.ps1）都用 0.8 ms
+    # + 开场自动增益；0 / 负数 = 用配置文件里的值。
     # 亮度不归曝光管：开相机后 tracker 按画面亮度把增益定一次、整场锁定（模拟 Gain 先用满
     # 12.78dB，不够再补 DigitalShift 数字增益），启动打印里每台一行「自动增益」。
     # 曝光只管拖影和噪声：回球段像面速度 ~1400px/s，拖影 ≈ 1.4px/1000μs（球径 13~18px），
     # 9000μs 时 2026-08-09 场击球后连丢 4 帧、回球统计整场为空；曝光越短要的增益越大、
     # 噪声越大。某台打印「还差 +x dB」且总增益顶到 36.8dB = 太暗，加曝光；
     # 「还差 −x dB」顶到下限 = 太亮，减曝光。
-    [double]$ExposureUs = 0,
+    [double]$ExposureUs = 800,
     [string]$CalibrationConfig = '',
     # 车型必选，没有默认值：各车的车载 AprilTag 布局不同，选错了车定位会静默
     # 偏几十 cm、yaw 还可能翻 180°（拟合照样收敛，只有 car_loc 重投影会从 ~2px 涨到
