@@ -6,7 +6,6 @@
   "fps": 100.0,
   "acquisition_frame_rate": 160.0,
   "exposure_us": 800.0,
-  "video_fps": 5.0,
   "auto_gain_target": 60.0,
   "sdk_image_nodes": 32,
   "roi": {
@@ -21,7 +20,7 @@
     "fore": {"j1_range_deg": [-45.0, 45.0]},
     "back": {"j1_range_deg": [-225.0, -135.0]}
   },
-  "marker": {"crop_radius_px": 48, "detect_workers": 2},
+  "marker": {"crop_radius_px": 48},
   "car_loc": {"tag_every_frames": 10, "tag_window_pad_px": 60, "pose_median_window": 20},
   "ports": {"bridge_listen": 47310, "main": 47311, "camera_base": 47320},
   "topics": {
@@ -33,8 +32,6 @@
     "100 fps：18F 灯 100 Hz 纹波，每帧同相位（120 fps 有 20 Hz 拍频）；每台 100 fps 预算 ≈ 1.1 MP 且高 ≤ ~1130 行",
     "曝光 0.8 ms：1010 用户定 tracker 与 100 fps 都用 0.8 ms，亮度交给开场自动增益（灰度中位数 60，同 tracker）",
     "fore = 正手（J1 0° = 臂指向车右，−90° = 车尾 / ready）；back = 反手，默认取正手 ±45° 关于 −180° 的镜像",
-    "roi：黑标包络 3D 外扩 marker_margin_m、车位扰动 ±car_push_m / ±car_push_deg 并集、再外扩 pixel_margin；tag 按黑边 × tag_scale 框",
-    "video_fps：录像 = 整幅 ROI 原分辨率原始 Bayer，按触发格号每 fps/video_fps 格存一帧（1011 用户定 5 fps、不降分辨率；100 fps 全录写盘跟不上）",
-    "marker.detect_workers：每台相机几个识别进程（共用任务队列；挥拍时夜里每块 8–10 ms，一个进程贴着 100 fps 的 10 ms 预算）"
+    "roi：黑标包络 3D 外扩 marker_margin_m、车位扰动 ±car_push_m / ±car_push_deg 并集、再外扩 pixel_margin；tag 按黑边 × tag_scale 框"
   ]
 }

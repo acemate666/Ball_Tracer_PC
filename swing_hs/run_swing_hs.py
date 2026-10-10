@@ -74,7 +74,7 @@ if str(REPO) not in sys.path:
 import numpy as np  # noqa: E402
 
 from swing_hs import geometry, udp_msgs  # noqa: E402
-from swing_hs.camera_proc import DETECT_QUEUE_JOBS, camera_main, detect_main  # noqa: E402
+from swing_hs.camera_proc import DETECT_QUEUE_JOBS, DETECT_WORKERS, camera_main, detect_main  # noqa: E402
 from swing_hs.joints import JointBuffer  # noqa: E402
 from swing_hs.marker_solver import MarkerFusion  # noqa: E402
 from swing_hs.trigger_proc import trigger_main  # noqa: E402
@@ -89,6 +89,9 @@ TRIGGER_MARGIN_S = 1.0e-4
 SLOT_TIMEOUT = 300
 #: 车位相对开录时的漂移超过 ROI 余量就提醒（车没锁会被挥拍推）
 DRIFT_WARN_PERIOD_S = 10.0
+#: 录像帧率（整幅 ROI 原分辨率原始帧，按触发格号挑帧）：用户 1011「保存视频这一块就按 5FPS 保留原版的（不要降低分辨率）」。
+#: --video-fps 覆盖。写成常量不进配置：配置会被复制去改（挥拍专场的临时配置），新增键旧副本里没有
+VIDEO_FPS = 5.0
 
 
 # ───────────────── 小件 ─────────────────
@@ -455,7 +458,7 @@ def main() -> int:
     ap.add_argument("--no-ros", action="store_true", help="不起 ROS 桥和 rosbag（没有关节角就没有黑标，只用于相机自检）")
     ap.add_argument("--no-patches", action="store_true", help="不存每帧锚点小块")
     ap.add_argument("--video-fps", type=float, default=None,
-                    help="覆盖配置的录像帧率（整幅 ROI 原分辨率原始帧，默认 5；要整除触发帧率；0 = 不录）")
+                    help=f"录像帧率（整幅 ROI 原分辨率原始帧，默认 {VIDEO_FPS:g}；要整除触发帧率；0 = 不录）")
     args = ap.parse_args()
 
     cfg = _load_json(Path(args.config))
@@ -481,12 +484,12 @@ def main() -> int:
         print("--j1-range 只能配单侧 --side", file=sys.stderr)
         return 2
     try:
-        video_every = video_every_slots(fps, float(args.video_fps if args.video_fps is not None else cfg["video_fps"]))
+        video_every = video_every_slots(fps, float(args.video_fps if args.video_fps is not None else VIDEO_FPS))
     except ValueError as exc:
         print(exc, file=sys.stderr)
         return 2
     video_fps = fps / video_every if video_every else 0.0
-    detect_workers = int(cfg["marker"]["detect_workers"])
+    detect_workers = DETECT_WORKERS
 
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")   # 只用来起目录名
     session = f"swing_hs_{'plan_' if args.plan_only else 'probe_' if args.probe is not None else ''}{stamp}"

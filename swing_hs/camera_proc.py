@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""swing_hs 相机侧：每台相机一个取流进程（CameraWorker）+ detect_workers 个黑标识别进程（detect_main）。
+"""swing_hs 相机侧：每台相机一个取流进程（CameraWorker）+ DETECT_WORKERS 个黑标识别进程（detect_main）。
 
 为什么拆进程：Python 有 GIL，4 × 100 fps 取帧 + 识别挤在一个进程里会互相饿死（1006 hs405_trial 实测
 4 条忙线程把 40 fps 同步组拖到 5 fps；record_swing_hs.py 一台一个进程 100 fps 0 丢帧）。黑标候选检测夜里每块
@@ -16,7 +16,7 @@
      Bayer ROI 帧上截 ±(48+4) px 小块；tag 窗按触发格每 tag_every 帧一块累加平均（车静止，平均压夜里的噪声）。
      小块 / tag 平均图发给本相机的识别进程：解码 → 黑方块候选（与 tracker 在线黑标、收场工具同一个
      racket_ht_black_marker._marker_candidates）/ 认 tag，结果小消息发主进程三角化 / 解车位。
-     一台相机配 detect_workers 个识别进程，共用一个任务队列（挥拍时夜里每块 8–10 ms，一个进程贴着 100 fps 的 10 ms 预算）；
+     一台相机配 DETECT_WORKERS 个识别进程，共用一个任务队列（挥拍时夜里每块 8–10 ms，一个进程贴着 100 fps 的 10 ms 预算）；
      任务带本相机的序号，结果到主进程的先后会乱几个，主进程按序号放行；
   4. 存盘：每帧小块原样存（patches_<serial>.bin，离线换算法重认，可关）；录像 = 整幅 ROI 原分辨率原始 Bayer，
      每 video_every 个触发格存一帧（默认 100/20 = 5 fps，用户 1011：「保存视频就按 5 FPS 保留原版的，不要降低分辨率」；
@@ -63,6 +63,9 @@ JOINT_WAIT_S = 0.08
 PROCESS_QUEUE_FRAMES = 200
 #: 识别任务队列上限（2 s；本相机几个识别进程共用）：满了就丢这一帧的任务、计数，不阻塞取流
 DETECT_QUEUE_JOBS = 200
+#: 每台相机几个识别进程（共用上面的任务队列）：1011 00:57 挥拍时同进程识别每帧平均 8.4–10 ms，一个进程贴着 100 fps 的
+#: 10 ms 预算。写成常量不进配置：配置会被复制去改（挥拍专场的临时配置），新增键旧副本里没有
+DETECT_WORKERS = 2
 #: 录像写盘队列上限（帧；5 fps 时 60 s）
 VIDEO_QUEUE_FRAMES = 300
 #: 开录前设备时钟锁存次数（取往返最短的作初始偏移），之后每秒一次
