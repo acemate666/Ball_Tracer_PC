@@ -1,18 +1,21 @@
 # -*- coding: utf-8 -*-
-"""swing_hs 相机进程：一台相机一个进程。
+"""swing_hs 相机侧：每台相机一个取流进程（CameraWorker）+ 一个黑标识别进程（detect_main）。
 
 为什么拆进程：Python 有 GIL，4 × 100 fps 取帧 + 识别挤在一个进程里会互相饿死（1006 hs405_trial 实测
-4 条忙线程把 40 fps 同步组拖到 5 fps；record_swing_hs.py 一台一个进程 100 fps 0 丢帧）。
+4 条忙线程把 40 fps 同步组拖到 5 fps；record_swing_hs.py 一台一个进程 100 fps 0 丢帧）。黑标候选检测夜里每块
+~6.7 ms（增益顶满、噪点连通域多），再单独拆一个识别进程（用户 1011：「把黑标当成一个独立进程，不影响视频读流」），
+取流进程只做轻活（每帧 < 0.5 ms）：识别跟不上时只在任务队列满了丢任务、计数，不拖取帧。
 
 流程：
   1. 开相机，全幅、软触发：自动增益（灰度中位数拉到 60，同 tracker 启动自动增益）→ 全幅样张，
      认 AprilTag，把角点发给主进程定车位；
   2. 等主进程发 ROI（按车位 + 黑标包络 + 两块 tag 算的）→ ROI + action 触发，读回帧率上限；
-  3. 开录：取帧线程 + 识别线程。帧时间 = 曝光开始 + 读回曝光 / 2（曝光中点），取到帧时算这一次，下游
+  3. 开录：取帧线程 + 准备线程。帧时间 = 曝光开始 + 读回曝光 / 2（曝光中点），取到帧时算这一次，下游
      （关节角插值、格号、发给主进程的时间、小块记录）一律直接用、不再补半曝光（同 tracker，用户 1010 定）。
-     识别线程每帧：帧时间的关节角（ROS 桥 UDP 转来）+ 车位姿（主进程共享）→ FK 黑标锚 → 投到本相机 → 在原始 Bayer ROI 帧上截 ±(48+4) px 小块解码 → 找黑方块候选
-     （与 tracker 在线黑标、收场工具同一个 racket_ht_black_marker._marker_candidates）；tag 窗按触发格每
-     tag_every 帧一块累加平均后认一次 tag（车静止，平均压夜里的噪声）。结果是小消息，发主进程三角化；
+     准备线程每帧：帧时间的关节角（ROS 桥 UDP 转来）+ 车位姿（主进程共享）→ FK 黑标锚 → 投到本相机 → 在原始
+     Bayer ROI 帧上截 ±(48+4) px 小块；tag 窗按触发格每 tag_every 帧一块累加平均（车静止，平均压夜里的噪声）。
+     小块 / tag 平均图发给本相机的识别进程：解码 → 黑方块候选（与 tracker 在线黑标、收场工具同一个
+     racket_ht_black_marker._marker_candidates）/ 认 tag，结果小消息发主进程三角化 / 解车位；
   4. 可选：每帧小块原样存盘（patches_<serial>.bin，离线换算法重认）、整幅 ROI 原始帧存盘（hs_<serial>.*，
      与 HighSpeedRecorder / test_src/hs_recording.py 同格式）。
 """
@@ -53,8 +56,10 @@ MONO8 = 0x01080001
 PATCH_BORDER_PX = 4
 #: 识别线程等关节角追上本帧曝光中点的最长时长（ROS 网络延时 + 200 Hz 采样间隔通常 < 20 ms）
 JOINT_WAIT_S = 0.08
-#: 待识别帧队列上限（帧）：识别跟不上时丢最老的，计数
+#: 待准备帧队列上限（帧）：准备线程跟不上时丢最老的，计数
 PROCESS_QUEUE_FRAMES = 200
+#: 识别进程任务队列上限（2 s）：满了就丢这一帧的任务、计数，不阻塞取流
+DETECT_QUEUE_JOBS = 200
 #: 原始帧写盘队列上限（帧）
 RAW_QUEUE_FRAMES = 3000
 #: 开录前设备时钟锁存次数（取往返最短的作初始偏移），之后每秒一次
@@ -94,6 +99,56 @@ def slot_of(frame_t: float, t0: float, period: float) -> int:
     return int(round((frame_t - t0) / period))
 
 
+def crop_marker_patch(
+    raw: np.ndarray,
+    roi_origin: tuple[int, int],
+    anchor_uv: np.ndarray,
+    *,
+    radius: int,
+) -> Optional[tuple[int, int, np.ndarray]]:
+    """原始 Bayer ROI 帧上，锚点（全幅像素）附近截块：左上角对齐到偶数（ROI 偏移本身是偶数），Bayer 相位与
+    全幅一致；块比候选半径多留 PATCH_BORDER_PX 的解码边。返回 (块左上全幅 x, y, 原始块)；锚点出 ROI 返回 None。"""
+    ox, oy = roi_origin
+    height, width = raw.shape[:2]
+    au, av = float(anchor_uv[0]) - ox, float(anchor_uv[1]) - oy
+    if not (math.isfinite(au) and math.isfinite(av)):
+        return None
+    if au < -radius or au >= width + radius or av < -radius or av >= height + radius:
+        return None
+    half = radius + PATCH_BORDER_PX
+    x0 = max(0, (int(math.floor(au - half)) // 2) * 2)
+    y0 = max(0, (int(math.floor(av - half)) // 2) * 2)
+    x1 = min(width, x0 + 2 * half + 2)
+    y1 = min(height, y0 + 2 * half + 2)
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return None
+    return ox + x0, oy + y0, np.ascontiguousarray(raw[y0:y1, x0:x1])
+
+
+def marker_candidates_in_patch(
+    patch: np.ndarray,
+    patch_origin: tuple[int, int],
+    anchor_uv: tuple[float, float],
+    code: int,
+    *,
+    radius: int,
+) -> list[tuple]:
+    """小块解码 → 黑方块候选：racket_ht_black_marker._marker_candidates（tracker 在线黑标同参数：local_radius=48、
+    不做大范围搜索）。返回候选行 [(u, v, score, area, bx, by, bw, bh)]，全幅像素。"""
+    import cv2
+
+    rbm = geometry.load_test_src("racket_ht_black_marker")
+    gx, gy = patch_origin
+    bgr = cv2.cvtColor(np.ascontiguousarray(patch), code)
+    found = rbm._marker_candidates(bgr, (float(anchor_uv[0]) - gx, float(anchor_uv[1]) - gy),
+                                   local_radius=radius, broad_radius=None)
+    return [
+        (round(c.uv[0] + gx, 2), round(c.uv[1] + gy, 2), round(float(c.score), 1), int(c.area),
+         int(c.bbox_xywh[0] + gx), int(c.bbox_xywh[1] + gy), int(c.bbox_xywh[2]), int(c.bbox_xywh[3]))
+        for c in found
+    ]
+
+
 def detect_marker_in_roi(
     raw: np.ndarray,
     roi_origin: tuple[int, int],
@@ -102,40 +157,13 @@ def detect_marker_in_roi(
     *,
     radius: int,
 ) -> tuple[list[tuple], Optional[tuple[int, int, np.ndarray]]]:
-    """原始 Bayer ROI 帧上，锚点（全幅像素）附近截块找黑方块候选。
-
-    块的左上角对齐到偶数（ROI 偏移本身是偶数），Bayer 相位与全幅一致；块比候选半径多留
-    PATCH_BORDER_PX 的解码边。候选检测 = racket_ht_black_marker._marker_candidates（tracker 在线
-    黑标同参数：local_radius=48、不做大范围搜索）。
-    返回 (候选行 [(u, v, score, area, bx, by, bw, bh)，全幅像素], (块左上全幅 x, y, 原始块) 或 None)。
-    """
-    import cv2
-
-    rbm = geometry.load_test_src("racket_ht_black_marker")
-    ox, oy = roi_origin
-    height, width = raw.shape[:2]
-    au, av = float(anchor_uv[0]) - ox, float(anchor_uv[1]) - oy
-    if not (math.isfinite(au) and math.isfinite(av)):
+    """截块 + 认候选一步做完（取流 / 识别两进程各做一半，这里给单测和离线用）。"""
+    patch = crop_marker_patch(raw, roi_origin, anchor_uv, radius=radius)
+    if patch is None:
         return [], None
-    if au < -radius or au >= width + radius or av < -radius or av >= height + radius:
-        return [], None
-    half = radius + PATCH_BORDER_PX
-    x0 = max(0, (int(math.floor(au - half)) // 2) * 2)
-    y0 = max(0, (int(math.floor(av - half)) // 2) * 2)
-    x1 = min(width, x0 + 2 * half + 2)
-    y1 = min(height, y0 + 2 * half + 2)
-    if x1 - x0 < 8 or y1 - y0 < 8:
-        return [], None
-    patch = np.ascontiguousarray(raw[y0:y1, x0:x1])
-    bgr = cv2.cvtColor(patch, code)
-    found = rbm._marker_candidates(bgr, (au - x0, av - y0), local_radius=radius, broad_radius=None)
-    gx, gy = ox + x0, oy + y0
-    rows = [
-        (round(c.uv[0] + gx, 2), round(c.uv[1] + gy, 2), round(float(c.score), 1), int(c.area),
-         int(c.bbox_xywh[0] + gx), int(c.bbox_xywh[1] + gy), int(c.bbox_xywh[2]), int(c.bbox_xywh[3]))
-        for c in found
-    ]
-    return rows, (gx, gy, patch)
+    gx, gy, block = patch
+    return marker_candidates_in_patch(block, (gx, gy), (float(anchor_uv[0]), float(anchor_uv[1])), code,
+                                      radius=radius), patch
 
 
 def tag_windows(
@@ -259,7 +287,7 @@ def detect_tags(detector, gray: np.ndarray, origin: tuple[int, int], tag_ids: se
 class CameraWorker:
     """一台相机：开 → 自动增益 → 全幅样张 → ROI + action 触发 → 取帧 / 识别 / 写盘 → 收尾。"""
 
-    def __init__(self, spec: dict, out_q, ctrl_q, shared_car, t0, stop_evt, start_evt) -> None:
+    def __init__(self, spec: dict, out_q, ctrl_q, detect_q, shared_car, t0, stop_evt, start_evt) -> None:
         import src.mvs_env  # noqa: F401  （MvImport / DLL 路径，必须在 SDK 之前）
         import CameraParams_header as cph
         from MvCameraControl_class import MvCamera
@@ -270,6 +298,7 @@ class CameraWorker:
         self.serial = str(spec["serial"])
         self.out_q = out_q
         self.ctrl_q = ctrl_q
+        self.detect_q = detect_q
         self.shared_car = shared_car
         self.t0 = t0
         self.stop_evt = stop_evt
@@ -300,7 +329,6 @@ class CameraWorker:
         self.tag_corners = geometry.tag_corners_car(vehicle, 1.0)
         self.tag_ids = set(self.tag_corners)
         self.full_tag_detector = make_tag_detector(full_frame=True)
-        self.tag_detector = make_tag_detector(full_frame=False)
         self.joints = JointBuffer(eab.CAR_MODELS[self.car].slot_joint_names)
         self.radius = int(spec["crop_radius_px"])
         self.tag_avg = TagWindowAverager(int(spec["tag_every_frames"]))
@@ -314,9 +342,9 @@ class CameraWorker:
         self._patch_q: "queue.Queue[Optional[tuple]]" = queue.Queue(maxsize=4000)
         self.stats: dict[str, Any] = {
             "received": 0, "missing": 0, "lost_packets": 0, "lost_packet_frames": 0, "size_mismatch": 0,
-            "proc_dropped": 0, "processed": 0, "with_candidates": 0, "no_car_pose": 0, "no_joint_state": 0,
-            "out_of_roi": 0, "tag_runs": 0, "tag_hits": 0, "raw_written": 0, "raw_dropped": 0,
-            "patches_written": 0, "patches_dropped": 0, "proc_ms_sum": 0.0, "proc_ms_max": 0.0,
+            "proc_dropped": 0, "prepared": 0, "detect_dropped": 0, "no_car_pose": 0, "no_joint_state": 0,
+            "out_of_roi": 0, "tag_blocks": 0, "raw_written": 0, "raw_dropped": 0,
+            "patches_written": 0, "patches_dropped": 0, "prep_ms_sum": 0.0, "prep_ms_max": 0.0,
             "joint_wait_ms_sum": 0.0, "queue_max": 0, "before_trigger": 0,
         }
         self._last_frame_num: Optional[int] = None
@@ -668,10 +696,18 @@ class CameraWorker:
             time.sleep(0.002)
         return time.perf_counter() - start
 
-    def _process_loop(self) -> None:
+    def _submit(self, job: tuple) -> bool:
+        try:
+            self.detect_q.put_nowait(job)
+            return True
+        except queue.Full:
+            self.stats["detect_dropped"] += 1
+            return False
+
+    def _prepare_loop(self) -> None:
+        """每帧：等关节角 → FK 黑标锚 → 截块，连同帧信息交给识别进程；tag 窗按块累加平均，满一块交给识别进程。"""
         stats = self.stats
-        code = bayer_code(self.pixel_type if self.pixel_type is not None else 0x01080008)
-        code_for = self.pixel_type
+        pixel_type = self.pixel_type if self.pixel_type is not None else 0x01080008
         roi_origin = (self.roi[0], self.roi[1])
         record_patches = bool(self.spec.get("record_patches"))
         while True:
@@ -679,15 +715,14 @@ class CameraWorker:
             if item is None:
                 break
             slot, fnum, frame_t, raw = item
-            if self.pixel_type != code_for:
-                code_for = self.pixel_type
-                code = bayer_code(code_for)
+            if self.pixel_type is not None:
+                pixel_type = self.pixel_type
             stats["joint_wait_ms_sum"] += 1e3 * self._wait_joints(frame_t)
             t_start = time.perf_counter()
             pose = self.car_pose()
             q = self.joints.at_pc(frame_t)
             anchor_mm = None
-            rows: list[tuple] = []
+            patch_job = None
             if pose is None:
                 status = "no_car_pose"
                 stats["no_car_pose"] += 1
@@ -699,54 +734,36 @@ class CameraWorker:
                 anchor_m = geometry.car_to_world(marker, pose, self.z_offset)[0]
                 anchor_mm = [round(float(v) * 1000.0, 1) for v in anchor_m]
                 anchor_uv = geometry.project_m(self.camera, anchor_m)[0]
-                rows, patch = detect_marker_in_roi(raw, roi_origin, anchor_uv, code, radius=self.radius)
+                patch = crop_marker_patch(raw, roi_origin, anchor_uv, radius=self.radius)
                 if patch is None:
                     status = "out_of_roi"
                     stats["out_of_roi"] += 1
                 else:
                     status = "ok"
-                    if rows:
-                        stats["with_candidates"] += 1
+                    gx, gy, block = patch
+                    patch_job = (gx, gy, float(anchor_uv[0]), float(anchor_uv[1]), block, pixel_type)
                     if record_patches:
                         try:
                             self._patch_q.put_nowait((slot, fnum, frame_t, patch))
                         except queue.Full:
                             stats["patches_dropped"] += 1
-            self.out_q.put(("f", self.serial, (
-                slot, fnum, frame_t, status, anchor_mm,
-                None if q is None else [round(float(v), 6) for v in q], rows,
-            )))
+            self._submit(("m", slot, fnum, frame_t, status, anchor_mm,
+                          None if q is None else [round(float(v), 6) for v in q], patch_job))
             if pose is not None and self.tags_in_roi:
                 block = self.tag_avg.add(
                     slot, frame_t, raw,
                     lambda: tag_windows(self.camera, pose, self.tag_corners, self.roi, self.tag_pad))
                 if block is not None:
-                    self._detect_tags(block, code)
-            stats["processed"] += 1
+                    stats["tag_blocks"] += 1
+                    self._submit(("t", *block, roi_origin, pixel_type))
+            stats["prepared"] += 1
             dt_ms = 1e3 * (time.perf_counter() - t_start)
-            stats["proc_ms_sum"] += dt_ms
-            stats["proc_ms_max"] = max(stats["proc_ms_max"], dt_ms)
+            stats["prep_ms_sum"] += dt_ms
+            stats["prep_ms_max"] = max(stats["prep_ms_max"], dt_ms)
         block = self.tag_avg.flush()
         if block is not None:
-            self._detect_tags(block, code)
-
-    def _detect_tags(self, block: tuple, code: int) -> None:
-        """一块（tag_every 帧）平均后的 tag 窗认 tag，按块首格号发主进程。"""
-        import cv2
-
-        slot0, t_mean, windows = block
-        self.stats["tag_runs"] += 1
-        found: list[tuple[int, list]] = []
-        ox, oy = self.roi[0], self.roi[1]
-        for x0, y0, avg in windows:
-            gray = cv2.cvtColor(cv2.cvtColor(avg, code), cv2.COLOR_BGR2GRAY)
-            found.extend(detect_tags(self.tag_detector, gray, (ox + x0, oy + y0), self.tag_ids))
-        ids = [tid for tid, _ in found]
-        if len(ids) != len(set(ids)):
-            found = []
-        if found:
-            self.stats["tag_hits"] += 1
-        self.out_q.put(("t", self.serial, (slot0, t_mean, found)))
+            stats["tag_blocks"] += 1
+            self._submit(("t", *block, roi_origin, pixel_type))
 
     # ── 写盘 ──
     def _patch_writer(self) -> None:
@@ -848,7 +865,7 @@ class CameraWorker:
             self._check(self.cam.MV_CC_StartGrabbing(), "StartGrabbing")
             threads = [
                 threading.Thread(target=self._grab_loop, name=f"grab-{self.serial}", daemon=True),
-                threading.Thread(target=self._process_loop, name=f"proc-{self.serial}", daemon=True),
+                threading.Thread(target=self._prepare_loop, name=f"prep-{self.serial}", daemon=True),
             ]
             if self.spec.get("record_patches"):
                 threads.append(threading.Thread(target=self._patch_writer, name=f"patch-{self.serial}", daemon=True))
@@ -861,7 +878,7 @@ class CameraWorker:
                 th.start()
             while not self.stop_evt.wait(1.0):
                 self._send("stats", self.stats_snapshot())
-            # 收尾：取帧线程把 SDK 缓冲取空后退出 → 识别线程处理完剩下的帧 → 写盘线程收尾
+            # 收尾：取帧线程把 SDK 缓冲取空后退出 → 准备线程把剩下的帧交给识别进程 → 写盘线程收尾 → 通知识别进程
             threads[0].join(timeout=10.0)
             self.cam.MV_CC_StopGrabbing()
             threads[1].join(timeout=30.0)
@@ -871,6 +888,10 @@ class CameraWorker:
             for th in threads[2:]:
                 th.join(timeout=60.0)
             listener_stop.set()
+            try:
+                self.detect_q.put(None, timeout=30.0)    # 识别进程把剩下的任务做完就退（主进程兜底也会放）
+            except queue.Full:
+                pass
             for _ in range(3):
                 self.latch_clock()
             self._write_clock_csv()
@@ -888,11 +909,77 @@ class CameraWorker:
                 self.MvCamera.MV_CC_Finalize()
 
 
-def camera_main(spec: dict, out_q, ctrl_q, shared_car, t0, stop_evt, start_evt) -> None:
+def camera_main(spec: dict, out_q, ctrl_q, detect_q, shared_car, t0, stop_evt, start_evt) -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)   # 只认主进程的停止事件
     set_priority(ABOVE_NORMAL_PRIORITY_CLASS)
     try:
         with HighResolutionTimer():
-            CameraWorker(spec, out_q, ctrl_q, shared_car, t0, stop_evt, start_evt).run()
+            CameraWorker(spec, out_q, ctrl_q, detect_q, shared_car, t0, stop_evt, start_evt).run()
     except BaseException as exc:  # noqa: BLE001 —— 任何异常都要报回主进程
         out_q.put(("error", str(spec.get("serial")), f"{exc!r}\n{traceback.format_exc()}"))
+
+
+def detect_main(spec: dict, detect_q, out_q) -> None:
+    """一台相机的黑标识别进程：取流进程交来的小块 → 黑方块候选（"f" 消息）、tag 平均图 → 认 tag（"t" 消息），发主进程。
+    收到 None（取流进程收尾时放的；主进程兜底也会放）就退。"""
+    import cv2
+
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    serial = str(spec["serial"])
+    try:
+        cv2.setNumThreads(1)       # 97 px 小块上 OpenCV 内部多线程只有调度开销，4 个识别进程还会互相抢核
+        geometry.load_test_src("racket_ht_black_marker")
+        tag_detector = make_tag_detector(full_frame=False)
+        tag_ids = set(geometry.tag_corners_car(geometry.load_vehicle_reference(Path(spec["vehicle_path"])), 1.0))
+        radius = int(spec["crop_radius_px"])
+        stats: dict[str, Any] = {"processed": 0, "with_candidates": 0, "proc_ms_sum": 0.0, "proc_ms_max": 0.0,
+                                 "tag_runs": 0, "tag_hits": 0, "backlog": 0, "backlog_max": 0}
+        last_report = time.perf_counter()
+
+        def report(kind: str) -> None:
+            try:
+                stats["backlog"] = detect_q.qsize()
+            except NotImplementedError:
+                stats["backlog"] = -1
+            stats["backlog_max"] = max(stats["backlog_max"], stats["backlog"])
+            out_q.put((kind, serial, dict(stats)))
+
+        while True:
+            if time.perf_counter() - last_report >= 1.0:
+                last_report = time.perf_counter()
+                report("dstats")
+            try:
+                job = detect_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if job is None:
+                break
+            t_start = time.perf_counter()
+            if job[0] == "m":
+                _, slot, fnum, frame_t, status, anchor_mm, q, patch_job = job
+                rows: list[tuple] = []
+                if patch_job is not None:
+                    gx, gy, au, av, block, pixel_type = patch_job
+                    rows = marker_candidates_in_patch(block, (gx, gy), (au, av), bayer_code(pixel_type), radius=radius)
+                    if rows:
+                        stats["with_candidates"] += 1
+                out_q.put(("f", serial, (slot, fnum, frame_t, status, anchor_mm, q, rows)))
+                stats["processed"] += 1
+                dt_ms = 1e3 * (time.perf_counter() - t_start)
+                stats["proc_ms_sum"] += dt_ms
+                stats["proc_ms_max"] = max(stats["proc_ms_max"], dt_ms)
+            else:
+                _, slot0, t_mean, windows, (ox, oy), pixel_type = job
+                code = bayer_code(pixel_type)
+                found: list[tuple[int, list]] = []
+                for x0, y0, avg in windows:
+                    gray = cv2.cvtColor(cv2.cvtColor(avg, code), cv2.COLOR_BGR2GRAY)
+                    found.extend(detect_tags(tag_detector, gray, (ox + x0, oy + y0), tag_ids))
+                if len({tid for tid, _ in found}) != len(found):
+                    found = []
+                stats["tag_runs"] += 1
+                stats["tag_hits"] += bool(found)
+                out_q.put(("t", serial, (slot0, t_mean, found)))
+        report("ddone")
+    except BaseException as exc:  # noqa: BLE001
+        out_q.put(("error", f"detect-{serial}", f"{exc!r}\n{traceback.format_exc()}"))

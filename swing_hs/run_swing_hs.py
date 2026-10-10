@@ -69,7 +69,7 @@ if str(REPO) not in sys.path:
 import numpy as np  # noqa: E402
 
 from swing_hs import geometry, udp_msgs  # noqa: E402
-from swing_hs.camera_proc import camera_main  # noqa: E402
+from swing_hs.camera_proc import DETECT_QUEUE_JOBS, camera_main, detect_main  # noqa: E402
 from swing_hs.joints import JointBuffer  # noqa: E402
 from swing_hs.marker_solver import MarkerFusion  # noqa: E402
 from swing_hs.trigger_proc import trigger_main  # noqa: E402
@@ -79,8 +79,9 @@ DEFAULT_CONFIG = Path(__file__).with_name("config_18.json")
 STOP_FILE_NAME = ".stop_swing_hs"
 #: 触发最小间隔在传感器最小周期之上留的余量（action 包在交换机上的抖动是几十 µs）
 TRIGGER_MARGIN_S = 1.0e-4
-#: 一个触发格最多等其它相机这么多格（0.5 s）就按不齐处理
-SLOT_TIMEOUT = 50
+#: 一个触发格最多等其它相机这么多格（3 s）就按不齐处理：各相机识别进程排队深浅不同（任务队列上限 2 s），
+#: 结果到得有先有后
+SLOT_TIMEOUT = 300
 #: 车位相对开录时的漂移超过 ROI 余量就提醒（车没锁会被挥拍推）
 DRIFT_WARN_PERIOD_S = 10.0
 
@@ -96,14 +97,23 @@ class SlotAssembler:
         self.timeout = timeout_slots
         self.pending: dict[int, dict[str, Any]] = {}
         self.newest: Optional[int] = None
+        self._closed: set[int] = set()      # 已交出的格（只留最近 2×timeout 格）
+        self.late = 0                       # 格已交出后才到的消息
 
     def add(self, slot: int, serial: str, payload: Any) -> list[tuple[int, dict]]:
+        if slot in self._closed:
+            self.late += 1
+            return []
         self.pending.setdefault(slot, {})[serial] = payload
         self.newest = slot if self.newest is None else max(self.newest, slot)
         done = []
         if self.expected <= set(self.pending[slot]):
             done.append((slot, self.pending.pop(slot)))
         done.extend(self.expire())
+        self._closed.update(slot for slot, _ in done)
+        if len(self._closed) > 4 * self.timeout:
+            floor = self.newest - 2 * self.timeout
+            self._closed = {slot for slot in self._closed if slot >= floor}
         return done
 
     def expire(self, force: bool = False) -> list[tuple[int, dict]]:
@@ -113,6 +123,7 @@ class SlotAssembler:
         for slot in sorted(self.pending):
             if force or slot < self.newest - self.timeout:
                 out.append((slot, self.pending.pop(slot)))
+        self._closed.update(slot for slot, _ in out)
         return out
 
 
@@ -437,6 +448,7 @@ def main() -> int:
     ctx = mp.get_context("spawn")
     out_q = ctx.Queue()
     ctrl_qs = {sn: ctx.Queue() for sn in serials}
+    detect_qs = {sn: ctx.Queue(maxsize=DETECT_QUEUE_JOBS) for sn in serials}
     shared_car = ctx.Array("d", 6)
     t0_shared = ctx.Value("d", 0.0)
     cam_stop, cam_start, trig_stop = ctx.Event(), ctx.Event(), ctx.Event()
@@ -454,6 +466,8 @@ def main() -> int:
     ready: dict[str, dict] = {}
     done: dict[str, dict] = {}
     latest: dict[str, dict] = {}
+    done_det: dict[str, dict] = {}
+    latest_det: dict[str, dict] = {}
 
     def handle_control(kind: str, who: str, payload: Any) -> bool:
         """非数据消息；返回 True 表示已处理。"""
@@ -465,6 +479,10 @@ def main() -> int:
             done[who] = payload
         elif kind in ("stats", "trigger"):
             latest[who] = payload
+        elif kind == "dstats":
+            latest_det[who] = payload
+        elif kind == "ddone":
+            done_det[who] = payload
         elif kind == "warn":
             print(f"  [警告 {who}] {payload}")
             meta["events"].append({"warn": who, "msg": payload})
@@ -517,10 +535,14 @@ def main() -> int:
                 "tag_window_pad_px": float(cfg["car_loc"]["tag_window_pad_px"]),
                 "joint_port": camera_ports[sn], "record_patches": not args.no_patches, "raw_dir": raw_dir,
             }
-            p = ctx.Process(target=camera_main, args=(spec, out_q, ctrl_qs[sn], shared_car, t0_shared, cam_stop, cam_start),
+            p = ctx.Process(target=camera_main,
+                            args=(spec, out_q, ctrl_qs[sn], detect_qs[sn], shared_car, t0_shared, cam_stop, cam_start),
                             name=f"cam-{sn}")
             p.start()
             procs[sn] = p
+            p = ctx.Process(target=detect_main, args=(spec, detect_qs[sn], out_q), name=f"det-{sn}")
+            p.start()
+            procs[f"det-{sn}"] = p
         wait_for(snapshots, serials, 120.0, "相机开场（自动增益 + 全幅样张）")
         if errors:
             raise RuntimeError("; ".join(errors))
@@ -750,9 +772,11 @@ def main() -> int:
                         continue
                     rate = (s["received"] - prev_rx.get(sn, 0)) / dt
                     prev_rx[sn] = s["received"]
-                    proc = max(1, s["processed"])
-                    parts.append(f"{sn[-3:]} {rate:5.1f}fps q{s['queue']:<3d} 丢{s['proc_dropped'] + s['missing']} "
-                                 f"候选{100 * s['with_candidates'] / proc:3.0f}%")
+                    d = latest_det.get(sn) or {}
+                    proc = max(1, d.get("processed", 0))
+                    parts.append(f"{sn[-3:]} {rate:5.1f}fps 丢{s['proc_dropped'] + s['missing'] + s['detect_dropped']} "
+                                 f"积压{d.get('backlog', 0):<3d} 候选{100 * d.get('with_candidates', 0) / proc:3.0f}% "
+                                 f"{d.get('proc_ms_sum', 0.0) / proc:4.1f}ms")
                 solved = 100.0 * window["solved"] / max(1, window["slots"])
                 window["solved"] = window["slots"] = 0
                 tr = latest.get("trigger") or {}
@@ -782,7 +806,20 @@ def main() -> int:
         cam_stop.set()
         deadline = time.perf_counter() + 120.0
         streaming = t_record is not None
-        while time.perf_counter() < deadline and any(procs[sn].is_alive() for sn in serials if sn in procs):
+        sentinel_sent: set[str] = set()
+
+        def detect_alive() -> bool:
+            for sn in serials:
+                if sn in procs and not procs[sn].is_alive() and sn not in sentinel_sent:
+                    sentinel_sent.add(sn)
+                    try:
+                        detect_qs[sn].put(None, timeout=1.0)
+                    except queue.Full:
+                        pass
+            return any(procs[k].is_alive() for k in procs if k.startswith("det-"))
+
+        while time.perf_counter() < deadline and (
+                any(procs[sn].is_alive() for sn in serials if sn in procs) or detect_alive()):
             try:
                 kind, who, payload = out_q.get(timeout=0.2)
             except queue.Empty:
@@ -823,8 +860,10 @@ def main() -> int:
         meta["interrupted"] = interrupted
         meta["errors"] = errors
         meta["done"] = done
+        meta["done_detect"] = done_det
+        meta["late_messages"] = {"marker": marker_asm.late if streaming else 0, "tag": tag_asm.late if streaming else 0}
         if streaming:
-            meta["summary"] = summarize(meta, counters, car, fusion, done, latest, main_joints, session_dir, fps)
+            meta["summary"] = summarize(meta, counters, car, fusion, done, latest, done_det, latest_det, main_joints)
             print(json.dumps(meta["summary"], ensure_ascii=False, indent=2))
         write_json(session_dir / "meta.json", meta)
         print(f"[swing_hs] meta → {session_dir / 'meta.json'}")
@@ -833,7 +872,7 @@ def main() -> int:
 
 
 def summarize(meta: dict, counters: dict, car: CarPose, fusion: MarkerFusion, done: dict, latest: dict,
-              joints: JointBuffer, session_dir: Path, fps: float) -> dict:
+              done_det: dict, latest_det: dict, joints: JointBuffer) -> dict:
     duration = (meta.get("record_stop_perf") or time.perf_counter()) - meta["record_start_perf"]
     out: dict[str, Any] = {"duration_s": round(duration, 2)}
     trig = done.get("trigger") or latest.get("trigger") or {}
@@ -843,18 +882,23 @@ def summarize(meta: dict, counters: dict, car: CarPose, fusion: MarkerFusion, do
     for sn, s in done.items():
         if sn == "trigger":
             continue
-        proc = max(1, int(s.get("processed", 0)))
+        d = done_det.get(sn) or latest_det.get(sn) or {}
+        prep = max(1, int(s.get("prepared", 0)))
+        proc = max(1, int(d.get("processed", 0)))
         cams[sn] = {
             "received": s.get("received"), "vs_issued": round(s.get("received", 0) / issued, 4) if issued else None,
             "missing": s.get("missing"), "lost_packet_frames": s.get("lost_packet_frames"),
-            "proc_dropped": s.get("proc_dropped"), "processed": s.get("processed"),
-            "with_candidates": round(s.get("with_candidates", 0) / proc, 4),
-            "out_of_roi": round(s.get("out_of_roi", 0) / proc, 4),
-            "no_joint_state": round(s.get("no_joint_state", 0) / proc, 4),
-            "no_car_pose": round(s.get("no_car_pose", 0) / proc, 4),
-            "proc_ms_mean": round(s.get("proc_ms_sum", 0.0) / proc, 2), "proc_ms_max": round(s.get("proc_ms_max", 0.0), 1),
-            "joint_wait_ms_mean": round(s.get("joint_wait_ms_sum", 0.0) / proc, 2),
-            "tag_hits": s.get("tag_hits"), "tag_runs": s.get("tag_runs"),
+            "proc_dropped": s.get("proc_dropped"), "detect_dropped": s.get("detect_dropped"),
+            "prepared": s.get("prepared"), "processed": d.get("processed"),
+            "with_candidates": round(d.get("with_candidates", 0) / proc, 4),
+            "out_of_roi": round(s.get("out_of_roi", 0) / prep, 4),
+            "no_joint_state": round(s.get("no_joint_state", 0) / prep, 4),
+            "no_car_pose": round(s.get("no_car_pose", 0) / prep, 4),
+            "prep_ms_mean": round(s.get("prep_ms_sum", 0.0) / prep, 2), "prep_ms_max": round(s.get("prep_ms_max", 0.0), 1),
+            "detect_ms_mean": round(d.get("proc_ms_sum", 0.0) / proc, 2),
+            "detect_ms_max": round(d.get("proc_ms_max", 0.0), 1), "detect_backlog_max": d.get("backlog_max"),
+            "joint_wait_ms_mean": round(s.get("joint_wait_ms_sum", 0.0) / prep, 2),
+            "tag_blocks": s.get("tag_blocks"), "tag_hits": d.get("tag_hits"), "tag_runs": d.get("tag_runs"),
             "patches_written": s.get("patches_written"), "raw_written": s.get("raw_written"),
             "joint_name_mismatch": s.get("joint_name_mismatch"),
         }

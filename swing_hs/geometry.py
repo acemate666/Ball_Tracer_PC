@@ -349,8 +349,8 @@ def plan_rois(
             if alone is not None and alone.max_fps >= fps + fps_headroom:
                 alone.notes.append(f"带 tag 的 ROI {plan.roi[2]}x{plan.roi[3]} 只到 {plan.max_fps:.1f} fps，这台只框黑标")
                 plan = alone
-        if plan.marker_in_sensor < 0.999:
-            plan.notes.append(f"黑标包络只有 {100 * plan.marker_in_sensor:.0f}% 在这台画面内（车离相机太近或太偏）")
+        if plan.marker_in_sensor < 0.98:
+            plan.notes.append(f"黑标包络只有 {100 * plan.marker_in_sensor:.1f}% 在这台画面内（车离相机太近或太偏）")
         for tid, ok in plan.tags_in_roi.items():
             if not ok and not plan.tags_dropped:
                 plan.notes.append(f"tag{tid} 不完整在 ROI 内（出画面或被裁）")
