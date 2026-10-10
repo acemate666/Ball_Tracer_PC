@@ -162,7 +162,11 @@ BASE_ROT = np.array(
 
 
 class CarModel(NamedTuple):
-    """一台车的整条 FK 链。tcp_distance = 拍甜点沿 link6 工具轴的标定距离。
+    """一台车的整条 FK 链。tcp_distance = 拍甜点（臂瞄准的点）沿 link6 工具轴的标定距离，marker_distance = 黑标（视觉标定
+    基准、实体拍面中心）的：v0.4 两者相同；v0.5 2026-10-09 起甜点 = 黑标往拍喉 2 cm（臂车型 yaml tool_x / marker_x）。
+    击球误差对甜点（fk()["tcp"]），与视觉黑标 / 拍心比对黑标（fk()["marker"]）。
+    roll_eccentricity_in_link6 = 拍心离拍柄轴的偏心（link6 系 [0, y, z]），甜点和黑标都带：臂端 compact_arm_kinematics
+    TCP_OFFSET_IN_LINK6 的 y/z（yaml roll_eccentricity_y/z；v0.5 10-03 起 y −5.95 mm，v0.4 为 0）。
     slot_joint_names[i] = 给控制器槽 i 供数的 ROS 关节名；None = 空槽（五轴臂的腕转槽 4，恒 0）。"""
 
     car: str
@@ -173,6 +177,8 @@ class CarModel(NamedTuple):
     tool_axis_in_link6: np.ndarray  # 拍柄方向
     face_normal_in_link6: np.ndarray
     tcp_distance: float
+    marker_distance: float
+    roll_eccentricity_in_link6: np.ndarray
     slot_joint_names: tuple
 
 # ── v0.4 / v0.5：标准运动学（唯一真值 = tennis-man/arm_controller 的 compact_arm_kinematics + config/cars/<car>.yaml）
@@ -235,6 +241,9 @@ def _standard_model(car: str) -> "CarModel":
         tool_axis_in_link6=cak.TOOL_AXIS_IN_LINK6,
         face_normal_in_link6=cak.FACE_NORMAL_IN_LINK6,
         tcp_distance=float(cak.TCP_DISTANCE),
+        marker_distance=float(cak.MARKER_DISTANCE),
+        roll_eccentricity_in_link6=np.array(
+            [0.0, float(cak.ROLL_ECCENTRICITY_Y), float(cak.ROLL_ECCENTRICITY_Z)]),
         slot_joint_names=_slot_joint_names(cak, car),
     )
 
@@ -248,6 +257,8 @@ _V03_MODEL = CarModel(
     tool_axis_in_link6=np.array([0.0, 0.0, 1.0]),
     face_normal_in_link6=np.array([1.0, 0.0, 0.0]),
     tcp_distance=0.62,
+    marker_distance=0.62,
+    roll_eccentricity_in_link6=np.zeros(3),
     slot_joint_names=SHORT_JOINT_NAMES,
 )
 
@@ -427,12 +438,14 @@ def fk(q: Iterable[float], *, tcp_distance: float | None = None,
     handle_axis = link6[:3, :3] @ model.tool_axis_in_link6
     handle_axis = handle_axis / np.linalg.norm(handle_axis)
     face_normal = link6[:3, :3] @ model.face_normal_in_link6
-    tcp = link6[:3, 3] + (model.tcp_distance if tcp_distance is None else tcp_distance) * handle_axis
+    eccentric = link6[:3, :3] @ model.roll_eccentricity_in_link6
+    tcp = link6[:3, 3] + (model.tcp_distance if tcp_distance is None else tcp_distance) * handle_axis + eccentric
 
     return {
         "q": q,
         "car": model.car,
         "tcp": tcp,
+        "marker": link6[:3, 3] + model.marker_distance * handle_axis + eccentric,  # 黑标（不随 tcp_distance 参数变）
         "handle_axis": handle_axis,
         "face_normal": face_normal / np.linalg.norm(face_normal),
         "link6": link6,
@@ -749,6 +762,12 @@ def main() -> int:
                 '"kind"' not in e["text"] for e in events if e["topic"] == "/predict_hit_pos"
             )
             c_mono = _median([d for _, d in predict_event_diffs])
+        status_diffs = [e["t_payload"] - e["recv"] for e in events
+                        if e["topic"] == "/tennis/status" and e["t_payload"] is not None]
+        if c_mono is None and len(status_diffs) >= 10:
+            # 专场空挥只发面板目标（无 generated_at）、bot 不跑：退回 status 尾缀 t=（RK 发布时刻，与 /bot_state 同口径）
+            mono_ref_topic = "/tennis/status(t=)"
+            c_mono = _median(status_diffs)
         if c_mono is None:
             raise RuntimeError(
                 "no RK mono reference in bag (/bot_state, /chassis_can/imu or "

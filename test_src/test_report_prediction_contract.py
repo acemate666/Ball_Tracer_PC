@@ -1226,12 +1226,12 @@ def test_rk300_table_anchors_everything_on_finalht():
         "末次target目标−实际车@FinalHT<br>dx/dy(cm)<br>(RK世界系)</th>",
         "末次target对应预测车<br>−实际车@FinalHT dx/dy(cm)<br>(RK世界系)</th>",
         "Pre300HT 预测击球点<br>rel_x/z(cm) @ht</th>",
-        "FinalHT 预测击球点<br>rel_x/z(cm) @ht</th>",
+        "FinalHT 预测击球点<br>rel_x/y/z(cm) @ht</th>",
         "Pre300HT−FinalHT<br>dx/dz(cm) Δht(ms)</th>",
         "PC真值@Pre300HT+zPhase<br>x/y/z(cm)<br>(y为球接触面)</th>",
         "PC真值@FinalHT+zPhase<br>x/y/z(cm)<br>(y为球接触面)</th>",
         "TCP@FinalHT x/y/z(cm,世界轴)<br>相对机械臂中心地面点z=0<br>tcp−臂目标（dx，dz）</th>",
-        "视觉拍心−车心@FinalHT+zPhase附近<br>x/y/z(cm,世界轴)<br>人工轨迹或最近前/后＋ht前逐帧；视觉−同曝光TCP（dx，dy，dz）</th>",
+        "视觉拍心−车心@FinalHT+zPhase附近<br>x/y/z(cm,世界轴)<br>人工轨迹或最近前/后＋ht前逐帧；视觉−同曝光FK黑标（dx，dy，dz）</th>",
         "车yaw@FinalHT<br>(°)</th>",
         "目标挥拍速度/yaw/pitch<br>(m/s, °, °)<br>碰撞 / 求解</th>",
         "拍面yaw,pitch / 世界拍心speed<br>@FinalHT<br>(°,°,m/s;世界系)</th>",
@@ -1330,7 +1330,11 @@ def test_rk300_table_anchors_everything_on_finalht():
     assert "(th.ref300CarX-runEnd.x)*100" not in source
     # 两个预测点格 + 差值格
     assert "const preCell=predPointCell(pre,'Pre300HT','');" in table
-    assert "const finCell=predPointCell(fin,'FinalHT',fin?' ['+srcLabel[fin.source]+']':'');" in table
+    assert "const finCell=predPointCell(fin,'FinalHT',fin?' ['+srcLabel[fin.source]+']':'',true);" in table
+    # FinalHT 格带 rel_y（与 x/z 同原点的 payload 原值；FinalHitPlan 第二行 arm target 同样 x/y/z）
+    assert "relX:p.rel_x, relY:p.rel_y, relZ:p.rel_z," in source
+    assert "(withY?tableXyzCm(d.relX,d.relY,d.relZ):tableXzCm(d.relX,d.relZ))" in table
+    assert "tableXyzCm(d.plan.arm_target_rel_x,d.plan.arm_target_rel_y,d.plan.arm_target_rel_z)" in table
     assert "tableSigned((pre.relX-fin.relX)*100)+'/'+tableSigned((pre.relZ-fin.relZ)*100)" in table
     assert "Δht'+tableSigned((pre.ht-fin.ht)*1000)+'ms" in table
     # 视频判型 / 反弹 COR 列已从主表撤下（实现保留给 racket-cor 单测）；e_n 列保留并锚 FinalHT

@@ -53,6 +53,21 @@ def test_tcp_distance_matches_current_calibration(car):
 
 
 @pytest.mark.parametrize("car", sorted(GOLDEN))
+def test_marker_is_the_yaml_black_marker(car):
+    """黑标 = yaml marker_x（视觉比对用）；甜点 = yaml tool_x（击球误差用）。v04 同点，v05 1009 起甜点在黑标往拍喉 2 cm。"""
+    cak = eab.standard_kinematics(car)
+    kin = cak.read_car_kinematics(car)
+    j6_x = float(cak.JOINTS[-1]["local0"][0, 3])
+    assert eab.CAR_MODELS[car].marker_distance == pytest.approx(float(kin["marker_x"]) - j6_x, abs=1e-12)
+    eab.use_car(car)
+    out = eab.fk([0.3, -0.2, 1.1, 0.4, 0.0, 0.2])
+    gap = float(kin["marker_x"]) - float(kin["tool_x"])
+    assert out["marker"] == pytest.approx(out["tcp"] + gap * out["handle_axis"], abs=1e-12)
+    assert gap == pytest.approx({"v04": 0.0, "v05": 0.02}[car], abs=1e-12)
+    eab.use_car("v04")  # 复位，免得影响同进程其它用例
+
+
+@pytest.mark.parametrize("car", sorted(GOLDEN))
 def test_fk_matches_arm_side_golden_vectors(car):
     """各车 FK 落回臂端 IK 声称的击球点（含 y≈0：拍心该落在击球平面上）。
 
@@ -84,6 +99,7 @@ def test_fk_matches_standard_module(car):
             q[4] = 0.0  # 空槽恒 0
         ours, theirs = eab.fk(q, car=car), cak.fk(q)
         assert np.allclose(ours["tcp"], theirs["tcp"], atol=1e-12)
+        assert np.allclose(ours["marker"], theirs["marker"], atol=1e-12)
         assert np.allclose(ours["handle_axis"], theirs["handle_axis"], atol=1e-12)
 
 

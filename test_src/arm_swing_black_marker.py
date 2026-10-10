@@ -403,7 +403,7 @@ def _worker_run(task: tuple) -> list[dict]:
         t_rk = center_abs_pc - pmr
         if not (window["start_rk"] <= t_rk <= window["end_rk"]):
             continue
-        state = ht._interpolate(arm_states, t_rk, "t", ("tcp",), ht.ARM_STATE_MAX_GAP_S)
+        state = ht._interpolate(arm_states, t_rk, "t", ("marker",), ht.ARM_STATE_MAX_GAP_S)
         car_here = c["car"]
         if c["car_track"]:
             el = center_abs_pc - c["tracker_t0"]
@@ -412,7 +412,7 @@ def _worker_run(task: tuple) -> list[dict]:
             car_here = None if pos is None or yaw is None else {"x": pos["x"], "y": pos["y"], "z": pos["z"], "yaw": yaw}
         expected = None
         if state is not None and car_here is not None:
-            expected = 1000.0 * world_of_local(np.asarray(state["tcp"], dtype=np.float64), car_here, c["z_offset_m"])
+            expected = 1000.0 * world_of_local(np.asarray(state["marker"], dtype=np.float64), car_here, c["z_offset_m"])
         jobs.append({"window": window, "frame": frame, "video_index": int(frame["video_frame_idx"]), "car": car_here,
                      "center_abs_pc": center_abs_pc, "center_elapsed": center_abs_pc - c["tracker_t0"], "t_rk": t_rk,
                      "fk_expected": expected, "candidates": None, "accepted": None})
@@ -605,8 +605,7 @@ def measure(session: str, paths: dict[str, Path], pc_minus_rk: float | None, car
     compensated = bool(arm.get("link_commands"))
     calibration_path = ht._session_path(config["calib_config_path"], paths["tracker"])
     cameras = ht._load_cameras(calibration_path, serials)
-    arm_states = sorted([row for row in arm.get("states", []) if ht._finite(row.get("t")) and row.get("tcp")],
-                        key=lambda row: float(row["t"]))
+    arm_states = ht.arm_states_with_marker(arm)   # FK 期望 = 黑标（arm JSON 的 tcp 是甜点，v05 1009 起在黑标往拍喉 2 cm）
     if not arm_states:
         raise ValueError("session lacks arm states")
 
@@ -619,7 +618,7 @@ def measure(session: str, paths: dict[str, Path], pc_minus_rk: float | None, car
                 t_rk = center_abs_pc - pmr
                 if not (window["start_rk"] <= t_rk <= window["end_rk"]):
                     continue
-                state = ht._interpolate(arm_states, t_rk, "t", ("tcp",), ht.ARM_STATE_MAX_GAP_S)
+                state = ht._interpolate(arm_states, t_rk, "t", ("marker",), ht.ARM_STATE_MAX_GAP_S)
                 expected = None
                 car_here = car
                 if car_track:
@@ -628,7 +627,7 @@ def measure(session: str, paths: dict[str, Path], pc_minus_rk: float | None, car
                     yaw = ht._interpolate_yaw(car_yaw_rows, el, ht.CAR_LOC_MAX_GAP_S)
                     car_here = None if pos is None or yaw is None else {"x": pos["x"], "y": pos["y"], "z": pos["z"], "yaw": yaw}
                 if state is not None and car_here is not None:
-                    expected = 1000.0 * world_of_local(np.asarray(state["tcp"], dtype=np.float64), car_here, z_offset_m)
+                    expected = 1000.0 * world_of_local(np.asarray(state["marker"], dtype=np.float64), car_here, z_offset_m)
                 jobs.append({"window": window, "frame": frame, "video_index": int(frame["video_frame_idx"]), "car": car_here,
                              "center_abs_pc": center_abs_pc, "center_elapsed": center_abs_pc - tracker_t0,
                              "t_rk": t_rk, "fk_expected": expected, "candidates": None, "accepted": None})
@@ -731,7 +730,7 @@ def measure(session: str, paths: dict[str, Path], pc_minus_rk: float | None, car
         if len(accepted) < 20:
             return 0.0, None
         st_t = np.asarray([float(r["t"]) for r in arm_states])
-        st_z = np.asarray([float(r["tcp"][2]) for r in arm_states])
+        st_z = np.asarray([float(r["marker"][2]) for r in arm_states])
         grid = np.arange(-0.15, 0.1501, 0.005)
         spread = []
         n_mov = []

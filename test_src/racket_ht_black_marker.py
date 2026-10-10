@@ -554,6 +554,20 @@ def _interpolate_yaw(rows: list[dict], target: float, max_gap_s: float) -> float
     return a + fraction * delta
 
 
+def arm_states_with_marker(arm: dict) -> list[dict]:
+    """arm JSON 的 states（按 t 排序、六关节齐全），每行补 marker = 黑标（视觉标定基准、实体拍面中心），按 arm["car"] 的
+    标准运动学从 position 现算。states[].tcp 是甜点（臂瞄准的点）：v0.5 2026-10-09 起在黑标往拍喉 2 cm，黑标测量用 marker。"""
+    import extract_arm_bag as eab
+
+    car = str(arm.get("car", "")).lower()
+    rows = []
+    for row in arm.get("states", []):
+        q = row.get("position")
+        if _finite(row.get("t")) and isinstance(q, list) and len(q) == 6 and all(_finite(v) for v in q):
+            rows.append({**row, "marker": [float(v) for v in eab.fk(q, car=car)["marker"]]})
+    return sorted(rows, key=lambda row: float(row["t"]))
+
+
 def _expected_world_mm(
     pc_elapsed: float,
     arm_states: list[dict],
@@ -565,7 +579,7 @@ def _expected_world_mm(
 ) -> np.ndarray | None:
     rk_absolute = rk_t0 + pc_elapsed - rk_to_pc_bias
     state = _interpolate(
-        arm_states, rk_absolute, "t", ("tcp",), ARM_STATE_MAX_GAP_S
+        arm_states, rk_absolute, "t", ("marker",), ARM_STATE_MAX_GAP_S
     )
     car = _interpolate(
         car_pos_rows, pc_elapsed, "elapsed_s", ("x", "y", "z"), CAR_LOC_MAX_GAP_S
@@ -573,7 +587,7 @@ def _expected_world_mm(
     yaw = _interpolate_yaw(car_yaw_rows, pc_elapsed, CAR_LOC_MAX_GAP_S)
     if state is None or car is None or yaw is None:
         return None
-    local = np.asarray(state["tcp"], dtype=np.float64)
+    local = np.asarray(state["marker"], dtype=np.float64)
     cosine, sine = math.cos(yaw), math.sin(yaw)
     relative_world = np.asarray(
         [
@@ -917,8 +931,8 @@ def _measurement_context(
     rk = _load_json(rk_path)
     tables = _load_json(tables_path)
     config = tracker.get("config") or {}
-    # 锚点 = 车位姿 + R(yaw)·TCP（z 减 zOff）。两车的 TCP 都标在拍面黑标上（v04 0905 tool_x 改到黑标；
-    # v05 0928 标定黑标比 TCP 只差 −0.7 mm），车定位原点都是 z=0 地面点（v05 即 J1 轴）。
+    # 锚点 = 车位姿 + R(yaw)·黑标 FK（z 减 zOff；arm_states_with_marker）。黑标 = 车型 yaml marker_x：v04 与甜点 tool_x 同点（0905），
+    # v05 1009 起甜点 = 黑标往拍喉 2 cm，arm JSON 的 tcp 不再是黑标。车定位原点都是 z=0 地面点（v05 即 J1 轴）。
     car = str(arm.get("car", "")).lower()
     if car not in ("v04", "v05") or car not in Path(
         str(config.get("car_config_path", ""))
@@ -1061,10 +1075,7 @@ def measure(
         ],
         key=lambda row: int(row["video_frame_idx"]),
     )
-    arm_states = sorted(
-        [row for row in arm.get("states", []) if _finite(row.get("t")) and row.get("tcp")],
-        key=lambda row: float(row["t"]),
-    )
+    arm_states = arm_states_with_marker(arm)
     car_locs = sorted(
         [row for row in tracker.get("car_locs", []) if _finite(row.get("elapsed_s"))],
         key=lambda row: float(row["elapsed_s"]),

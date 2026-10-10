@@ -38,11 +38,13 @@ _TENNIS_BALL_RADIUS_M = 0.033
 # 「过臂中心、垂直拍面法向」的线上；五轴臂（v05，没有腕转）甜点绕 J1 偏 φ'，挥拍方向随之转。
 # 上旋方案（world3d_topspin_v1_*，bot_center return_topspin_racket_vz_mps>0）几何同上，碰撞换旋转模型
 # spin_cross_v1：出球 = 零旋等效（en, kt）出球 + spin_c·R·(ω_in×n)（臂 control/spin_ball.hpp，臂端同式对账）。
+# 五轴上旋 v2（2026-10-09 起的 v05 生产方案）：甜点对准冲量质心 = 球心 − R·n（含仰角）+ τ·v_切，载荷多 contact_slide_sec（τ）。
 _FINAL_HIT_PLAN_FINGERPRINT_RE = re.compile(
-    r"world3d_(effective_v3|topspin_v1)_(arm_center|five_axis)_sweetspot:[0-9a-f]{16}\Z"
+    r"world3d_((effective_v3|topspin_v1)_(arm_center|five_axis)|topspin_v2_five_axis)_sweetspot:[0-9a-f]{16}\Z"
 )
-_FINAL_HIT_PLAN_FIVE_AXIS_RE = re.compile(r"world3d_(effective_v3|topspin_v1)_five_axis_sweetspot:")
-_FINAL_HIT_PLAN_SPIN_PREFIX = "world3d_topspin_v1_"
+_FINAL_HIT_PLAN_FIVE_AXIS_RE = re.compile(r"world3d_(effective_v3|topspin_v1|topspin_v2)_five_axis_sweetspot:")
+_FINAL_HIT_PLAN_SPIN_PREFIX = ("world3d_topspin_v1_", "world3d_topspin_v2_")
+_FINAL_HIT_PLAN_CENTROID_PREFIX = "world3d_topspin_v2_"
 _FINAL_HIT_PLAN_SPIN_FIELDS = (
     "spin_c",
     "incoming_spin_wx", "incoming_spin_wy", "incoming_spin_wz",
@@ -105,23 +107,25 @@ def _valid_final_hit_plan_physics(payload: dict) -> bool:
         if abs(contact_plane - payload["tennis_ball_radius_m"]) > tolerance:
             return False
 
+    # 甜点：旧口径 = 球心沿水平拍面法向退 R、高度 = 球心高；v2 冲量质心 = 球心 − R·n（含仰角）+ τ·v_切
+    # （v_切 = 来球相对拍速度去掉法向分量；bot_center return_hit_model.cpp physical_sweet_spot_relative 同式）。
+    radius = payload["tennis_ball_radius_m"]
+    contact = tuple(payload[f"contact_rel_{axis}"] for axis in "xyz")
+    sweet = (
+        contact[0] - radius * horizontal_normal[0],
+        contact[1] - radius * horizontal_normal[1],
+        contact[2],
+    )
+    if payload["model_fingerprint"].startswith(_FINAL_HIT_PLAN_CENTROID_PREFIX):
+        n = tuple(payload[f"face_normal_n{axis}"] for axis in "xyz")
+        rel = tuple(payload[f"incoming_v{axis}"] - payload[f"racket_contact_v{axis}"] for axis in "xyz")
+        along = sum(a * b for a, b in zip(rel, n))
+        tau = payload["contact_slide_sec"]
+        sweet = tuple(c - radius * ni + tau * (r - along * ni) for c, ni, r in zip(contact, n, rel))
     target_error = math.sqrt(
-        (
-            payload["arm_target_rel_x"]
-            - payload["contact_rel_x"]
-            + payload["tennis_ball_radius_m"] * horizontal_normal[0]
-            - payload["arm_target_x_bias_m"]
-        ) ** 2
-        + (
-            payload["arm_target_rel_y"]
-            - payload["contact_rel_y"]
-            + payload["tennis_ball_radius_m"] * horizontal_normal[1]
-        ) ** 2
-        + (
-            payload["arm_target_rel_z"]
-            - payload["contact_rel_z"]
-            - payload["arm_target_z_bias_m"]
-        ) ** 2
+        (payload["arm_target_rel_x"] - sweet[0] - payload["arm_target_x_bias_m"]) ** 2
+        + (payload["arm_target_rel_y"] - sweet[1]) ** 2
+        + (payload["arm_target_rel_z"] - sweet[2] - payload["arm_target_z_bias_m"]) ** 2
     )
     if target_error > tolerance:
         return False
@@ -280,6 +284,10 @@ def _report_prediction_payload(payload: dict) -> dict | None:
         payload["collision_model"] != "spin_cross_v1"
         or not all(_finite(payload.get(key)) for key in _FINAL_HIT_PLAN_SPIN_FIELDS)
         or not 0.0 < payload["spin_c"] < 1.0
+    ):
+        return None
+    if payload["model_fingerprint"].startswith(_FINAL_HIT_PLAN_CENTROID_PREFIX) and not (
+        _finite(payload.get("contact_slide_sec")) and 0.0 < payload["contact_slide_sec"] <= 0.01
     ):
         return None
     if not _valid_final_hit_plan_physics(payload):

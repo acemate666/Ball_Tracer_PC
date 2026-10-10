@@ -456,7 +456,8 @@ def test_report_surfaces_plan_physics_and_disables_new_contract_fallback():
         "racket_contact_vx", "face_normal_nx",
     ):
         assert field in source
-    assert "world3d_(effective_v3|topspin_v1)_(arm_center|five_axis)_sweetspot:[0-9a-f]{16}" in source
+    assert ("world3d_((effective_v3|topspin_v1)_(arm_center|five_axis)|topspin_v2_five_axis)_sweetspot:[0-9a-f]{16}"
+            in source)
     assert "碰撞 / 求解" in source
 
 
@@ -702,3 +703,91 @@ def test_report_accepts_topspin_plan_and_matches_ack(tmp_path):
     assert any("no-model#1" in e and "collision_model与指纹不符" in e for e in errors)
     assert any("bad-spin#1" in e and "碰撞前向复算一致性" in e for e in errors)
     assert any("flat-model#1" in e and "collision_model与指纹不符" in e for e in errors)
+
+
+# 五轴上旋 v2（2026-10-09 起 v05 生产）：甜点对准冲量质心 = 球心 − R·n（含仰角）+ τ·v_切，载荷带 contact_slide_sec。
+# 夹具在 v1 五轴上旋夹具上保持甜点 / 拍速 / 法向 / 出球不动，反推球心 = 甜点 + R·n − τ·v_切（v_切 只依赖来球、拍速、法向）。
+_SLIDE_TAU = 0.00244
+
+
+def _topspin_v2_plan(plan_id: str = "throw42", revision: int = 3) -> dict:
+    plan = _topspin_plan(plan_id, revision, five_axis=True)
+    radius = plan["tennis_ball_radius_m"]
+    normal = tuple(plan[f"face_normal_n{axis}"] for axis in "xyz")
+    rel = tuple(plan[f"incoming_v{axis}"] - plan[f"racket_contact_v{axis}"] for axis in "xyz")
+    along = sum(r * n for r, n in zip(rel, normal))
+    sweet = (
+        plan["arm_target_rel_x"] - plan["arm_target_x_bias_m"],
+        plan["arm_target_rel_y"],
+        plan["arm_target_rel_z"] - plan["arm_target_z_bias_m"],
+    )
+    contact = tuple(s + radius * n - _SLIDE_TAU * (r - along * n) for s, n, r in zip(sweet, normal, rel))
+    plan.update(
+        model_fingerprint="world3d_topspin_v2_five_axis_sweetspot:718619524b4bab8b",
+        contact_slide_sec=_SLIDE_TAU,
+        contact_rel_x=contact[0], contact_rel_y=contact[1], contact_rel_z=contact[2],
+        contact_x=plan["arm_center_x"] + contact[0], contact_y=plan["arm_center_y"] + contact[1],
+        contact_z=contact[2],
+    )
+    return plan
+
+
+def test_topspin_v2_fixture_moves_the_ball_centre_off_the_old_sweet_spot():
+    plan = _topspin_v2_plan()
+    # 上旋往上刷：甜点比球心低 R·sinθ 加下滑，旧口径（甜点高 = 球心高）对不上
+    assert plan["contact_rel_z"] - (plan["arm_target_rel_z"] - plan["arm_target_z_bias_m"]) > 0.005
+
+
+def test_rk_extractor_accepts_topspin_v2_plan():
+    plan = _topspin_v2_plan()
+    mapped = _report_prediction_payload(plan)
+    assert mapped is not None
+    assert [mapped[k] for k in ("rel_x", "rel_y", "rel_z")] == pytest.approx(
+        [plan["contact_rel_x"], plan["contact_rel_y"], plan["contact_rel_z"]]
+    )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda p: p.pop("contact_slide_sec"),
+        lambda p: p.update(contact_slide_sec=0.0),
+        lambda p: p.update(contact_slide_sec=0.02),
+        # τ 差 1 ms：甜点差 ~4 mm，超出对账容差
+        lambda p: p.update(contact_slide_sec=_SLIDE_TAU + 0.001),
+        # 按 v1 口径给的甜点（球心 = 甜点 + 水平 R 法向）贴 v2 指纹
+        lambda p: p.update({k: v for k, v in _topspin_plan(five_axis=True).items() if k.startswith("contact_")}),
+    ],
+)
+def test_rk_extractor_rejects_invalid_topspin_v2_plan(mutate):
+    plan = _topspin_v2_plan()
+    mutate(plan)
+    assert _report_prediction_payload(plan) is None
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_report_accepts_topspin_v2_plan_and_matches_ack(tmp_path):
+    good = _topspin_v2_plan("v2good", 1)
+    old_geometry = {
+        **_topspin_plan("v2-old-geometry", 1, five_axis=True),
+        "model_fingerprint": "world3d_topspin_v2_five_axis_sweetspot:718619524b4bab8b",
+        "contact_slide_sec": _SLIDE_TAU,
+    }
+    no_tau = _topspin_v2_plan("v2-no-tau", 1)
+    del no_tau["contact_slide_sec"]
+    events = [
+        {"t": 0.0, "topic": "/predict_hit_pos", "text": json.dumps(good)},
+        {"t": 0.01, "topic": "/predict_hit_pos", "text": json.dumps(old_geometry)},
+        {"t": 0.02, "topic": "/predict_hit_pos", "text": json.dumps(no_tau)},
+        {"t": 0.05, "topic": "/tennis/status", "text":
+         f"accepted hit x={good['arm_target_rel_x']:.4f} z={good['arm_target_rel_z']:.4f} "
+         "duration=0.5500 plan_id=v2good revision=1 contact_ht=100.600000 solve_ms=1.380"},
+    ]
+    result = _run_plan_parse(tmp_path, events)
+    assert result["plans"] == ["v2good"]
+    assert result["acks"] == ["v2good"]
+    assert result["ackErrors"] == []
+    errors = result["contractErrors"]
+    assert len(errors) == 2
+    assert any("v2-old-geometry#1" in e and "球心→拍心执行点一致性" in e for e in errors)
+    assert any("v2-no-tau#1" in e and "contact_slide_sec" in e for e in errors)
