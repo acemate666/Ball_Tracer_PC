@@ -141,7 +141,6 @@ class RacketMarkerLocator:
         car: str,
         calib_path: str,
         serials: list[str],
-        exposure_us: float,
         joint_states: JointStateBuffer,
     ) -> None:
         self._ht = _load_test_src("racket_ht_black_marker")
@@ -150,7 +149,6 @@ class RacketMarkerLocator:
         self._fk = eab.fk
         self._z_offset_m = float(eab.standard_kinematics(car).car_hit_pos_z_offset(car))
         self._cameras = self._ht._load_cameras(Path(calib_path), serials)
-        self._exposure_center_s = 0.5e-6 * float(exposure_us)
         self._joints = joint_states
         self._last_xyz: tuple[float, float, float, float] | None = None  # (t, x, y, z)
         self._last_yaw: tuple[float, float] | None = None  # (t, yaw)
@@ -163,8 +161,9 @@ class RacketMarkerLocator:
         没做车定位的帧，车位姿在上一个和这一个车定位位姿之间按曝光时刻插值（车慢、黑标快：拿上一帧黑标
         位置截块，113329 有 25% 的帧截不到，插值车位姿 + 本帧关节角只有 0.5%）；关节角各取各的曝光时刻。
         返回各帧 {frame_idx, exposure_pc, anchor_mm, candidates}；缺车位姿 / 关节角的帧不出。
+        exposure_pc 是 tracker 帧时间（各相机曝光中点的均值），直接当曝光时刻用。
         """
-        t_now = frames[-1][1] + self._exposure_center_s
+        t_now = frames[-1][1]
         before_xyz, before_yaw = self._last_xyz, self._last_yaw
         if loc is not None:
             self._last_xyz = (t_now, loc.x, loc.y, loc.z)
@@ -173,7 +172,7 @@ class RacketMarkerLocator:
         rows = []
         for frame_idx, exposure_pc, images in frames:
             self.stats["frames"] += 1
-            t = exposure_pc + self._exposure_center_s
+            t = exposure_pc
             xyz = _sample_at(before_xyz, self._last_xyz, t)
             yaw = _sample_at(before_yaw, self._last_yaw, t, wrap=True)
             if xyz is None or yaw is None:

@@ -841,14 +841,6 @@ def _measurement_context(
     serials = list(config.get("serials") or [])
     if len(serials) != 4 or len(set(serials)) != 4:
         raise ValueError("fixed black-marker HT measurement requires four unique cameras")
-    settings = config.get("camera_settings") or {}
-    exposures = [float(settings[serial]["exposure_us"]) for serial in serials]
-    if not exposures or not all(math.isfinite(v) and v > 0.0 for v in exposures):
-        raise ValueError("missing finite camera exposure")
-    if max(exposures) - min(exposures) > 1e-6:
-        raise ValueError("four cameras must use the same exposure time")
-    exposure_center_offset_s = 0.5e-6 * exposures[0]
-
     if tables.get("script_error") or tables.get("tab_errors"):
         raise ValueError("report page snapshot did not complete cleanly")
     contract = tables.get("arm_contract") or {}
@@ -929,7 +921,7 @@ def _measurement_context(
     targets.sort(key=lambda row: row["final_ht_pc_elapsed_s"])
     if not targets:
         raise ValueError("report arm contract has no accepted final HT with usable zPhase")
-    return tracker, arm, rk, serials, exposure_center_offset_s, z_offset, targets
+    return tracker, arm, rk, serials, z_offset, targets
 
 
 def _online_candidates(frame: dict) -> dict[str, list[MarkerCandidate]]:
@@ -961,7 +953,6 @@ def measure(
         arm,
         rk,
         serials,
-        exposure_center_offset_s,
         z_offset,
         targets,
     ) = _measurement_context(tracker_path, arm_path, rk_path, tables_path)
@@ -1012,7 +1003,6 @@ def measure(
             if -PRE_WINDOW_S
             <= (
                 float(frame["exposure_pc"])
-                + exposure_center_offset_s
                 - tracker_t0
                 - target["final_ht_pc_elapsed_s"]
             )
@@ -1031,7 +1021,7 @@ def measure(
     jobs: list[dict] = []
     for target, target_frames in windows:
         for frame in target_frames:
-            center_abs_pc = float(frame["exposure_pc"]) + exposure_center_offset_s
+            center_abs_pc = float(frame["exposure_pc"])  # tracker 帧时间就是曝光中点
             center_elapsed = center_abs_pc - tracker_t0
             jobs.append(
                 {
@@ -1238,10 +1228,7 @@ def measure(
     return {
         "config": {
             "measurement": "fixed black marker center (V04/V05, TCP calibrated onto the marker)",
-            "timing": (
-                "four-camera exposure center: exposure_pc + "
-                f"{exposure_center_offset_s * 1000.0:.3f} ms"
-            ),
+            "timing": "tracker frame time (exposure_pc = four-camera exposure center)",
             "selection": (
                 "tracker online full-resolution candidates (car-loc frames) from report "
                 f"raw final HT {-PRE_WINDOW_S:g}s to {POST_WINDOW_S:+g}s "

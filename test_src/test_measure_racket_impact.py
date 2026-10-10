@@ -14,7 +14,6 @@ from test_src.measure_racket_impact import (
     ExactVideoFrame,
     _providers,
     exact_video_frames,
-    exposure_center_offset_s,
     iter_rk_world_payloads,
     measure_video_jobs,
     parse_args,
@@ -125,7 +124,6 @@ def test_clock_bridge_and_exact_exposure_center_contracts():
         },
         "video_frame_mapping_exact": True,
     }
-    offset = exposure_center_offset_s(config)
     base = {
         "config": config,
         "frames": [{
@@ -134,12 +132,12 @@ def test_clock_bridge_and_exact_exposure_center_contracts():
             "video_mapping_exact": True,
         }],
     }
-    assert offset == pytest.approx(0.003)
-    assert exact_video_frames(base, offset) == [ExactVideoFrame(7, 50.003)]
+    # tracker 帧时间就是曝光中点（只在 tracker 入口补一次半曝光），这里原样用、不再补
+    assert exact_video_frames(base) == [ExactVideoFrame(7, 50.0)]
 
     base["frames"][0]["video_mapping_exact"] = False
     with pytest.raises(ValueError, match="non-exact"):
-        exact_video_frames(base, offset)
+        exact_video_frames(base)
 
 
 def test_video_jobs_preserve_exact_frame_id_and_fail_closed_vz(tmp_path):

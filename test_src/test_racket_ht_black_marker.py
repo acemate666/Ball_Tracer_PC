@@ -101,13 +101,11 @@ def _write_inputs(tmp_path: Path, *, align_err: float = 0.01, tab_errors=None):
     return tracker, arm, rk, tables
 
 
-def test_measurement_context_uses_report_final_ht_and_exposure_center(tmp_path: Path):
+def test_measurement_context_uses_report_final_ht(tmp_path: Path):
+    # 帧时间就是曝光中点（只在 tracker 入口补一次半曝光），上下文里不再有曝光补偿量
     paths = _write_inputs(tmp_path)
-    _, _, _, serials, exposure_offset, z_offset, targets = (
-        _measurement_context(*paths)
-    )
+    _, _, _, serials, z_offset, targets = _measurement_context(*paths)
     assert serials == SERIALS
-    assert exposure_offset == pytest.approx(0.0045)
     assert z_offset == pytest.approx(-0.1471)
     assert targets == [{
         "report_row": 1,
@@ -237,7 +235,7 @@ def _set_car(paths, car: str, layout: str) -> None:
 def test_measurement_context_accepts_v05(tmp_path: Path):
     paths = _write_inputs(tmp_path)
     _set_car(paths, "v05", r"D:\robot\Ball_Tracer_PC\src\config\vehicle_v05.json")
-    _, arm, _, _, _, _, targets = _measurement_context(*paths)
+    _, arm, _, _, _, targets = _measurement_context(*paths)
     assert arm["car"] == "v05"
     assert [row["report_row"] for row in targets] == [1]
 

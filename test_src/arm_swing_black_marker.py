@@ -300,13 +300,13 @@ def manual_windows(text: str, arm: dict) -> list[dict]:
     return out
 
 
-def motion_alignment(video_path: Path, frames: list[dict], exposure_center_offset_s: float, arm: dict,
+def motion_alignment(video_path: Path, frames: list[dict], arm: dict,
                      scale: int = MOTION_SCALE) -> dict:
     """PC/RK alignment without bot_center: whole-frame motion energy of the grid video (per exposure centre, PC
     perf axis) cross-correlated with |J1 command speed| (RK axis). The car is static, so the arm is the only
     thing moving; the lag of the correlation peak is pc_minus_rk (parabolic sub-grid refinement, ~ms).
     Compliance does not bias this: it shifts the racket by a few cm, not the timing of the whole-arm motion."""
-    t_by_idx = {int(f["video_frame_idx"]): float(f["exposure_pc"]) + exposure_center_offset_s for f in frames}
+    t_by_idx = {int(f["video_frame_idx"]): float(f["exposure_pc"]) for f in frames}  # tracker 帧时间 = 曝光中点
     cache = Path(str(video_path)[:-4] + "_motion_energy.npz")
     if cache.is_file():
         z = np.load(cache)
@@ -399,7 +399,7 @@ def _worker_run(task: tuple) -> list[dict]:
     serials, cameras, frames, arm_states = c["serials"], c["cameras"], c["frames"], c["arm_states"]
     jobs = []
     for frame in frames:
-        center_abs_pc = float(frame["exposure_pc"]) + c["exposure_center_offset_s"]
+        center_abs_pc = float(frame["exposure_pc"])
         t_rk = center_abs_pc - pmr
         if not (window["start_rk"] <= t_rk <= window["end_rk"]):
             continue
@@ -554,12 +554,6 @@ def measure(session: str, paths: dict[str, Path], pc_minus_rk: float | None, car
     serials = list(video_output.get("serial_order") or config.get("serials") or [])
     if len(serials) != 4 or len(set(serials)) != 4:
         raise ValueError("requires four unique cameras")
-    settings = config.get("camera_settings") or {}
-    exposures = [float(settings[serial]["exposure_us"]) for serial in serials]
-    if max(exposures) - min(exposures) > 1e-6:
-        raise ValueError("four cameras must use the same exposure time")
-    exposure_center_offset_s = 0.5e-6 * exposures[0]
-
     tracker_t0 = float(config["first_frame_exposure_pc"])
     frames = sorted([row for row in tracker.get("frames", [])
                      if isinstance(row, dict) and isinstance(row.get("video_frame_idx"), int)
@@ -579,14 +573,14 @@ def measure(session: str, paths: dict[str, Path], pc_minus_rk: float | None, car
         alignment.update(source="bag", bag=bag)
     elif align == "motion":
         print("[swing-marker] motion-energy alignment (decodes the whole video once)", flush=True)
-        motion = motion_alignment(paths["video"], frames, exposure_center_offset_s, arm)
+        motion = motion_alignment(paths["video"], frames, arm)
         pc_minus_rk = motion["pc_minus_rk"]
         alignment.update(source="motion", motion=motion)
     else:
         raise ValueError("no PC/RK alignment: tracker config has no rk_clock_bridge (bot_center /bot_state not recorded); "
                          "use --align bag (same boot, no sleep), --align motion or --pc-minus-rk")
     if check_align and alignment["source"] != "motion":
-        motion = motion_alignment(paths["video"], frames, exposure_center_offset_s, arm)
+        motion = motion_alignment(paths["video"], frames, arm)
         alignment["motion"] = motion
         alignment["motion_minus_used_ms"] = (motion["pc_minus_rk"] - pc_minus_rk) * 1e3
         print(f"[swing-marker] alignment cross-check: motion − {alignment['source']} = {alignment['motion_minus_used_ms']:+.1f} ms "
@@ -614,7 +608,7 @@ def measure(session: str, paths: dict[str, Path], pc_minus_rk: float | None, car
         jobs: list[dict] = []
         for window in windows_sel:
             for frame in frames:
-                center_abs_pc = float(frame["exposure_pc"]) + exposure_center_offset_s
+                center_abs_pc = float(frame["exposure_pc"])
                 t_rk = center_abs_pc - pmr
                 if not (window["start_rk"] <= t_rk <= window["end_rk"]):
                     continue
@@ -773,7 +767,7 @@ def measure(session: str, paths: dict[str, Path], pc_minus_rk: float | None, car
         import multiprocessing as mp
         ctx = {"serials": serials, "cameras": cameras, "frames": frames, "arm_states": arm_states, "car": car,
                "car_track": car_track, "car_pos_rows": car_pos_rows, "car_yaw_rows": car_yaw_rows,
-               "exposure_center_offset_s": exposure_center_offset_s, "tracker_t0": tracker_t0, "z_offset_m": z_offset_m,
+               "tracker_t0": tracker_t0, "z_offset_m": z_offset_m,
                "video": str(paths["video"])}
         print("[swing-marker] %d windows on %d worker processes" % (len(windows), workers), flush=True)
         results = []
@@ -803,7 +797,7 @@ def measure(session: str, paths: dict[str, Path], pc_minus_rk: float | None, car
     return {
         "session": session,
         "config": {"measurement": "V04 fixed black marker center over arm-only swing windows",
-                   "timing": f"exposure center = exposure_pc + {exposure_center_offset_s * 1000:.3f} ms; "
+                   "timing": "exposure center = tracker exposure_pc; "
                              f"t_rk_bridge = t_pc − pc_minus_rk (tracker rk_clock_bridge)",
                    "anchor": "FK(measured joints, extract_arm_bag) → world via median AprilTag car pose; "
                              f"z − hit_pos_z_offset_m ({z_offset_m:+.6f})",

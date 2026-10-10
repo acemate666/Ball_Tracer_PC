@@ -53,7 +53,7 @@ def _locator(q_of_t) -> RacketMarkerLocator:
     buffer = JointStateBuffer("v05")
     _feed(buffer, q_of_t)
     return RacketMarkerLocator(
-        car="v05", calib_path=str(CALIB), serials=SERIALS, exposure_us=1000.0, joint_states=buffer
+        car="v05", calib_path=str(CALIB), serials=SERIALS, joint_states=buffer
     )
 
 
@@ -91,8 +91,8 @@ def test_frame_between_car_locs_uses_interpolated_car_pose_and_its_own_joints():
 
     assert [row["frame_idx"] for row in rows] == [1, 2]
     middle = SimpleNamespace(x=-0.25, y=1.5, z=0.0, yaw=0.03)
-    # 曝光中点 = 起点 + 0.5 ms；_feed 的最小网络延时 2 ms 被当成钟差的一部分，关节角早取 2 ms
-    q_middle = [READY_Q[0] + 2.0 * (0.025 + 0.0005 - 0.002), *READY_Q[1:]]
+    # 帧时间就是曝光中点；_feed 的最小网络延时 2 ms 被当成钟差的一部分，关节角早取 2 ms
+    q_middle = [READY_Q[0] + 2.0 * (0.025 - 0.002), *READY_Q[1:]]
     marker = eab.fk(q_middle, car="v05")["marker"]
     z_off = eab.standard_kinematics("v05").car_hit_pos_z_offset("v05")
     c, s = np.cos(middle.yaw), np.sin(middle.yaw)
@@ -130,7 +130,7 @@ def test_post_run_solves_the_marker_from_online_candidates(tmp_path: Path):
             candidates[sn] = [[u, v, 100.0, 121, int(u) - 5, int(v) - 5, 11, 11]]
         frames.append({
             "frame_idx": 2 * len(frames),
-            "exposure_pc": tracker_t0 + elapsed - 0.5e-6 * exposure_us,
+            "exposure_pc": tracker_t0 + elapsed,  # tracker 帧时间 = 曝光中点
             "anchor_mm": fk_mm.tolist(),
             "candidates": candidates,
         })

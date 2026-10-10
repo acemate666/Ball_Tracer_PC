@@ -1296,6 +1296,19 @@ def _infer_model_input_size_from_model_path(model_path: Path) -> int | None:
     return size if size > 0 else None
 
 
+def _frame_exposure_center_pc(
+    frames: dict,
+    serials: list[str],
+    half_exposure_s: dict[str, float],
+) -> float:
+    """同步组帧时间：各相机「曝光开始 + 本机曝光 / 2」的均值 = 曝光中点（perf_counter 轴，秒）。"""
+    centers = [
+        frames[sn].exposure_start_pc + half_exposure_s[sn]
+        for sn in serials if sn in frames
+    ]
+    return sum(centers) / len(centers)
+
+
 def _select_detector_model_for_active_cams(
     model_path: Path,
     active_yolo_cams: int,
@@ -2367,6 +2380,17 @@ def main() -> int:
                 f"{_hs_info.get('slot_fps'):g} fps，每 {_hs_info.get('rate_multiplier')} 帧与其余相机同拍；"
                 "不参与球检测/车定位"
             )
+        # PC 帧时间 = 各相机「曝光开始 + 本机读回曝光 / 2」的均值 = 曝光中点（2026-10-10 用户定：球像对应曝光中点，
+        # 原先记曝光开始，PC 时间系统性早半个曝光；Jetson 的 t 本来就是曝光中心）。高速相机不算：它在同步组里的
+        # exposure_start_pc 就是其余相机曝光开始的均值（ball_grabber 拼组时写入），自己的曝光不对应这个时刻。
+        frame_time_serials = [sn for sn in cam_serials if sn != hs_serial]
+        frame_half_exposure_s: dict[str, float] = {}
+        for _sn in frame_time_serials:
+            _exp_us = (camera_settings.get(_sn) or {}).get("exposure_us")
+            if not isinstance(_exp_us, (int, float)) or not math.isfinite(_exp_us) or _exp_us <= 0.0:
+                print(f"*** 错误: 相机 {_sn} 读不回曝光时间，帧时间无法定到曝光中点 ***")
+                return 1
+            frame_half_exposure_s[_sn] = 0.5e-6 * float(_exp_us)
         ball_detection_disabled_serials = {
             sn for sn in cam_serials
             if sn == hs_serial or any(
@@ -2444,7 +2468,6 @@ def main() -> int:
                 car=marker_car,
                 calib_path=args.calib_config,
                 serials=cam_serials,
-                exposure_us=camera_settings[cam_serials[0]]["exposure_us"],
                 joint_states=racket_marker_joints,
             )
             if racket_marker_joints is not None
@@ -2775,11 +2798,10 @@ def main() -> int:
                     continue
                 _t_capture_sum += _t_capture_done - _t_loop0
 
-                exp_starts = [
-                    frames[sn].exposure_start_pc
-                    for sn in cam_serials if sn in frames
-                ]
-                exposure_pc = sum(exp_starts) / len(exp_starts)
+                # 本帧时间 = 曝光中点（见 frame_half_exposure_s）；下游观测 / 车位 / 黑标 / 对时 / 帧记录都用它
+                exposure_pc = _frame_exposure_center_pc(
+                    frames, frame_time_serials, frame_half_exposure_s
+                )
                 if first_frame_exposure_pc is None:
                     first_frame_exposure_pc = exposure_pc
                 frame_elapsed_s = exposure_pc - first_frame_exposure_pc
@@ -3057,6 +3079,9 @@ def main() -> int:
     result = {
         "config": {
             "first_frame_exposure_pc": first_frame_exposure_pc,
+            # 帧时间口径标记（只给人看，代码不分支）：exposure_center = 各相机（不含高速相机）曝光开始 + 读回曝光 / 2
+            # 的均值，只在 tracker 入口算一次，下游一律直接用。没有这个键的旧场次帧时间是曝光开始的均值（早半个曝光）。
+            "frame_time_reference": "exposure_center",
             "serials": cam_serials,
             "camera_config_path": str(Path(args.camera_config).resolve()),
             # 逐相机读回的实际曝光/模拟增益/数字增益。拖影 px ≈ v_img(px/s) × 曝光(s)，

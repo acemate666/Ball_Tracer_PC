@@ -141,25 +141,8 @@ def validate_clock_bridge(config: dict) -> tuple[dict | None, str]:
     }, ""
 
 
-def exposure_center_offset_s(config: dict) -> float:
-    """Half the group-mean exposure duration added to logged group-mean start."""
-    serials = config.get("serials")
-    settings = config.get("camera_settings")
-    if not isinstance(serials, list) or not serials or not isinstance(settings, dict):
-        raise ValueError("config serials/camera_settings are required")
-    exposures_us = []
-    for serial in serials:
-        camera = settings.get(serial)
-        if not isinstance(camera, dict) or "exposure_us" not in camera:
-            raise ValueError(f"missing exposure_us for camera {serial}")
-        exposure_us = float(camera["exposure_us"])
-        if not math.isfinite(exposure_us) or exposure_us <= 0.0:
-            raise ValueError(f"invalid exposure_us for camera {serial}")
-        exposures_us.append(exposure_us)
-    return 0.5e-6 * sum(exposures_us) / len(exposures_us)
-
-
-def exact_video_frames(base_data: dict, center_offset_s: float) -> list[ExactVideoFrame]:
+def exact_video_frames(base_data: dict) -> list[ExactVideoFrame]:
+    """Exact video frames with the tracker frame time (exposure_pc is the four-camera exposure center)."""
     config = base_data.get("config")
     frames = base_data.get("frames")
     if not isinstance(config, dict) or config.get("video_frame_mapping_exact") is not True:
@@ -174,15 +157,15 @@ def exact_video_frames(base_data: dict, center_offset_s: float) -> list[ExactVid
         if frame.get("video_mapping_exact") is not True:
             raise ValueError("frame has a non-exact video mapping")
         video_frame_idx = frame["video_frame_idx"]
-        exposure_start_pc = frame.get("exposure_pc")
+        exposure_center_pc = frame.get("exposure_pc")
         if (
             isinstance(video_frame_idx, bool)
             or not isinstance(video_frame_idx, int)
             or video_frame_idx < 0
-            or not isinstance(exposure_start_pc, (int, float))
+            or not isinstance(exposure_center_pc, (int, float))
         ):
             raise ValueError("invalid video_frame_idx/exposure_pc")
-        exposure_center_pc = float(exposure_start_pc) + center_offset_s
+        exposure_center_pc = float(exposure_center_pc)
         if not math.isfinite(exposure_center_pc) or video_frame_idx in seen:
             raise ValueError("duplicate or nonfinite exact video frame")
         seen.add(video_frame_idx)
@@ -489,13 +472,11 @@ def run(args: argparse.Namespace) -> dict:
         for index, estimate in indexed_estimates
     ]
     jobs: list[ContactJob] = []
-    exposure_offset = None
     frame_failure = ""
     exact_frames: list[ExactVideoFrame] = []
     if bridge is not None:
         try:
-            exposure_offset = exposure_center_offset_s(base_config)
-            exact_frames = exact_video_frames(base_data, exposure_offset)
+            exact_frames = exact_video_frames(base_data)
         except (TypeError, ValueError) as exc:
             frame_failure = str(exc)
 
@@ -602,7 +583,6 @@ def run(args: argparse.Namespace) -> dict:
                 "failure_reason": bridge_failure,
                 "value": bridge,
             },
-            "exposure_center_offset_s": exposure_offset,
             "player_box_world_m": player_box_world_m,
             "bundle_world_volume_m": [list(values) for values in world_volume_m],
             "bundle_player_world_margin_m": margin,
