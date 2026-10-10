@@ -65,6 +65,10 @@ def main() -> int:
         "--stop-file", type=Path, required=True,
         help="该文件出现时停止录制并退出",
     )
+    parser.add_argument(
+        "--no-racket-imu", action="store_true",
+        help="不连球拍 IMU（不管 tracker.json 的 racket_imu.enabled）：IMU 没开机时 bag 会跟着退出",
+    )
     args = parser.parse_args()
     config = json.loads((Path(__file__).parent / "config" / "tracker.json").read_text(encoding="utf-8"))
     imu = config["racket_imu"]
@@ -80,7 +84,7 @@ def main() -> int:
     recorder.start_spin()
     recorder.record()
     try:
-        if imu["enabled"]:
+        if imu["enabled"] and not args.no_racket_imu:
             asyncio.run(record_imu_until_stopped(args.stop_file, imu["address"]))
         else:
             while not args.stop_file.exists():

@@ -1,0 +1,37 @@
+{
+  "camera_config": "src/config/camera_18.json",
+  "calibration": "src/config/four_camera_calib_18.json",
+  "cyclonedds_xml": "ros2/cyclonedds_18.xml",
+  "serials": ["DB0260414", "DB0260405", "DB0260373", "DB0260378"],
+  "fps": 100.0,
+  "acquisition_frame_rate": 160.0,
+  "exposure_us": 800.0,
+  "auto_gain_target": 60.0,
+  "sdk_image_nodes": 32,
+  "roi": {
+    "marker_margin_m": 0.05,
+    "car_push_m": 0.04,
+    "car_push_deg": 3.0,
+    "pixel_margin": 20,
+    "tag_scale": 1.5,
+    "fps_headroom": 2.0
+  },
+  "sides": {
+    "fore": {"j1_range_deg": [-45.0, 45.0]},
+    "back": {"j1_range_deg": [-225.0, -135.0]}
+  },
+  "marker": {"crop_radius_px": 48},
+  "car_loc": {"tag_every_frames": 10, "tag_window_pad_px": 60, "pose_median_window": 20},
+  "ports": {"bridge_listen": 47310, "main": 47311, "camera_base": 47320},
+  "topics": {
+    "marker": "/swing_hs/racket_marker",
+    "car_loc": "/pc_car_loc",
+    "status": "/swing_hs/status"
+  },
+  "notes": [
+    "100 fps：18F 灯 100 Hz 纹波，每帧同相位（120 fps 有 20 Hz 拍频）；每台 100 fps 预算 ≈ 1.1 MP 且高 ≤ ~1130 行",
+    "曝光 0.8 ms：1010 用户定 tracker 与 100 fps 都用 0.8 ms，亮度交给开场自动增益（灰度中位数 60，同 tracker）",
+    "fore = 正手（J1 0° = 臂指向车右，−90° = 车尾 / ready）；back = 反手，默认取正手 ±45° 关于 −180° 的镜像",
+    "roi：黑标包络 3D 外扩 marker_margin_m、车位扰动 ±car_push_m / ±car_push_deg 并集、再外扩 pixel_margin；tag 按黑边 × tag_scale 框"
+  ]
+}

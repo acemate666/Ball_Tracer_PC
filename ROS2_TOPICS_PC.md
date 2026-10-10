@@ -30,10 +30,27 @@
   运行时组件：RK 全站自带 CLOCK_MONOTONIC 时间，报告端固定 `scale=1`，每场只拟合
   `PC t = RK t + bias`。
 
+## 100 fps 静态挥拍识别 `swing_hs`（`.\run_swing_hs.ps1`，2026-10-10）
+
+另一个入口，**不和 tracker 同时跑**（相机独占）：车不动、臂挥拍（挥拍时不起 bot_center），4 台相机只开
+「黑标包络 + 两块 tag」的 ROI、100 fps，在线出拍上黑标 + 车位，rosbag 照 tracker 录全部话题（`src/rosbag_recorder.py
+--no-racket-imu`，不连球拍 IMU）。话题由 ROS 桥
+（`swing_hs/ros_bridge.py`，经 `ros2/run_ros2.bat`）发，都进 bag；本机 DDS 配置在 `cyclonedds_18.xml` 上补了本机网卡
+地址 peer（原配置同机两个参与者互相发现不了，tracker 的 bag 里因此没有 `/pc_car_loc`）。
+
+| Topic | 载荷（JSON） | QoS | 说明 |
+| --- | --- | --- | --- |
+| `/swing_hs/racket_marker` | `{t, slot, x, y, z, n_cams, smooth, rms_px, anchor, rk_t}` | `RELIABLE`, depth=200 | 每个触发格一条（100 Hz）；`t` = 曝光中点（PC perf 秒），`x/y/z` 世界系 m（没解出为 null），`n_cams` 3 或 4，`smooth` = 与 30 ms 内上一个解的「黑标 − FK」偏差变化 ≤ 25 mm，`anchor` = 同曝光 FK 黑标（m），`rk_t` = 按 /joint_states 收发差换算的 RK 时刻估计（含最小网络延时） |
+| `/pc_car_loc` | 同 §1（tracker 主线契约，不带 `rk_timestamp`） | `BEST_EFFORT`, depth=1 | 双 tag 刚体拟合（同 `CarLocalizer.estimate_car_pose`），~10 Hz；只发双 tag 解（没有 `yaw: null` 帧）；`t` = 曝光中点（同 tracker） |
+| `/swing_hs/status` | 各相机统计、计数、车位 | `RELIABLE`, depth=200 | 1 Hz |
+
+相机进程定锚用的车位是最近 20 次 `/pc_car_loc` 的中位（车静止，滤单次噪声），记在 `marker.jsonl` 每行的 `car`。
+
 ## 拍柄 IMU 录制 `/racket/imu`
 
 `src/config/tracker.json` 的 `racket_imu.enabled=true` 时，随现有 rosbag
 录制进程启动，停止 tracker 时一起断开。`--no-log` 不启动 IMU。
+`src/rosbag_recorder.py --no-racket-imu` 不管配置、不连 IMU（`.\run_swing_hs.ps1` 一律这样起 rosbag）。
 `address` 指定蓝牙地址，当前为 `WT901BLE68` / `F4:69:A2:72:B4:23`。
 WitMotion 上位机需要先断开设备。ROS2 录制环境依赖 `bleak==3.0.1`。
 
