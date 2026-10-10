@@ -1976,7 +1976,8 @@ def main() -> int:
         default=str(config_dir / "camera_18.json"),
         help="相机采集配置",
     )
-    # 曝光/模拟增益/Digital Shift 按当场光照临时覆盖，不用改配置文件。
+    # 曝光按当场需要临时覆盖，不用改配置文件。亮度不靠它：开相机后 SyncCapture.auto_gain()
+    # 按画面亮度把增益定一次、整场锁定，曝光只管拖影和噪声（越短要的增益越大）。
     # 曝光直接决定运动拖影：blur_px = v_img(px/s) × T。整条弹道里回球段像面速度最高
     # （出拍后向上横切，~1400px/s，是来球段 200~900px/s 的 2~3 倍），所以最先在那里
     # 成片漏检。2026-08-09 场实测：T=9ms 时回球段拖影 11~13px，与球本身直径 13~18px
@@ -1985,15 +1986,7 @@ def main() -> int:
     parser.add_argument(
         "--exposure-us", type=float, default=None,
         help="覆盖相机曝光（μs）；不给则用 --camera-config 里的值。"
-             "光线足时调小可减运动拖影（回球段拖影 ∝ 曝光）",
-    )
-    parser.add_argument(
-        "--gain-db", type=float, default=None,
-        help="覆盖相机模拟增益（dB）；配合 --exposure-us 补回亮度（+6dB ≈ 亮度×2）",
-    )
-    parser.add_argument(
-        "--digital-shift", type=float, default=None,
-        help="覆盖相机 Digital Shift；给值后自动启用 DigitalShiftEnable",
+             "调小可减运动拖影（回球段拖影 ∝ 曝光），亮度由启动自动增益补",
     )
     parser.add_argument(
         "--calib-config",
@@ -2259,13 +2252,12 @@ def main() -> int:
     capture_overrides: dict[str, float] = {}
     if args.exposure_us is not None:
         capture_overrides["exposure_us"] = float(args.exposure_us)
-    if args.gain_db is not None:
-        capture_overrides["gain_db"] = float(args.gain_db)
-    if args.digital_shift is not None:
-        capture_overrides["digital_shift"] = float(args.digital_shift)
     with SyncCapture.from_config(args.camera_config, **capture_overrides) as cap:
         sync_sns = cap.sync_serials
         capture_fps = cap.fps
+        # 不同时段光线差得多：每次启动按画面亮度把增益定一次，整场不再动。
+        # 配置里的 gain_db/digital_shift 只是测光起点。
+        cap.auto_gain()
         # 相机实际生效的曝光/模拟增益/数字增益（读回，不是配置里写的值）。
         # 曝光是回球段能不能连续检出的决定因素：拖影 px ≈ 像面速度 × 曝光，
         # 回球段像面速度 ~1400px/s，球本身才 13~18px 宽。

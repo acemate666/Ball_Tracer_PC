@@ -10,21 +10,13 @@ param(
     [int]$RosDomainId = 2,
     [string]$CameraConfig = '',
     # 曝光临时覆盖（不改配置文件）。0 / 负数 = 用配置文件里的值。
-    # 18F 相机模拟 Gain 上限只有 12.78dB 且出厂就顶格，-GainDb 基本没用；
-    # -DigitalShift 可调数字增益，但不会改善传感器信噪比，并会增加高光截断风险。
-    # 曝光越长运动拖影越大，回球段最吃亏（像面速度 ~1400px/s，是来球段的 2~3 倍）：
-    # 9000μs 拖影 12.6px、和球直径（13~18px）同量级，2026-08-09 场击球后连丢 4 帧、
-    # 回球统计整场为空；那一档是光线过暗下的被动选择，**回球段数据本来就不可靠**，
-    # 看 summary.detection_shape_gate 确认是不是形状门在拦。
-    # 当前配置 2000μs（2026-09-07 用户定，拖影 ~2.8px）。⚠ 高于下面实测出的健康区间
-    # 800~1600μs，那次是强自然光下测的；光线更暗时这一档合理，但**过曝先杀 AprilTag**，
-    # 所以开场先看 summary 的「小车定位 hits/sampled」，成片为空就往下调。
-    # 上一档 1000μs（拖影 1.4px），2026-09-05 亮光下实测定的：3000μs 时球场
-    # 中位灰度已顶到 217~253、车载 AprilTag 全被打糊，car_localizer 5 帧 0 次定位成功；
-    # 800~1600μs 都能 5/5 定位。光线转暗再往上加：每 +1000μs 拖影 +1.4px。
+    # 亮度不归曝光管：开相机后 tracker 按画面亮度把增益定一次、整场锁定（模拟 Gain 先用满
+    # 12.78dB，不够再补 DigitalShift 数字增益），启动打印里每台一行「自动增益」。
+    # 曝光只管拖影和噪声：回球段像面速度 ~1400px/s，拖影 ≈ 1.4px/1000μs（球径 13~18px），
+    # 9000μs 时 2026-08-09 场击球后连丢 4 帧、回球统计整场为空；曝光越短要的增益越大、
+    # 噪声越大。某台打印「还差 +x dB」且总增益顶到 36.8dB = 太暗，加曝光；
+    # 「还差 −x dB」顶到下限 = 太亮，减曝光。
     [double]$ExposureUs = 0,
-    [double]$GainDb = -1,
-    [Nullable[double]]$DigitalShift = $null,
     [string]$CalibrationConfig = '',
     # 车型必选，没有默认值：各车的车载 AprilTag 布局不同，选错了车定位会静默
     # 偏几十 cm、yaw 还可能翻 180°（拟合照样收敛，只有 car_loc 重投影会从 ~2px 涨到
@@ -351,12 +343,6 @@ if ($FullResVideo) {
 }
 if ($ExposureUs -gt 0) {
     $args += @("--exposure-us", $ExposureUs.ToString())
-}
-if ($GainDb -ge 0) {
-    $args += @("--gain-db", $GainDb.ToString())
-}
-if ($null -ne $DigitalShift) {
-    $args += @("--digital-shift", $DigitalShift.ToString())
 }
 if ($EnableRkTimeAlign) {
     $args += "--online-time-align"

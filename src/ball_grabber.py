@@ -11,6 +11,7 @@
 
 相机参数：
   - config/camera_18.json —— 曝光、增益、帧率、触发、底部裁剪只在这里维护
+  - tracker 开相机后调 SyncCapture.auto_gain() 按画面亮度把增益定一次（配置里的增益只是起点）
 
 时间同步：
   - 每台相机的 ImageGrabber 启动时校准 PC↔设备时钟偏移 (GevTimestampControlLatch)
@@ -1533,6 +1534,17 @@ class HighSpeedRecorder(threading.Thread):
         return stats
 
 
+# ───────────────── 启动自动增益 ─────────────────
+
+# 目标：每台相机画面原始像素的灰度中位数（隔 4 行 4 列取样，BayerGR8 下取到的全是绿通道）。
+# 定标（2026-10-10 上午自然光）：400μs + 模拟 12.78dB + DigitalShift 16.5dB 时四台中位数
+# 67/50/58/58，那两场车定位 98~99% 帧、3D 观测 36~37% 帧；同光照 1500/2200μs 亮了 4~5 倍
+# （饱和 20~40%）的两场车定位全 0、3D 观测 7~12% —— 过曝先杀 AprilTag。
+AUTO_GAIN_TARGET_MEDIAN = 60.0
+_AUTO_GAIN_TOLERANCE_DB = 1.0   # |20·log10(目标/实测)| 在这以内算到位
+_AUTO_GAIN_MAX_ROUNDS = 8    # 起点整幅过曝时中位数卡在 255，每轮只能退 ~11dB
+
+
 class SyncCapture:
     """
     多相机硬触发同步采集上下文管理器。
@@ -2034,6 +2046,85 @@ class SyncCapture:
             if entry:
                 out[sn] = entry
         return out
+
+    def auto_gain(self) -> None:
+        """启动时测一次光：每台同步相机把画面灰度中位数拉到 AUTO_GAIN_TARGET_MEDIAN，之后整场不动。
+
+        曝光不动（它决定拖影），只动增益：模拟 Gain 先用满，不够再用 DigitalShift 补
+        （CS032 上它就是 ±24dB 的数字增益）；画面偏亮时反过来先退 DigitalShift。
+        相机自带 GainAuto 只调模拟增益（0~12.78dB），而模拟增益常年顶格，所以自己测。
+        增益到了上下限还不到位只告警：那是该改曝光了。
+        """
+        import numpy as np
+
+        period_s = 1.0 / self._fps
+        hs_serial = self.high_speed_serial
+        limits: dict[str, tuple[float, float, float]] = {}  # (模拟上限, 数字下限, 数字上限)
+        total_db: dict[str, float] = {}
+        for sn in self._sync_serials:
+            cam = self._cameras[sn]
+            _check(cam.MV_CC_SetEnumValueByString("GainAuto", "Off"), f"GainAuto=Off({sn})")
+            _check(cam.MV_CC_SetBoolValue("DigitalShiftEnable", True), f"DigitalShiftEnable({sn})")
+            gain, shift = MVCC_FLOATVALUE(), MVCC_FLOATVALUE()
+            _check(cam.MV_CC_GetFloatValue("Gain", gain), f"Gain({sn})")
+            _check(cam.MV_CC_GetFloatValue("DigitalShift", shift), f"DigitalShift({sn})")
+            # 上下限往里收到 0.01dB：两者都是整数寄存器换算出的浮点，写正好等于 fMax 的值
+            # 会换算进位越界被拒（实测 Gain=12.7804 → 0x80000102，12.78 照收）
+            limits[sn] = (math.floor(gain.fMax * 100) / 100,
+                          math.ceil(shift.fMin * 100) / 100,
+                          math.floor(shift.fMax * 100) / 100)
+            total_db[sn] = float(gain.fCurValue) + float(shift.fCurValue)
+
+        first: dict[str, float] = {}
+        for rounds in range(1, _AUTO_GAIN_MAX_ROUNDS + 1):
+            # 只认改完增益之后才开始曝光的帧：新值从下一帧起生效，留两帧余量。
+            # frame_num < 0 是高速相机同拍帧丢了的黑画布占位，不能拿来测光。
+            settled_after = time.perf_counter() + 2.0 * period_s
+            while True:
+                frames = self.get_frames(timeout_s=1.0)
+                if frames is None or time.perf_counter() > settled_after + 2.0:
+                    raise RuntimeError("自动增益：取不到改增益之后的同步帧")
+                if all(f.frame_num >= 0 and f.exposure_start_pc > settled_after for f in frames.values()):
+                    break
+            medians: dict[str, float] = {}
+            for sn, f in frames.items():
+                img = np.frombuffer(f.data, dtype=np.uint8, count=f.width * f.height).reshape(f.height, f.width)
+                if sn == hs_serial:  # 贴回全幅画布的高速帧：只量 ROI
+                    roi = self._hs_info["roi"]
+                    img = img[roi["offset_y"]:roi["offset_y"] + roi["height"],
+                              roi["offset_x"]:roi["offset_x"] + roi["width"]]
+                medians[sn] = float(np.median(img[::4, ::4]))
+            first = first or medians
+            if rounds == _AUTO_GAIN_MAX_ROUNDS:
+                break
+            changed = False
+            for sn, median in medians.items():
+                err_db = 20.0 * math.log10(AUTO_GAIN_TARGET_MEDIAN / max(median, 1.0))
+                if abs(err_db) <= _AUTO_GAIN_TOLERANCE_DB:
+                    continue
+                gain_max, shift_min, shift_max = limits[sn]
+                new_total = min(max(total_db[sn] + err_db, shift_min), gain_max + shift_max)
+                if abs(new_total - total_db[sn]) < 0.05:
+                    continue  # 已经顶在增益上/下限
+                analog = min(max(new_total, 0.0), gain_max)
+                cam = self._cameras[sn]
+                _check(cam.MV_CC_SetFloatValue("Gain", analog), f"Gain={analog:.2f}({sn})")
+                _check(cam.MV_CC_SetFloatValue("DigitalShift", new_total - analog),
+                       f"DigitalShift={new_total - analog:.2f}({sn})")
+                total_db[sn] = new_total
+                changed = True
+            if not changed:
+                break
+
+        for sn, median in medians.items():
+            err_db = 20.0 * math.log10(AUTO_GAIN_TARGET_MEDIAN / max(median, 1.0))
+            warn = ""
+            if abs(err_db) > _AUTO_GAIN_TOLERANCE_DB:
+                gain_max, shift_min, shift_max = limits[sn]
+                warn = (f"  ⚠ 还差 {err_db:+.1f}dB：总增益 {total_db[sn]:.1f}dB"
+                        f"（可调 {shift_min:.1f}~{gain_max + shift_max:.1f}dB），顶到头了就改曝光")
+            print(f"  自动增益 {sn}: 灰度中位数 {first[sn]:.0f} → {median:.0f}"
+                  f"（目标 {AUTO_GAIN_TARGET_MEDIAN:.0f}）{warn}")
 
     @property
     def fps(self) -> float:
