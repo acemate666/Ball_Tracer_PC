@@ -1,3 +1,6 @@
+﻿# 本文件必须存成 UTF-8 带 BOM：ASUS 上只有 Windows PowerShell 5.1、ANSI 码页 936，无 BOM 就按 GBK 读，
+# 行尾的中文会吞掉换行、把下一行代码并进注释，整个脚本解析失败（2026-10-10 实测；之前没炸是因为
+# 那边的旧检出碰巧是 CRLF，git 按 eol=lf 重写成 LF 就炸了）。
 param(
     [double]$Duration = 300,
     [switch]$NoVideo,
@@ -21,7 +24,6 @@ param(
     # 车型必选，没有默认值：各车的车载 AprilTag 布局不同，选错了车定位会静默
     # 偏几十 cm、yaw 还可能翻 180°（拟合照样收敛，只有 car_loc 重投影会从 ~2px 涨到
     # 40px+，要等出报告才看得见）。不传就在这里弹提示让你选，别猜。
-    # HelpMessage 保持 ASCII：本文件无 BOM，PS 5.1 按 ANSI 读，中文字面量会变乱码
     [Parameter(Mandatory = $true, HelpMessage = "Pick the car: v03, v04, or v05")]
     [ValidateSet('v03', 'v04', 'v05')]
     [string]$Car,
