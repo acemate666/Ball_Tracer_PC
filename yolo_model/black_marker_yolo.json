@@ -1,12 +1,12 @@
 {
-  "version": "final_v5_1012",
+  "version": "final_v6_1012",
   "use": "swing_hs 在线黑标候选（swing_hs/marker_yolo.py）：FK 锚附近原始 Bayer 小块解码后截 96×96，单类 black_marker",
   "io": "images: 1×3×96×96 RGB float 0–1；output0: 1×5×189（cx, cy, w, h, conf，输入像素）",
   "trained": "2026-10-12",
-  "source": "tennis-man scratch/marker_label_1011/yolo/runs/final_v5/weights/best.pt：ultralytics 8.4.21，从 final_v4_1011 接着训 30 轮（batch 16，best 第 23 轮），整幅 ROI 原分辨率（imgsz 1152）；yolo/export_onnx.py 导出 ONNX opset 17、imgsz 96、不简化",
-  "data": "人工复核页确认的 swing_hs 5 fps 原分辨率录像帧：黑标 2333 帧、无黑标 96 帧（不含整段套用复制的）；夜场 014335 / 014632，白天 115050 / 115405 / 115528，ASUS 复核页 134511（1311 帧）+ 155720（白天动态挥拍，1012 新标 126 帧）",
+  "source": "tennis-man scratch/marker_label_1011/yolo/runs/final_v6/weights/best.pt：ultralytics 8.4.21，从 final_v5_1012 接着训 30 轮（batch 16，best 第 26 轮），整幅 ROI 原分辨率（imgsz 1152）；yolo/export_onnx.py 导出 ONNX opset 17、imgsz 96、不简化",
+  "data": "人工复核页确认的 swing_hs 5 fps 原分辨率录像帧：黑标 2611 帧、无黑标 109 帧（不含整段套用复制的）；夜场 014335 / 014632 / 041047（1012 暗光动态挥拍，新标 291 帧），白天 115050 / 115405 / 115528 / 155720，ASUS 复核页 134511",
   "validation": [
-    "录制时的 100 fps 小块走在线同一条路回放（yolo/eval_models.py，ASUS，门 2e602ef），对 final_v4_1011：041047（1012 暗光动态挥拍，没训过）解出 95.2 → 96.9 %、4 台解 57.3 → 60.2 %、触球段正手 97.4 → 97.8 %、反手 82.8 → 84.0 %；155720 解出 99.3 = 99.3 %、4 台解 86.1 → 87.4 %；每块 1.4 ms 不变",
-    "白天挥拍段重投影不变（yolo/eval_reproj.py，4 场同一批格）：正手侧中位 1.06 → 1.09 px、反手侧 1.61 → 1.61 px、静止 1.17 → 1.21 px——收益在找得到，框心精度没变"
+    "录制时的 100 fps 小块走在线同一条路回放（yolo/eval_models.py，ASUS，门 2e602ef），对 final_v5_1012：040055（1012 暗光，没标过）解出 99.2 → 99.7 %、4 台解 79.3 → 92.3 %；041047 解出 96.9 → 94.7 %（静止格贴着 2.5 px 门）、挥动段正手 96.8 → 97.5 %、反手 85.9 → 87.1 %；155720 持平；每块 1.4 ms 不变",
+    "挥拍段重投影不变（yolo/eval_reproj.py）：夜里正手 1.85、反手 2.54 px，白天 1.15 / 1.84 px——夜里系统性大 0.7–0.9 px 不是模型的问题（tag 重投影夜里也高）"
   ]
 }
