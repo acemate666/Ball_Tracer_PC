@@ -202,16 +202,16 @@ def _clutter(cameras, anchor, rng, n):
 
 
 def test_fast_solver_pure_clutter_rate(cameras):
-    """真黑标不在候选里、锚点附近全是杂点（极端情形）。候选来自黑标 YOLO（每台每格 ≤ 3 个框），按每台 3 个杂点测。
-    1011 门放宽到 5 / 5 px 后每台 1 / 2 / 3 个杂点误收 0.2 / 1.8 / 5.5 %（旧 3 / 2.5 px：0 / 0 / 1.0 %，各 400 次）；
-    旧阈值候选器那种每台 8 个杂点会到 ~47 %（旧门 ~14 %）——放宽的门只配 YOLO 候选，别再接回阈值候选器。"""
+    """真黑标不在候选里、每台 8 个锚点附近的杂点（极端情形）：1010 扫参误收 ~14%，门放松了这里会涨。
+    1011 关联门 3 → 5 px、重投影门仍 2.5 px：8 个杂点 14.5 → 17.8 %、3 个杂点（YOLO 每格上限）1.0 → 1.5 %（各 400 次）；
+    重投影门也放到 5 px 时 8 个杂点 47 %——挡假解的是重投影门，别动它。"""
     rng = np.random.default_rng(13)
     solver = FastMarkerSolver(cameras)
     false = 0
     for _ in range(200):
         anchor = np.array([rng.uniform(500, 1200), rng.uniform(1500, 3500), rng.uniform(500, 1600)])
-        false += solver.solve(_clutter(cameras, anchor, rng, 3), anchor) is not None
-    assert false <= 20
+        false += solver.solve(_clutter(cameras, anchor, rng, 8), anchor) is not None
+    assert false <= 40
 
 
 def test_fusion_flags_clutter_fits_as_not_smooth(cameras):
