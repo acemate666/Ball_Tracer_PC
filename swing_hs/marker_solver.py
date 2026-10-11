@@ -8,8 +8,8 @@
   4. 内点相机多者优先、再比误差平方和、再比离锚距离；过锚点门；
   5. 全部内点重做 DLT，最大重投影 > MAX_REPROJ_PX 就丢最差那台重来（≥ min_cams 台为止）。
 锚点 = 同曝光 FK 黑标；本场「黑标 − FK」车体系偏差（收场同一个稳健中位数 _session_marker_offset）稳定后锚点
-加上它、门换成收场 v05 的视线深度 / 横向分开的门（AnchorGate 35 / 80 mm）。偏差没定之前用球形门：4 台 110 mm、
-3 台 80 mm（同收场 recovery 门）。
+加上它、门换成视线深度 / 横向分开的 AnchorGate（在线 70 / 120 mm，比收场的 35 / 80 mm 宽，见 ONLINE_REANCHOR_*）。
+偏差没定之前用球形门：4 台 110 mm、3 台 80 mm（同收场 recovery 门）。
 至少 3 台（同收场工具）：两台的解只受一条极线约束，截块里随便两个暗点就能凑出 < 2.5 px 的解（1010 假相机
 实测锚点偏 ~10 cm 时两台解几乎全是假点）。在线结果供监看、进 bag；全部候选在 marker.jsonl 里，可离线重解。
 """
@@ -27,16 +27,25 @@ import numpy as np
 from swing_hs import geometry
 
 #: 每台取离锚点最近的几个候选做假设、内点关联门。1010 合成扫参（4 台真实标定、每台 8 个杂点、0.4 px 噪声）：
-#: 4/4 px → 3/3 px 纯杂点误收 19% → 14%，有黑标时 3 台 / 4 台解出率不变（100%）
+#: 4/4 px → 3/3 px 纯杂点误收 19% → 14%，有黑标时 3 台 / 4 台解出率不变（100%）——那是阈值候选器满块杂点时的账。
+#: 1011 放宽到 5 / 5 px（用户「把门放开一点」）：候选换成黑标 YOLO 后每台 ≤ 3 个、几乎没有杂点；18F 标定本身有几 px
+#: 系统误差（YOLO 框留一投影中位 2.5–5.6 px），3 / 2.5 px 会把一致的 3–4 台拆散。swing_hs_20261011_155720 用录制时的
+#: YOLO 候选重放：像素门 5 / 5 + 锚点门 70 / 120 → 反手 J1 ∈ [−210°, −135°] 解出 56.7 → 95.3 %、正手 [−45°, 30°]
+#: 83.4 → 99.9 %；±50 ms 二次拟合偏 > 20 mm 的可疑解 0.6 % / 0 %，新增解和原有解在时间上连续（不是拍框上别的暗点）。
 TOP_K = 3
-ASSOC_PX = 3.0
+ASSOC_PX = 5.0
 #: 「和上一帧连续」：30 ms 内上一个解的（黑标 − FK 锚）偏差变化 ≤ 25 mm。真黑标的偏差（柔度 / 时间差）随时间平滑变，
 #: 杂点凑出来的解在锚点门里乱跳（合成扫参里离锚中位 63 mm）
 SMOOTH_MAX_GAP_S = 0.03
 SMOOTH_MAX_STEP_MM = 25.0
-MAX_REPROJ_PX = 2.5          # 同收场 MARKER_MAX_REPROJ_PX
+MAX_REPROJ_PX = 5.0          # 收场 MARKER_MAX_REPROJ_PX 仍是 2.5；在线放宽理由见 ASSOC_PX
 MAX_ANCHOR_MM = 110.0        # 同收场 MARKER_MAX_EXPECTED_DISTANCE_MM（4 台）
 MAX_ANCHOR_RECOVERY_MM = 80.0  # 同收场 MARKER_MAX_EXPECTED_RECOVERY_MM（少于 4 台）
+#: 偏差学到后的 AnchorGate（在线专用；收场仍用 racket_ht_black_marker.REANCHOR_MAX_LATERAL / DEPTH_MM = 35 / 80 mm）。
+#: 挥拍高速段 FK 锚落后于真黑标（在线关节角晚于曝光 + 柔度）：155720 里锚速 > 2 m/s 的解沿运动方向超前 5–16 ms、
+#: 垂直偏 20–60 mm，横向 35 mm 正好挡掉挥得最快的那段（辨识时延 / 柔度最要的数据）。
+ONLINE_REANCHOR_MAX_LATERAL_MM = 70.0
+ONLINE_REANCHOR_MAX_DEPTH_MM = 120.0
 MIN_CAMS = 3
 #: 只用 ≥ 3 台相机的解估本场偏差
 OFFSET_MIN_CAMS = 3
@@ -265,8 +274,8 @@ class MarkerFusion:
             seeing = [s for s in self.serials if candidates.get(s)] or self.serials
             gate = rbm.AnchorGate(
                 view_dir=rbm._mean_view_dir(self.cameras, seeing, use),
-                max_lateral_mm=rbm.REANCHOR_MAX_LATERAL_MM,
-                max_depth_mm=rbm.REANCHOR_MAX_DEPTH_MM,
+                max_lateral_mm=ONLINE_REANCHOR_MAX_LATERAL_MM,
+                max_depth_mm=ONLINE_REANCHOR_MAX_DEPTH_MM,
             )
         solution = self.solver.solve(candidates, use, gate=gate, corrected=corrected)
         if solution is not None:
