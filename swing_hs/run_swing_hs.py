@@ -77,6 +77,7 @@ from swing_hs import geometry, udp_msgs  # noqa: E402
 from swing_hs.camera_proc import DETECT_QUEUE_JOBS, DETECT_WORKERS, camera_main, detect_main  # noqa: E402
 from swing_hs.joints import JointBuffer  # noqa: E402
 from swing_hs.marker_solver import MarkerFusion  # noqa: E402
+from swing_hs.marker_yolo import model_info as marker_model_info  # noqa: E402
 from swing_hs.trigger_proc import trigger_main  # noqa: E402
 from swing_hs.winutil import write_json  # noqa: E402
 
@@ -533,6 +534,7 @@ def main() -> int:
         "calibration": str(calib_path), "vehicle_config": str(vehicle_path), "envelope": str(envelope_path),
         "marker_z_offset_m": z_offset, "frame_time_reference": "exposure_center", "video_fps": video_fps,
         "video_every_slots": video_every, "detect_workers": detect_workers, "events": [],
+        "marker_model": marker_model_info(),
     }
     errors: list[str] = []
     snapshots: dict[str, dict] = {}

@@ -14,9 +14,10 @@
      （关节角插值、格号、发给主进程的时间、小块记录）一律直接用、不再补半曝光（同 tracker，用户 1010 定）。
      准备线程每帧：帧时间的关节角（ROS 桥 UDP 转来）+ 车位姿（主进程共享）→ FK 黑标锚 → 投到本相机 → 在原始
      Bayer ROI 帧上截 ±(48+4) px 小块；tag 窗按触发格每 tag_every 帧一块累加平均（车静止，平均压夜里的噪声）。
-     小块 / tag 平均图发给本相机的识别进程：解码 → 黑方块候选（与 tracker 在线黑标、收场工具同一个
-     racket_ht_black_marker._marker_candidates）/ 认 tag，结果小消息发主进程三角化 / 解车位。
-     一台相机配 DETECT_WORKERS 个识别进程，共用一个任务队列（挥拍时夜里每块 8–10 ms，一个进程贴着 100 fps 的 10 ms 预算）；
+     小块 / tag 平均图发给本相机的识别进程：解码 → 黑标 YOLO 候选（marker_yolo.py；1011 起替换阈值暗块候选器
+     racket_ht_black_marker._marker_candidates，夜里那个满块噪点、在线解多数是错的）/ 认 tag，结果小消息发主进程三角化 / 解车位。
+     一台相机配 DETECT_WORKERS 个识别进程，共用一个任务队列（阈值候选器挥拍时夜里每块 8–10 ms，一个进程贴着 100 fps 的 10 ms 预算；
+     YOLO 每块 CPU 单线程几 ms）；
      任务带本相机的序号，结果到主进程的先后会乱几个，主进程按序号放行；
   4. 存盘：每帧小块原样存（patches_<serial>.bin，离线换算法重认，可关）；录像 = 整幅 ROI 原分辨率原始 Bayer，
      每 video_every 个触发格存一帧（默认 100/20 = 5 fps，用户 1011：「保存视频就按 5 FPS 保留原版的，不要降低分辨率」；
@@ -132,30 +133,22 @@ def crop_marker_patch(
 
 
 def marker_candidates_in_patch(
+    detector,
     patch: np.ndarray,
     patch_origin: tuple[int, int],
     anchor_uv: tuple[float, float],
     code: int,
-    *,
-    radius: int,
 ) -> list[tuple]:
-    """小块解码 → 黑方块候选：racket_ht_black_marker._marker_candidates（tracker 在线黑标同参数：local_radius=48、
-    不做大范围搜索）。返回候选行 [(u, v, score, area, bx, by, bw, bh)]，全幅像素。"""
+    """小块解码 → 黑标 YOLO 候选（detector = marker_yolo.MarkerYolo）。返回候选行 [(u, v, score, area, bx, by, bw, bh)]，
+    全幅像素，score = 置信。"""
     import cv2
 
-    rbm = geometry.load_test_src("racket_ht_black_marker")
-    gx, gy = patch_origin
     bgr = cv2.cvtColor(np.ascontiguousarray(patch), code)
-    found = rbm._marker_candidates(bgr, (float(anchor_uv[0]) - gx, float(anchor_uv[1]) - gy),
-                                   local_radius=radius, broad_radius=None)
-    return [
-        (round(c.uv[0] + gx, 2), round(c.uv[1] + gy, 2), round(float(c.score), 1), int(c.area),
-         int(c.bbox_xywh[0] + gx), int(c.bbox_xywh[1] + gy), int(c.bbox_xywh[2]), int(c.bbox_xywh[3]))
-        for c in found
-    ]
+    return detector.candidates(bgr, patch_origin, anchor_uv)
 
 
 def detect_marker_in_roi(
+    detector,
     raw: np.ndarray,
     roi_origin: tuple[int, int],
     anchor_uv: np.ndarray,
@@ -168,8 +161,7 @@ def detect_marker_in_roi(
     if patch is None:
         return [], None
     gx, gy, block = patch
-    return marker_candidates_in_patch(block, (gx, gy), (float(anchor_uv[0]), float(anchor_uv[1])), code,
-                                      radius=radius), patch
+    return marker_candidates_in_patch(detector, block, (gx, gy), (float(anchor_uv[0]), float(anchor_uv[1])), code), patch
 
 
 def tag_windows(
@@ -935,18 +927,19 @@ def camera_main(spec: dict, out_q, ctrl_q, detect_q, shared_car, t0, stop_evt, s
 
 
 def detect_main(spec: dict, worker: int, detect_q, out_q) -> None:
-    """一台相机的一个黑标识别进程（本相机几个识别进程共用 detect_q）：取流进程交来的小块 → 黑方块候选（"f" 消息）、
+    """一台相机的一个黑标识别进程（本相机几个识别进程共用 detect_q）：取流进程交来的小块 → 黑标 YOLO 候选（"f" 消息）、
     tag 平均图 → 认 tag（"t" 消息），带任务序号发主进程。收到 None（取流进程收尾时每个识别进程放一个；主进程兜底也会放）就退。"""
     import cv2
+
+    from swing_hs.marker_yolo import MarkerYolo
 
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     serial = str(spec["serial"])
     try:
-        cv2.setNumThreads(1)       # 97 px 小块上 OpenCV 内部多线程只有调度开销，8 个识别进程还会互相抢核
-        geometry.load_test_src("racket_ht_black_marker")
+        cv2.setNumThreads(1)       # 小块上 OpenCV 内部多线程只有调度开销，8 个识别进程还会互相抢核
+        detector = MarkerYolo(threads=1)      # 同理 ONNX Runtime 也单线程；8 个进程各一个会话、不碰 GPU
         tag_detector = make_tag_detector(full_frame=False)
         tag_ids = set(geometry.tag_corners_car(geometry.load_vehicle_reference(Path(spec["vehicle_path"])), 1.0))
-        radius = int(spec["crop_radius_px"])
         stats: dict[str, Any] = {"worker": int(worker), "processed": 0, "with_candidates": 0, "proc_ms_sum": 0.0,
                                  "proc_ms_max": 0.0, "tag_runs": 0, "tag_hits": 0, "backlog": 0, "backlog_max": 0}
         last_report = time.perf_counter()
@@ -976,7 +969,7 @@ def detect_main(spec: dict, worker: int, detect_q, out_q) -> None:
                 rows: list[tuple] = []
                 if patch_job is not None:
                     gx, gy, au, av, block, pixel_type = patch_job
-                    rows = marker_candidates_in_patch(block, (gx, gy), (au, av), bayer_code(pixel_type), radius=radius)
+                    rows = marker_candidates_in_patch(detector, block, (gx, gy), (au, av), bayer_code(pixel_type))
                     if rows:
                         stats["with_candidates"] += 1
                 out_q.put(("f", serial, (seq, (slot, fnum, frame_t, status, anchor_mm, q, rows))))

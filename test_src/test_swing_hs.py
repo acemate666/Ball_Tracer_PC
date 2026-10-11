@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""swing_hs（100 fps 静态挥拍识别）的纯逻辑单测：ROI 规划、截块认黑方块、快速三角化、车位、关节缓存、格号拼组。"""
+"""swing_hs（100 fps 静态挥拍识别）的纯逻辑单测：ROI 规划、截块认黑标（YOLO）、快速三角化、车位、关节缓存、格号拼组。"""
 
 from __future__ import annotations
 
@@ -91,35 +91,61 @@ def test_plan_near_cameras_flags_414_coverage(cameras, vehicle, fore_marker):
         assert plans[sn].marker_in_sensor == pytest.approx(1.0)
 
 
-# ── 截块认黑方块 ──
+# ── 截块认黑标（YOLO） ──
 
-def _synthetic_roi(roi, square_center_full, side=11, background=140, dark=20):
-    ox, oy, w, h = roi
-    img = np.full((h, w), background, dtype=np.uint8)
-    cu, cv = square_center_full[0] - ox, square_center_full[1] - oy
-    x0, y0 = int(round(cu - side / 2)), int(round(cv - side / 2))
-    img[y0:y0 + side, x0:x0 + side] = dark
-    true_center = (ox + x0 + (side - 1) / 2.0, oy + y0 + (side - 1) / 2.0)
-    return img, true_center
+#: 真实录像里人工核对过的黑标（1011 复核页）：014335 夜场 2 张、115405 白天 2 张，原始 Bayer 160×160 块（ROI 内偶数对齐截的，
+#: Bayer 相位不变）+ 人标框（块内像素、像素边缘坐标）
+MARKER_SAMPLES = Path(__file__).resolve().parent / "fixtures" / "swing_hs_marker_samples.npz"
 
 
-def test_detect_marker_in_roi_returns_full_frame_pixels():
+@pytest.fixture(scope="module")
+def marker_detector():
+    from swing_hs.marker_yolo import MarkerYolo
+
+    return MarkerYolo()
+
+
+def _roi_with_sample(roi, raw, at=(200, 120)):
+    """假 ROI（填样本的灰度中位数）里在偶数位置 at 贴一块真实原始 Bayer。"""
+    img = np.full((roi[3], roi[2]), int(np.median(raw)), dtype=np.uint8)
+    img[at[1]:at[1] + raw.shape[0], at[0]:at[0] + raw.shape[1]] = raw
+    return img
+
+
+def test_detect_marker_in_roi_finds_real_markers(marker_detector):
+    """锚点故意偏 (+15, −10) px（在线 FK 锚的典型误差）：候选 top-1 落在人标框心 1.5 px 内，全幅坐标对得上。"""
+    samples = np.load(MARKER_SAMPLES)
+    roi, at = [512, 300, 640, 480], (200, 120)
+    for raw, box, pixel_type in zip(samples["raw"], samples["box"], samples["pixel_type"]):
+        img = _roi_with_sample(roi, raw, at)
+        cx = roi[0] + at[0] + 0.5 * (box[0] + box[2])
+        cy = roi[1] + at[1] + 0.5 * (box[1] + box[3])
+        rows, patch = detect_marker_in_roi(marker_detector, img, (roi[0], roi[1]), np.array([cx + 15.0, cy - 10.0]),
+                                           bayer_code(int(pixel_type)), radius=48)
+        assert patch is not None
+        gx, gy, raw_patch = patch
+        assert gx % 2 == 0 and gy % 2 == 0
+        assert raw_patch.shape[0] <= 2 * (48 + PATCH_BORDER_PX) + 2
+        assert 1 <= len(rows) <= 3
+        u, v, score, area, bx, by, bw, bh = rows[0]
+        assert 0.25 <= score <= 1.0
+        assert math.hypot(u - cx, v - cy) < 1.5
+        assert abs(bx + 0.5 * bw - u) <= 1.0 and abs(by + 0.5 * bh - v) <= 1.0 and area > 0
+
+
+def test_detect_marker_nothing_on_blank(marker_detector):
     roi = [512, 300, 640, 480]
-    img, true_center = _synthetic_roi(roi, (900.0, 520.0))
-    anchor = np.array([915.0, 505.0])
-    rows, patch = detect_marker_in_roi(img, (roi[0], roi[1]), anchor, bayer_code(0x01080008), radius=48)
-    assert patch is not None
-    gx, gy, raw_patch = patch
-    assert gx % 2 == 0 and gy % 2 == 0
-    assert raw_patch.shape[0] <= 2 * (48 + PATCH_BORDER_PX) + 2
-    best = min(rows, key=lambda r: math.hypot(r[0] - true_center[0], r[1] - true_center[1]))
-    assert math.hypot(best[0] - true_center[0], best[1] - true_center[1]) < 0.6
+    img = np.full((roi[3], roi[2]), 90, dtype=np.uint8)
+    rows, patch = detect_marker_in_roi(marker_detector, img, (roi[0], roi[1]), np.array([900.0, 520.0]),
+                                       bayer_code(0x01080008), radius=48)
+    assert patch is not None and rows == []
 
 
-def test_detect_marker_out_of_roi():
+def test_detect_marker_out_of_roi(marker_detector):
     roi = [512, 300, 640, 480]
-    img, _ = _synthetic_roi(roi, (900.0, 520.0))
-    rows, patch = detect_marker_in_roi(img, (roi[0], roi[1]), np.array([100.0, 100.0]), bayer_code(0x01080008), radius=48)
+    img = np.full((roi[3], roi[2]), 90, dtype=np.uint8)
+    rows, patch = detect_marker_in_roi(marker_detector, img, (roi[0], roi[1]), np.array([100.0, 100.0]),
+                                       bayer_code(0x01080008), radius=48)
     assert rows == [] and patch is None
 
 
