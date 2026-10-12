@@ -8,6 +8,7 @@
 用法（除下面几个本脚本自己的参数外，其余原样转给 ASUS 上的 run_tracker_with_predict.ps1；
 -Car 必填、没有默认值，理由同 run_tracker.ps1）：
     .\run_tracker_asus.ps1 -Car v05 -Duration 500                     曝光默认 0.8 ms（run_tracker.ps1），亮度由开场自动增益定
+    .\run_tracker_asus.ps1 -Car v05 -Duration 500 -NoVideo            不录 mp4（开关只有一个横杠，写成 --No-Video 会被拦下报错）
     .\run_tracker_asus.ps1 -PullOnly                                    只拉 ASUS 上最新一场
     .\run_tracker_asus.ps1 -PullOnly -Session tracker_20261001_234800   拉指定场（拉取中断后续传也用它）
     -AsusHost asus@10.50.65.130   不在 ASUS 局域网时走 ZeroTier（见 tennis-man memory/asus-ssh-access.md）
@@ -25,7 +26,8 @@
   - ASUS 上有 tracker 在跑时不拉（先等它退）：ASUS 走 Wi-Fi，几 GB 的拷贝会挤 /pc_car_loc。
     拉 mp4 时想马上开下一场：Ctrl+C 掉拉取，之后 -PullOnly -Session <场次> 续传。
   - ssh 中途断线会把远端 tracker 一起带走（和手动 ssh 一样），那一场数据不全。
-  - 一场 500 s 约 7 GB（mp4 占大头）；1001 实测 ASUS→笔记本约 17 MB/s，拉完约 7 分钟。
+  - 一场 500 s 约 10 GB：mp4 占 9.5 GB（40 fps 拼图固定 ~19 MB/s，与曝光无关，1010–1012 各场实测），
+    -NoVideo 时整场只剩 ~0.5 GB；1001 实测 ASUS→笔记本约 17 MB/s，带 mp4 拉完约 10 分钟。
   - 依赖 ~/.ssh/config 的 Host asus 免密登录；ASUS 换了 IP 改那里。
 #>
 param(
@@ -38,6 +40,17 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $trackerArgs = @($args)
+# PowerShell 开关只有一个横杠（-NoVideo）。--No-Video 这类写法不是开关，是普通字符串，
+# 按位置依次塞进本脚本自己的 -Session / -AsusHost / -RemoteRepo / -LocalRoot；跑场分支不看 -Session，
+# 于是被静默吞掉、tracker 照常录像，几 GB 的 mp4 照拉（2026-10-12 实测）。这里一律拦下
+foreach ($v in @($Session) + @($AsusHost, $RemoteRepo, $LocalRoot)) {
+    if ($v -like '-*') {
+        throw "'$v' is not a PowerShell switch, so it landed on one of this script's own parameters instead of reaching the tracker. Switches take a single dash and no inner hyphen, e.g. -NoVideo."
+    }
+}
+if (-not $PullOnly -and $Session.Count -gt 0) {
+    throw "-Session only goes with -PullOnly; got '$($Session -join ', ')'."
+}
 if ([string]::IsNullOrWhiteSpace($LocalRoot)) {
     $LocalRoot = Join-Path $PSScriptRoot 'tracker_output'
 }
