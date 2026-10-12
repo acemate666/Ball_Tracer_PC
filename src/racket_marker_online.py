@@ -2,12 +2,13 @@
 """拍上黑标在线识别（全分辨率）。
 
 车定位线每算出一帧车位姿，就把这一帧和前面没做车定位的帧（车位姿按时间插值）一起处理：取各帧曝光
-时刻的关节角做 FK，得黑标的大致世界位置，投到四台相机，只在全分辨率图上截一小块找黑方块候选，
+时刻的关节角做 FK，得黑标的大致世界位置，投到四台相机，只在全分辨率图上截一小块找黑标候选，
 每帧都有（40 fps），收尾写进 <run>_racket_marker.json。三角化、选点和本场
 「黑标 − FK」偏差校正留给收场的 test_src/racket_ht_black_marker.py（用报告对时后的精确 FK 锚）。
 
-候选检测与收场工具是同一个函数（racket_ht_black_marker._marker_candidates），FK 是同一份标准运动学
-（extract_arm_bag.fk → tennis-man/arm_controller 的 compact_arm_kinematics + 车型 yaml）。
+候选 = 黑标 YOLO（swing_hs/marker_yolo.py：FK 锚为中心截 96×96，同 swing_hs 100 fps 在线识别、同一个模型
+yolo_model/black_marker_yolo.onnx；1012 用户：「40fps 也换成 yolo 识别」，原来的阈值暗块候选夜里被噪点带偏），
+FK 是同一份标准运动学（extract_arm_bag.fk → tennis-man/arm_controller 的 compact_arm_kinematics + 车型 yaml）。
 """
 
 from __future__ import annotations
@@ -22,13 +23,14 @@ from pathlib import Path
 
 import numpy as np
 
+from swing_hs.marker_yolo import MarkerYolo, model_info
+
 _TEST_SRC = Path(__file__).resolve().parent.parent / "test_src"
 
-# 截块半径（全分辨率 px；候选离锚点 ≤ 半径 − 10）。1010 用 113329 回放定：在线锚离真黑标每台
-# p50 7.6 / p95 16.4 / p99 28.7 / 最大 47 px（主要是本场「黑标 − FK」常偏 ~20 mm）；收场解出帧数随半径
-# 96/64/55/48 px = 334/364/390/402（原离线 40 fps 录像大范围搜索在同一批帧上 390）——块越大，自适应阈值
-# 被背景稀释、杂点越多，反而认不出。
-CROP_RADIUS_PX = 48
+# 截块 = YOLO 输入（96×96，FK 锚为中心 ±48 px）。1010 用 113329 回放量过：在线锚离真黑标每台
+# p50 7.6 / p95 16.4 / p99 28.7 / 最大 47 px（主要是本场「黑标 − FK」常偏 ~20 mm），装得下。
+# 先截锚点 ±(48 + 余量) 的块（出画的部分截掉），YOLO 自己再以锚点为中心截 96×96、画外补灰（同 swing_hs）。
+CROP_MARGIN_PX = 4
 # /joint_states 200 Hz，留 2 s
 JOINT_BUFFER_S = 2.0
 # 前后两条关节角相隔超过这么久就不插值（掉包 / 臂没在发）
@@ -150,6 +152,10 @@ class RacketMarkerLocator:
         self._z_offset_m = float(eab.standard_kinematics(car).car_hit_pos_z_offset(car))
         self._cameras = self._ht._load_cameras(Path(calib_path), serials)
         self._joints = joint_states
+        # 只在车定位线里用（单线程），一个 ONNX Runtime 会话；模型不在开相机前就报错
+        self._yolo = MarkerYolo()
+        info = model_info()
+        self.model = {k: info.get(k) for k in ("version", "model", "sha256")}
         self._last_xyz: tuple[float, float, float, float] | None = None  # (t, x, y, z)
         self._last_yaw: tuple[float, float] | None = None  # (t, yaw)
         self.stats = {"frames": 0, "no_car_pose": 0, "no_joint_state": 0, "with_candidates": 0}
@@ -199,16 +205,8 @@ class RacketMarkerLocator:
                 image = images.get(serial)
                 if image is None:
                     continue
-                found = self._ht._marker_candidates(
-                    image,
-                    tuple(self._ht._project_raw(camera, anchor_mm)),
-                    local_radius=CROP_RADIUS_PX,
-                    broad_radius=None,
-                )
-                candidates[serial] = [
-                    [round(c.uv[0], 2), round(c.uv[1], 2), round(c.score, 1), c.area, *c.bbox_xywh]
-                    for c in found
-                ]
+                u, v = (float(c) for c in self._ht._project_raw(camera, anchor_mm))
+                candidates[serial] = [list(row) for row in self._candidates(image, u, v)]
             if any(candidates.values()):
                 self.stats["with_candidates"] += 1
             rows.append({
@@ -218,3 +216,19 @@ class RacketMarkerLocator:
                 "candidates": candidates,
             })
         return rows
+
+    def _candidates(self, image: np.ndarray, u: float, v: float) -> list[tuple]:
+        """全分辨率 BGR 图 + 锚点 → YOLO 候选行 (u, v, 置信, 面积, x, y, w, h)，全分辨率 px。
+        锚点出画超过半个截块就不认（同 swing_hs.camera_proc.crop_marker_patch）。"""
+        radius = self._yolo.size // 2
+        height, width = image.shape[:2]
+        if not (math.isfinite(u) and math.isfinite(v)):
+            return []
+        if u < -radius or u >= width + radius or v < -radius or v >= height + radius:
+            return []
+        half = radius + CROP_MARGIN_PX
+        x0, y0 = max(0, int(math.floor(u - half))), max(0, int(math.floor(v - half)))
+        x1, y1 = min(width, x0 + 2 * half), min(height, y0 + 2 * half)
+        if x1 - x0 < 8 or y1 - y0 < 8:
+            return []
+        return self._yolo.candidates(image[y0:y1, x0:x1], (x0, y0), (u, v))

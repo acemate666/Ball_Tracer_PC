@@ -3244,11 +3244,13 @@ def main() -> int:
                 if car_localizer is not None else 0
             ),
             # 黑标在线候选：车定位帧数 / 有候选的帧 / 缺车位姿 / 缺关节角；
-            # joint_name_mismatch = 收到的 /joint_states 关节名不是本车型那一组（车型选错，整场不出）
+            # joint_name_mismatch = 收到的 /joint_states 关节名不是本车型那一组（车型选错，整场不出）；
+            # model = 认候选的黑标 YOLO（版本 + sha256，同 swing_hs meta 的 marker_model）
             "racket_marker": (
                 {
                     **racket_marker.stats,
                     "joint_name_mismatch": racket_marker_joints.name_mismatch,
+                    "model": racket_marker.model,
                 }
                 if racket_marker is not None
                 else None
@@ -3283,7 +3285,10 @@ def main() -> int:
         if racket_marker is not None:
             with open(_racket_marker_json_path(json_path), "w", encoding="utf-8") as f:
                 json.dump(
-                    {"frames": sorted(log_racket_markers, key=lambda row: row["frame_idx"])},
+                    {
+                        "model": racket_marker.model,
+                        "frames": sorted(log_racket_markers, key=lambda row: row["frame_idx"]),
+                    },
                     f,
                     separators=(",", ":"),
                 )

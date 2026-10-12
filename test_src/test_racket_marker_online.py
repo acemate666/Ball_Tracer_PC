@@ -1,9 +1,10 @@
-"""黑标在线候选的核心 contract：按曝光时刻取到对应的关节角；FK 锚投影处的黑方块被截出来；
+"""黑标在线候选的核心 contract：按曝光时刻取到对应的关节角；FK 锚附近的真实黑标被 YOLO 认出来；
 收场在这些候选里解出三维。"""
 
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,6 +23,8 @@ READY_Q = [-1.56487, -0.15568, 2.48771, 2.42524, 0.0, 0.05177]
 # 车在这里时 ready 位黑标四台相机都看得到
 CAR_POSE = SimpleNamespace(x=-0.3, y=1.5, z=0.0, yaw=0.02)
 PC_MINUS_RK = 50.0
+#: 真实录像里人工核对过的黑标（swing_hs 单测同一份：014335 夜场 2 张、115405 白天 2 张，原始 Bayer 160×160 块 + 人标框）
+MARKER_SAMPLES = ROOT / "test_src" / "fixtures" / "swing_hs_marker_samples.npz"
 
 
 def _feed(buffer: JointStateBuffer, q_of_t, *, latency_s=lambda k: 0.002) -> None:
@@ -57,26 +60,39 @@ def _locator(q_of_t) -> RacketMarkerLocator:
     )
 
 
-def test_locator_crops_the_marker_square_at_the_fk_anchor():
+def test_locator_finds_real_markers_near_the_fk_anchor():
+    """四台各贴一块真实黑标（解码成 BGR，人标框心落在真黑标的投影上）：真黑标离 FK 锚 2–3 cm（本场常偏的量级），
+    YOLO top-1 落在人标框心 1.5 px 内；空白图没有候选。"""
+    import cv2
+    from swing_hs.camera_proc import bayer_code
+
     locator = _locator(lambda t: READY_Q)
     exposure_pc = 101.0 + PC_MINUS_RK
     blank = {sn: np.full((1536, 2048, 3), 120, np.uint8) for sn in SERIALS}
-    anchor_mm = np.asarray(locator.process(CAR_POSE, [(0, exposure_pc, blank)])[0]["anchor_mm"])
+    first = locator.process(CAR_POSE, [(0, exposure_pc, blank)])[0]
+    assert all(rows == [] for rows in first["candidates"].values())
+    anchor_mm = np.asarray(first["anchor_mm"])
 
-    # 真黑标离 FK 锚 2–3 cm（本场常偏的量级），画成全分辨率下 11 px 的黑方块
     cameras = ht._load_cameras(CALIB, SERIALS)
     true_mm = anchor_mm + np.array([8.0, -5.0, -25.0])
+    samples = np.load(MARKER_SAMPLES)
     images, expected = {}, {}
-    for sn in SERIALS:
-        u, v = (int(round(float(c))) for c in ht._project_raw(cameras[sn], true_mm))
-        assert 6 <= u < 2042 and 6 <= v < 1530, f"{sn} 看不到黑标"
-        image = np.full((1536, 2048, 3), 120, np.uint8)
-        image[v - 5 : v + 6, u - 5 : u + 6] = 15
-        images[sn], expected[sn] = image, (u, v)
+    for sn, raw, box, pixel_type in zip(SERIALS, samples["raw"], samples["box"], samples["pixel_type"]):
+        u, v = (float(c) for c in ht._project_raw(cameras[sn], true_mm))
+        block = cv2.cvtColor(raw, bayer_code(int(pixel_type)))
+        cx, cy = 0.5 * (box[0] + box[2]), 0.5 * (box[1] + box[3])
+        x0, y0 = int(round(u - cx)), int(round(v - cy))
+        assert 0 <= x0 <= 2048 - block.shape[1] and 0 <= y0 <= 1536 - block.shape[0], f"{sn} 看不到黑标"
+        image = np.full((1536, 2048, 3), np.median(block, axis=(0, 1)).astype(np.uint8), np.uint8)
+        image[y0:y0 + block.shape[0], x0:x0 + block.shape[1]] = block
+        images[sn], expected[sn] = image, (x0 + cx, y0 + cy)
 
     result = locator.process(CAR_POSE, [(2, exposure_pc, images)])[0]
     for sn in SERIALS:
-        assert result["candidates"][sn][0][:2] == pytest.approx(expected[sn], abs=1e-6)
+        u, v, score, area, bx, by, bw, bh = result["candidates"][sn][0]
+        assert 0.25 <= score <= 1.0 and area > 0
+        assert math.hypot(u - expected[sn][0], v - expected[sn][1]) < 1.5
+        assert abs(bx + 0.5 * bw - u) <= 1.0 and abs(by + 0.5 * bh - v) <= 1.0
 
 
 def test_frame_between_car_locs_uses_interpolated_car_pose_and_its_own_joints():
