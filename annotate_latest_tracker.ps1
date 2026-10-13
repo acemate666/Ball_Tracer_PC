@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$InputJson = "",
     [string]$OutputDir = "",
     [string]$TrackerConfig = "",
