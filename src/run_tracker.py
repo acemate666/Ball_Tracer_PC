@@ -2318,6 +2318,8 @@ def main() -> int:
     # 都由 ArchiveThread 维护，shutdown 后再回收。
     car_loc_sampled_frames = 0
     car_loc_dropped_frames = 0
+    # 车定位抽 (frame_idx + car_loc_phase) % car_loc_sample_every_frames == 0 的帧；miss 后由车定位线改相位
+    car_loc_phase = 0
     capture_fps = 0.0
 
     # ── 打开同步相机 ────────────────────────────────────────────────────
@@ -2597,6 +2599,7 @@ def main() -> int:
             _car_job_queue = queue.Queue(maxsize=1)
 
             def _car_worker():
+                nonlocal car_loc_phase
                 while True:
                     job = _car_job_queue.get()
                     if job is None:
@@ -2608,7 +2611,13 @@ def main() -> int:
                         },
                         t=job.exposure_pc,
                     )
-                    if loc is not None:
+                    if loc is None:
+                        # 场馆灯 100 Hz 频闪、相机 40 fps：相邻两帧一亮一暗，隔帧抽会一直抽在同一相位上（相机帧率与市电几乎锁死，掉帧才翻）。
+                        # 夜里 800 μs、车停原点时暗相位的 tag 几乎全黑（1013_210101 原点暗相位只定到 31.6 %，暗段最长 16.5 s），
+                        # 而 miss 帧的下一帧 77 % 以上检得出，所以 miss 就把抽帧挪到 miss 帧的下一帧上。
+                        # 相位按 miss 的帧号算：worker 滞后期间同一相位上接连 miss 都指向同一个新相位，不会来回翻。
+                        car_loc_phase = -(job.frame_idx + 1) % car_loc_sample_every_frames
+                    else:
                         _ros2_sink.publish_car_loc({
                             "topic": "car_loc",
                             "x": round(loc.x, 4),
@@ -2673,8 +2682,9 @@ def main() -> int:
                         _full_decode_count += 1
                         if racket_marker is not None:
                             marker_frames.append((job.frame_idx, job.exposure_pc, images))
-                            # 车定位帧被挤掉时不让它越攒越多（每帧四张全分辨率图 ~34 MB）
-                            del marker_frames[:-car_loc_sample_every_frames]
+                            # 车定位帧被挤掉时不让它越攒越多（每帧四张全分辨率图 ~34 MB）；
+                            # miss 换相位时两个车定位帧最多隔 2×抽帧间隔−1 帧，这些帧都要留给黑标
+                            del marker_frames[:-(2 * car_loc_sample_every_frames - 1)]
 
                         if job.car_loc_sampled:
                             assert _car_job_queue is not None
@@ -2809,7 +2819,7 @@ def main() -> int:
                 # ── 标记本帧是否需要后台车辆定位 ──
                 car_loc_sampled = (
                     car_localizer is not None
-                    and (frame_idx % car_loc_sample_every_frames) == 0
+                    and ((frame_idx + car_loc_phase) % car_loc_sample_every_frames) == 0
                 )
                 if car_loc_sampled:
                     car_loc_sampled_frames += 1
