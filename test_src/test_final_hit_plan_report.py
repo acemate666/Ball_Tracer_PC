@@ -1,10 +1,18 @@
 # -*- coding: utf-8 -*-
-"""FinalHitPlan/PreAimHint report contract tests."""
+"""FinalHitPlan / PreAimHint 报告合同测试。
+
+2026-10-13 起方案收不收由臂生产代码判（test_src/arm_production.py → 臂 arm_controller.hit_pos → C++ node::receive_hit_pos，
+臂节点收消息那一段）：报告的 Python / JS 不再复刻 bot 的方案物理（旧的 car→arm 刚体变换 / 球心→拍心执行点 / 水平触球平面 /
+碰撞前向复算 / 上旋 / 五轴切向对账整套删了，连同这里照 bot 公式造自洽方案的夹具——那是同一套公式的又一份实现）。这里守：
+  - 抽取（ROS2 解释器，调不了臂 C 库）只映射、不判；
+  - 页面只读 Python 写进 event.check 的判决，不判、不对账；
+  - ACK 按 (plan_id, revision) 原子回配、contact_ht 同源校验；
+  - plan_audit 的判决与录包里臂自己的 /tennis/status 逐字对账（要臂 checkout 与 g++，缺了 skip）。
+"""
 
 from __future__ import annotations
 
 import json
-import math
 import re
 import shutil
 import subprocess
@@ -17,7 +25,10 @@ from test_src.extract_rk_tracking_bag import _payload_time, _report_prediction_p
 
 
 SRC = Path(__file__).with_name("generate_curve3_html.py")
+RK_EXTRACTOR = Path(__file__).with_name("extract_rk_tracking_bag.py")
 NODE = shutil.which("node")
+STATUS_NUM_JS = ("\nconst statusNum=(text,key)=>{const m=new RegExp('(?:^|\\\\s)'+key+"
+                 "'=(-?[0-9]+(?:\\\\.[0-9]+)?)').exec(text||'');return m?Number(m[1]):null;};\n")
 
 
 def _core(begin: str, end: str) -> str:
@@ -32,56 +43,7 @@ def _core(begin: str, end: str) -> str:
 
 
 def _plan(plan_id: str = "throw42", revision: int = 3, contact_ht: float = 100.6) -> dict:
-    car_yaw = 0.05
-    car_yaw_rate = -0.1
-    arm_forward_offset = 0.045
-    ball_radius = 0.033
-    target_x_bias = 0.0
-    target_z_bias = -0.02
-    arm_center = (0.2, 2.0)
-    arm_center_v = (0.1, 0.3)
-    offset = (-arm_forward_offset * math.sin(car_yaw),
-              arm_forward_offset * math.cos(car_yaw))
-    car_center = (arm_center[0] - offset[0], arm_center[1] - offset[1])
-    car_center_v = (
-        arm_center_v[0] + car_yaw_rate * offset[1],
-        arm_center_v[1] - car_yaw_rate * offset[0],
-    )
-    face_yaw = -0.08
-    face_pitch = 0.31
-    horizontal_normal = (-math.sin(face_yaw), math.cos(face_yaw))
-    face_normal = (
-        horizontal_normal[0] * math.cos(face_pitch),
-        horizontal_normal[1] * math.cos(face_pitch),
-        math.sin(face_pitch),
-    )
-    contact_rel = (
-        1.0,
-        (ball_radius - horizontal_normal[0]) / horizontal_normal[1],
-        1.1,
-    )
-    arm_target_rel = (
-        contact_rel[0] - ball_radius * horizontal_normal[0] + target_x_bias,
-        contact_rel[1] - ball_radius * horizontal_normal[1],
-        contact_rel[2] + target_z_bias,
-    )
-    incoming = (0.2, -7.0, -1.2)
-    compensated_speed = 5.4
-    racket_contact_v = (
-        arm_center_v[0] - car_yaw_rate * arm_target_rel[1]
-        + compensated_speed * horizontal_normal[0],
-        arm_center_v[1] + car_yaw_rate * arm_target_rel[0]
-        + compensated_speed * horizontal_normal[1],
-        0.2,
-    )
-    collision_en = 0.36441583352036017
-    collision_kt = 1.1528285465425736
-    relative = tuple(vin - vr for vin, vr in zip(incoming, racket_contact_v))
-    relative_normal = sum(u * n for u, n in zip(relative, face_normal))
-    outgoing = tuple(
-        vr + collision_kt * (u - relative_normal * n) - collision_en * relative_normal * n
-        for vr, u, n in zip(racket_contact_v, relative, face_normal)
-    )
+    """一条字段齐全的 final_hit_plan。数值只求形状对、不求物理自洽：报告不再对账方案物理。"""
     return {
         "kind": "final_hit_plan",
         "contract": "final_hit_plan/v1",
@@ -91,106 +53,32 @@ def _plan(plan_id: str = "throw42", revision: int = 3, contact_ht: float = 100.6
         "generated_at": 100.012,
         "contact_ht": contact_ht,
         "n_points": 18,
-        "contact_rel_x": contact_rel[0],
-        "contact_rel_y": contact_rel[1],
-        "contact_rel_z": contact_rel[2],
-        "arm_target_rel_x": arm_target_rel[0],
-        "arm_target_rel_y": arm_target_rel[1],
-        "arm_target_rel_z": arm_target_rel[2],
-        "contact_x": arm_center[0] + contact_rel[0],
-        "contact_y": arm_center[1] + contact_rel[1],
-        "contact_z": contact_rel[2],
-        "incoming_vx": incoming[0],
-        "incoming_vy": incoming[1],
-        "incoming_vz": incoming[2],
-        "arm_center_x": arm_center[0],
-        "arm_center_y": arm_center[1],
-        "arm_center_vx": arm_center_v[0],
-        "arm_center_vy": arm_center_v[1],
-        "car_center_x": car_center[0],
-        "car_center_y": car_center[1],
-        "car_center_vx": car_center_v[0],
-        "car_center_vy": car_center_v[1],
-        "arm_forward_offset_m": arm_forward_offset,
-        "tennis_ball_radius_m": ball_radius,
-        "arm_target_x_bias_m": target_x_bias,
-        "arm_target_z_bias_m": target_z_bias,
-        "car_yaw_at_ht": car_yaw,
-        "car_yaw_rate_at_ht": car_yaw_rate,
-        "face_normal_yaw_world": face_yaw,
-        "face_pitch": face_pitch,
-        "face_normal_nx": face_normal[0],
-        "face_normal_ny": face_normal[1],
-        "face_normal_nz": face_normal[2],
-        "compensated_speed": compensated_speed,
-        "racket_contact_vx": racket_contact_v[0],
-        "racket_contact_vy": racket_contact_v[1],
-        "racket_contact_vz": racket_contact_v[2],
-        "outgoing_vx": outgoing[0],
-        "outgoing_vy": outgoing[1],
-        "outgoing_vz": outgoing[2],
-        "landing_x": 0.0,
-        "landing_y": 15.5,
+        "contact_rel_x": 1.0,
+        "contact_rel_y": 0.04,
+        "contact_rel_z": 1.1,
+        "arm_target_rel_x": 0.99,
+        "arm_target_rel_y": 0.01,
+        "arm_target_rel_z": 1.08,
+        "contact_x": 1.2,
+        "contact_y": 2.04,
+        "contact_z": 1.1,
+        "arm_center_x": 0.2,
+        "arm_center_y": 2.0,
+        "car_center_x": 0.2,
+        "car_center_y": 1.955,
+        "car_yaw_at_ht": 0.05,
+        "face_normal_yaw_world": -0.08,
+        "face_pitch": 0.31,
+        "compensated_speed": 5.4,
         "apex_z_world": 2.55,
         "net_clearance_m": 0.24,
-        "collision_en": collision_en,
-        "collision_kt": collision_kt,
-        "model_fingerprint": "world3d_effective_v3_arm_center_sweetspot:0123456789abcdef",
+        "collision_en": 0.36,
+        "collision_kt": 1.15,
         "solve_iterations": 2,
         "solve_ms": 1.38,
+        "model_fingerprint": "world3d_topspin_v2_five_axis_sweetspot:0123456789abcdef",
+        "arm_calibration_fingerprint": "dc47f4de4b72bebf",
     }
-
-
-def _five_axis_plan(
-    plan_id: str = "throw42", revision: int = 3, sweet_spot_yaw: float = 0.21
-) -> dict:
-    """v05 五轴臂方案：甜点绕 J1 偏 φ'（sweet_spot_yaw），挥拍方向 = 甜点绕 J1 的切向。
-
-    与 bot_center return_hit_model.cpp 同式：甜点 t = R·(cos ψ, sin ψ)、挥拍方向
-    (−sin ψ, cos ψ)，ψ = 拍面法向 yaw + φ'；拍面法向、碰撞系数沿用六轴夹具。
-    """
-    plan = _plan(plan_id, revision)
-    yaw = plan["face_normal_yaw_world"]
-    horizontal_normal = (-math.sin(yaw), math.cos(yaw))
-    swing_yaw = yaw + sweet_spot_yaw
-    radius = 1.05
-    target = (radius * math.cos(swing_yaw), radius * math.sin(swing_yaw),
-              plan["arm_target_rel_z"])
-    ball_radius = plan["tennis_ball_radius_m"]
-    contact_rel = (
-        target[0] + ball_radius * horizontal_normal[0] - plan["arm_target_x_bias_m"],
-        target[1] + ball_radius * horizontal_normal[1],
-        target[2] - plan["arm_target_z_bias_m"],
-    )
-    yaw_rate = plan["car_yaw_rate_at_ht"]
-    racket = (
-        plan["arm_center_vx"] - yaw_rate * target[1]
-        + plan["compensated_speed"] * -math.sin(swing_yaw),
-        plan["arm_center_vy"] + yaw_rate * target[0]
-        + plan["compensated_speed"] * math.cos(swing_yaw),
-        plan["racket_contact_vz"],
-    )
-    incoming = tuple(plan[f"incoming_v{axis}"] for axis in "xyz")
-    normal = tuple(plan[f"face_normal_n{axis}"] for axis in "xyz")
-    relative = tuple(vin - vr for vin, vr in zip(incoming, racket))
-    relative_normal = sum(u * n for u, n in zip(relative, normal))
-    outgoing = tuple(
-        vr + plan["collision_kt"] * (u - relative_normal * n)
-        - plan["collision_en"] * relative_normal * n
-        for vr, u, n in zip(racket, relative, normal)
-    )
-    plan.update(
-        contact_rel_x=contact_rel[0], contact_rel_y=contact_rel[1],
-        contact_rel_z=contact_rel[2],
-        contact_x=plan["arm_center_x"] + contact_rel[0],
-        contact_y=plan["arm_center_y"] + contact_rel[1],
-        contact_z=contact_rel[2],
-        arm_target_rel_x=target[0], arm_target_rel_y=target[1], arm_target_rel_z=target[2],
-        racket_contact_vx=racket[0], racket_contact_vy=racket[1], racket_contact_vz=racket[2],
-        outgoing_vx=outgoing[0], outgoing_vy=outgoing[1], outgoing_vz=outgoing[2],
-        model_fingerprint="world3d_effective_v3_five_axis_sweetspot:a1939d6096395e7a",
-    )
-    return plan
 
 
 def _preaim() -> dict:
@@ -206,14 +94,17 @@ def _preaim() -> dict:
         "estimate_rel_x": 0.9,
         "estimate_rel_y": 1.1,
         "estimate_rel_z": 1.0,
-        "car_yaw_estimate": 0.04,
-        "face_normal_yaw_seed": -0.07,
         # These legacy-looking fields must not make a pre-aim message a FinalHT.
         "ct": 99.7,
         "ht": 100.6,
         "rel_x": 999.0,
         "rel_z": 999.0,
     }
+
+
+def _solve_failed() -> dict:
+    return {**_plan("throw43", 1), "plan_status": "solve_failed", "fail_reason": "no_meeting_root",
+            "fail_detail": "meeting"}
 
 
 def test_arm_extractor_preserves_full_json_and_uses_generated_at():
@@ -233,53 +124,79 @@ def test_arm_extractor_preserves_full_json_and_uses_generated_at():
     assert "text = text[:" not in source
 
 
-def test_rk_extractor_excludes_preaim_and_maps_contact_coordinates():
+def test_rk_extractor_maps_plans_raw_and_skips_preaim_and_solve_failures():
     preaim = _preaim()
     plan = _plan()
     assert _payload_time("/predict_hit_pos", preaim) == pytest.approx(preaim["generated_at"])
     assert _report_prediction_payload(preaim) is None
+    # bot 求解失败报告没有触球点，不是预测
+    assert _report_prediction_payload(_solve_failed()) is None
     mapped = _report_prediction_payload(plan)
     assert mapped is not None
     assert mapped["ct"] == plan["source_ct"]
     assert mapped["ht"] == plan["contact_ht"]
+    assert mapped["duration"] == pytest.approx(plan["contact_ht"] - plan["source_ct"])
     assert [mapped[k] for k in ("x", "y", "z")] == pytest.approx(
         [plan["contact_x"], plan["contact_y"], plan["contact_z"]]
     )
     assert [mapped[k] for k in ("rel_x", "rel_y", "rel_z")] == pytest.approx(
         [plan["contact_rel_x"], plan["contact_rel_y"], plan["contact_rel_z"]]
     )
-    malformed = {**plan, "contract": "final_hit_plan/v0", "ct": 7.0, "ht": 9.0}
-    assert _report_prediction_payload(malformed) is None
-    assert _report_prediction_payload({**plan, "revision": 0}) is None
-    assert _report_prediction_payload({**plan, "arm_forward_offset_m": float("nan")}) is None
+    assert (mapped["arm_pred_x"], mapped["arm_pred_y"]) == (plan["arm_center_x"], plan["arm_center_y"])
+    # 抽取不判：契约错、字段坏的方案照样映射（收不收报告生成时由臂生产代码判，见 arm_production.plan_audit）
+    malformed = {**plan, "contract": "final_hit_plan/v0", "arm_forward_offset_m": float("nan")}
+    assert _report_prediction_payload(malformed)["contract"] == "final_hit_plan/v0"
+    no_time = {k: v for k, v in plan.items() if k != "source_ct"}
+    assert _report_prediction_payload(no_time)["duration"] is None
     legacy = {"ct": 8.0, "ht": 8.5, "rel_x": 0.2}
     assert _report_prediction_payload(legacy) is legacy
 
 
-@pytest.mark.parametrize(
-    "mutate",
-    [
-        lambda p: p.update(model_fingerprint="world3d_effective_v3_arm_center_sweetspot:xyz"),
-        lambda p: p.update(revision=0),
-        lambda p: p.update(solve_iterations=0),
-        lambda p: p.update(solve_iterations=5),
-        lambda p: p.update(solve_iterations=2.0),
-        lambda p: p.update(generated_at=p["source_ct"] - 0.001),
-        lambda p: p.update(generated_at=p["contact_ht"]),
-        lambda p: p.update(car_center_x=p["car_center_x"] + 0.001),
-        lambda p: p.update(arm_center_vy=p["arm_center_vy"] + 0.001),
-        lambda p: p.update(contact_rel_y=p["contact_rel_y"] + 0.001,
-                           contact_y=p["contact_y"] + 0.001),
-        lambda p: p.update(arm_target_rel_x=p["arm_target_rel_x"] + 0.001),
-        lambda p: p.update(face_normal_nx=p["face_normal_nx"] + 0.001),
-        lambda p: p.update(racket_contact_vx=p["racket_contact_vx"] + 0.001),
-        lambda p: p.update(outgoing_vz=p["outgoing_vz"] + 0.001),
-    ],
-)
-def test_rk_extractor_rejects_each_invalid_final_plan_invariant(mutate):
-    plan = _plan()
-    mutate(plan)
-    assert _report_prediction_payload(plan) is None
+def test_report_and_extractors_carry_no_plan_physics():
+    """方案物理只在 bot（解）与臂（指纹核对）里：报告链不再有第二份对账。"""
+    for path in (SRC, RK_EXTRACTOR):
+        source = path.read_text(encoding="utf-8")
+        for gone in ("_valid_final_hit_plan_physics", "spin_cross_v1", "碰撞前向复算", "car→arm刚体变换",
+                     "球心→拍心执行点", "水平触球平面", "拍心世界水平速度", "_FINAL_HIT_PLAN_FINGERPRINT_RE"):
+            assert gone not in source, (path.name, gone)
+    source = SRC.read_text(encoding="utf-8")
+    assert "return structured?null:chassisTargetForThrow" in source
+    assert "armPreds.filter(p=>p.kind==='final_hit_plan')" in source
+    for field in (
+        "collision_en", "collision_kt", "apex_z_world", "net_clearance_m", "solve_iterations", "solve_ms",
+        "model_fingerprint", "contact_rel_x", "arm_target_rel_x",
+    ):
+        assert field in source
+    assert "碰撞 / 求解" in source
+
+
+def _parse_harness(events: list, tail: str) -> str:
+    return (
+        "const isNum=v=>typeof v==='number'&&Number.isFinite(v);\n"
+        "const RK={t0:100};\n"
+        f"const ARM={{events:{json.dumps(events)}}};\n"
+        + _core("final-hit-plan-parse-core-begin", "final-hit-plan-parse-core-end")
+        + STATUS_NUM_JS
+        + _core("final-hit-plan-ack-core-begin", "final-hit-plan-ack-core-end")
+        + tail
+    )
+
+
+def _run(tmp_path: Path, body: str) -> dict:
+    script = tmp_path / "final_plan_contract.js"
+    script.write_text(body, encoding="utf-8")
+    run = subprocess.run(
+        [NODE, str(script)], capture_output=True, text=True, encoding="utf-8", timeout=30
+    )
+    assert run.returncode == 0, run.stderr
+    return json.loads(run.stdout)
+
+
+def _event(t: float, payload: dict, check: dict | None) -> dict:
+    event = {"t": t, "topic": "/predict_hit_pos", "text": json.dumps(payload)}
+    if check is not None:
+        event["check"] = check
+    return event
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
@@ -292,127 +209,95 @@ def test_malformed_declared_new_message_still_disables_legacy_fallback(tmp_path)
         + "\nconsole.log(JSON.stringify({structured:hasStructuredHitMessages,"
           "bad:armPredParseBad,preds:armPreds.length}));\n"
     )
-    script = tmp_path / "malformed_final_plan.js"
-    script.write_text(body, encoding="utf-8")
-    run = subprocess.run(
-        [NODE, str(script)], capture_output=True, text=True, encoding="utf-8", timeout=30
-    )
-    assert run.returncode == 0, run.stderr
-    assert json.loads(run.stdout) == {"structured": True, "bad": 1, "preds": 0}
+    assert _run(tmp_path, body) == {"structured": True, "bad": 1, "preds": 0}
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_page_reads_the_production_verdict_and_never_judges(tmp_path):
+    """event.check 是 Python 用臂生产代码判好的：executable / old_version / 未判 进 FinalHT 候选，rejected 原文进
+    合同错误（= 臂 /tennis/status 原文），solve_failed 单独记原因、不算合同错误；页面自己不看方案物理。"""
+    rejected_text = ("error hit_pos: final plan arm calibration fingerprint 00000000deadbeef differs from this arm's "
+                     "dc47f4de4b72bebf (bot loaded another arm calibration) plan_id=bad revision=1 contact_ht=100.600000")
+    # 物理上乱写的方案：页面不该看出任何问题（判决只看 check）
+    nonsense = {**_plan("nonsense", 1), "outgoing_vz": 99.0, "car_center_x": 7.0}
+    events = [
+        _event(-0.3, _preaim(), {"verdict": "executable", "kind": "preaim_hint"}),
+        _event(0.0, _plan("good", 1), {"verdict": "executable", "kind": "final_hit_plan", "side": 1}),
+        _event(0.01, _plan("old", 1), {"verdict": "old_version", "kind": "final_hit_plan",
+                                       "reason": "方案没有 arm_calibration_fingerprint（1012 前的契约）"}),
+        _event(0.02, nonsense, None),
+        _event(0.03, _plan("bad", 1), {"verdict": "rejected", "kind": "final_hit_plan", "text": rejected_text}),
+        _event(0.04, _solve_failed(), {"verdict": "solve_failed", "kind": "final_hit_plan",
+                                       "fail_reason": "no_meeting_root", "fail_detail": "meeting"}),
+        _event(0.05, {**_plan("noid", 1), "plan_id": ""}, {"verdict": "executable", "kind": "final_hit_plan"}),
+    ]
+    result = _run(tmp_path, _parse_harness(events, (
+        "console.log(JSON.stringify({preds:armPreds.map(p=>[p.planId,p.verdict]),preaim:armPreaimCount,"
+        "errors:armPlanContractErrors,failed:armSolveFailed,unusable:armPlanUnusable,counts:armPlanVerdictCounts}));\n")))
+    assert result["preds"] == [["good", "executable"], ["old", "old_version"], ["nonsense", "unchecked"]]
+    assert result["preaim"] == 1
+    assert result["errors"] == [rejected_text]
+    assert result["failed"] == [{"t": 0.04, "planId": "throw43", "revision": 1, "reason": "no_meeting_root",
+                                 "detail": "meeting"}]
+    assert result["unusable"] == ["?#1"]
+    assert result["counts"] == {"executable": 1, "old_version": 1, "unchecked": 1}
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
 def test_report_matches_only_exact_plan_identity_and_contact_ht(tmp_path):
     good = _plan(revision=3, contact_ht=100.6)
     wrong_ht = _plan(revision=4, contact_ht=100.62)
-    malformed = {**_plan("bad", 1), "contract": "final_hit_plan/v0", "ct": 1.0, "ht": 2.0}
-    bad_geometry = {**_plan("bad-geometry", 1), "car_center_x": 0.3}
-    bad_sweetspot = {
-        **_plan("bad-sweetspot", 1),
-        "arm_target_rel_x": _plan("bad-sweetspot", 1)["arm_target_rel_x"] + 0.01,
-    }
-    bad_collision = {
-        **_plan("bad-collision", 1),
-        "outgoing_vx": _plan("bad-collision", 1)["outgoing_vx"] + 0.1,
-    }
-    bad_plane = _plan("bad-plane", 1)
-    bad_plane["contact_rel_y"] += 0.01
-    bad_plane["contact_y"] += 0.01
-    bad_racket = {
-        **_plan("bad-racket", 1),
-        "racket_contact_vy": _plan("bad-racket", 1)["racket_contact_vy"] + 0.01,
-    }
-    bad_fingerprint = {
-        **_plan("bad-fingerprint", 1),
-        "model_fingerprint": "world3d_effective_v2:0123456789abcdef",
-    }
-    bad_iterations = {**_plan("bad-iterations", 1), "solve_iterations": 5}
-    bad_time = {**_plan("bad-time", 1), "generated_at": 99.99}
     conflict_a = _plan("conflict", 5)
     conflict_b = {**conflict_a, "solve_ms": conflict_a["solve_ms"] + 0.01}
+    ok = {"verdict": "executable", "kind": "final_hit_plan", "side": 1}
     events = [
-        {"t": -0.3, "topic": "/predict_hit_pos", "text": json.dumps(_preaim())},
-        {"t": 0.0, "topic": "/predict_hit_pos", "text": json.dumps(good)},
-        {"t": 0.01, "topic": "/predict_hit_pos", "text": json.dumps(wrong_ht)},
-        {"t": 0.02, "topic": "/predict_hit_pos", "text": json.dumps(malformed)},
-        {"t": 0.021, "topic": "/predict_hit_pos", "text": json.dumps(bad_geometry)},
-        {"t": 0.0215, "topic": "/predict_hit_pos", "text": json.dumps(bad_sweetspot)},
-        {"t": 0.022, "topic": "/predict_hit_pos", "text": json.dumps(bad_collision)},
-        {"t": 0.0221, "topic": "/predict_hit_pos", "text": json.dumps(bad_plane)},
-        {"t": 0.0222, "topic": "/predict_hit_pos", "text": json.dumps(bad_racket)},
-        {"t": 0.0223, "topic": "/predict_hit_pos", "text": json.dumps(bad_fingerprint)},
-        {"t": 0.0224, "topic": "/predict_hit_pos", "text": json.dumps(bad_iterations)},
-        {"t": 0.0225, "topic": "/predict_hit_pos", "text": json.dumps(bad_time)},
-        {"t": 0.023, "topic": "/predict_hit_pos", "text": json.dumps(conflict_a)},
-        {"t": 0.024, "topic": "/predict_hit_pos", "text": json.dumps(conflict_b)},
+        _event(-0.3, _preaim(), {"verdict": "executable", "kind": "preaim_hint"}),
+        _event(0.0, good, ok),
+        _event(0.01, wrong_ht, ok),
+        _event(0.023, conflict_a, ok),
+        _event(0.024, conflict_b, ok),
         {"t": 0.05, "topic": "/tennis/status", "text":
          "accepted hit x=1.0120 z=1.0800 duration=0.5500 "
          "plan_id=throw42 revision=3 contact_ht=100.600000 solve_ms=1.380"},
         {"t": 0.06, "topic": "/tennis/status", "text":
          "accepted hit x=1.0120 z=1.0800 duration=0.5600 "
          "plan_id=throw42 revision=4 contact_ht=100.610000 solve_ms=1.400"},
+        {"t": 0.07, "topic": "/tennis/status", "text":
+         "accepted hit x=1.0120 z=1.0800 duration=0.5600 "
+         "plan_id=conflict revision=5 contact_ht=100.600000 solve_ms=1.400"},
     ]
-    body = (
-        "const isNum=v=>typeof v==='number'&&Number.isFinite(v);\n"
-        "const RK={t0:100};\n"
-        f"const ARM={{events:{json.dumps(events)}}};\n"
-        + _core("final-hit-plan-parse-core-begin", "final-hit-plan-parse-core-end")
-        + "\nconst statusNum=(text,key)=>{const m=new RegExp('(?:^|\\\\s)'+key+'=(-?[0-9]+(?:\\\\.[0-9]+)?)').exec(text||'');return m?Number(m[1]):null;};\n"
-        + _core("final-hit-plan-ack-core-begin", "final-hit-plan-ack-core-end")
-        + "\nconst rec=acceptedRecordForPlanAck(armPlanAcks[0]);\n"
-          "console.log(JSON.stringify({structured:hasStructuredHitMessages,preaim:armPreaimCount,"
-          "preds:armPreds.length,plans:armFinalPlans.length,acks:armPlanAcks.length,"
-          "contractErrors:armPlanContractErrors,ackErrors:armPlanAckErrors,"
-          "contact:[rec.plan.rel_x,rec.plan.rel_y,rec.plan.rel_z],"
-          "target:[rec.wx,rec.wy,rec.wz],id:rec.plan.planId,revision:rec.plan.revision}));\n"
-    )
-    script = tmp_path / "final_plan_contract.js"
-    script.write_text(body, encoding="utf-8")
-    run = subprocess.run(
-        [NODE, str(script)], capture_output=True, text=True, encoding="utf-8", timeout=30
-    )
-    assert run.returncode == 0, run.stderr
-    result = json.loads(run.stdout)
+    result = _run(tmp_path, _parse_harness(events, (
+        "const rec=acceptedRecordForPlanAck(armPlanAcks[0]);\n"
+        "console.log(JSON.stringify({structured:hasStructuredHitMessages,preaim:armPreaimCount,"
+        "preds:armPreds.length,plans:armFinalPlans.length,acks:armPlanAcks.length,ackErrors:armPlanAckErrors,"
+        "contact:[rec.plan.rel_x,rec.plan.rel_y,rec.plan.rel_z],"
+        "target:[rec.wx,rec.wy,rec.wz],id:rec.plan.planId,revision:rec.plan.revision}));\n")))
     assert result["structured"] is True
     assert result["preaim"] == 1
     assert result["preds"] == result["plans"] == 4
     assert result["acks"] == 1
-    assert any("bad#1" in err for err in result["contractErrors"])
-    assert any("car→arm刚体变换" in err for err in result["contractErrors"])
-    assert any("球心→拍心执行点" in err for err in result["contractErrors"])
-    assert any("水平触球平面" in err for err in result["contractErrors"])
-    assert any("拍心世界水平速度" in err for err in result["contractErrors"])
-    assert any("碰撞前向复算" in err for err in result["contractErrors"])
-    assert any("model_fingerprint" in err for err in result["contractErrors"])
-    assert any("solve_iterations" in err for err in result["contractErrors"])
-    assert any("generated_at>=source_ct" in err for err in result["contractErrors"])
-    assert any("payload 不一致" in err for err in result["contractErrors"])
+    assert any("payload 不一致" in err for err in result["ackErrors"])
     assert any("contact_ht" in err for err in result["ackErrors"])
+    assert any("conflict#5" in err and "找不到同身份" in err for err in result["ackErrors"])
     expected = _plan()
     assert result["contact"] == pytest.approx([
-        expected["contact_rel_x"], expected["contact_rel_y"],
-        expected["contact_rel_z"],
+        expected["contact_rel_x"], expected["contact_rel_y"], expected["contact_rel_z"],
     ])
     assert result["target"] == pytest.approx([
-        expected["arm_target_rel_x"], expected["arm_target_rel_y"],
-        expected["arm_target_rel_z"],
+        expected["arm_target_rel_x"], expected["arm_target_rel_y"], expected["arm_target_rel_z"],
     ])
     assert (result["id"], result["revision"]) == ("throw42", 3)
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
 def test_final_plan_session_calibrates_arm_z_offset_from_plan_acks(tmp_path):
-    """FinalHitPlan 场没有旧状态可回配，zOff 必须从 plan_id+revision 原子回配的 ACK 标定。
-
-    臂端 z = arm_target_rel_z + hit_pos_z_offset_m；夹具 arm_target_z_bias=−0.02，误用
-    contact_rel_z 会差 2cm。zOff=null 会让 TCP 列与黑标测量整场失效（0923 155028 场）。
-    """
+    """FinalHitPlan 场没有旧状态可回配，zOff（旧状态回配的值键与悬停溯源用）从 plan_id+revision 原子回配的 ACK 标定：
+    臂端 z = arm_target_rel_z + hit_pos_z_offset_m。"""
     z_offset = -0.193109308
     events = []
     for k in range(3):
         plan = _plan(plan_id=f"throw{k}", revision=1)
-        events.append({"t": 0.02 + 0.01 * k, "topic": "/predict_hit_pos",
-                       "text": json.dumps(plan)})
+        events.append(_event(0.02 + 0.01 * k, plan, {"verdict": "executable", "kind": "final_hit_plan"}))
         events.append({"t": 0.05 + 0.01 * k, "topic": "/tennis/status", "text":
                        f"accepted hit x={plan['arm_target_rel_x']:.4f} "
                        f"z={plan['arm_target_rel_z'] + z_offset:.4f} duration=0.5500 "
@@ -425,369 +310,105 @@ def test_final_plan_session_calibrates_arm_z_offset_from_plan_acks(tmp_path):
         + _core("arm-prediction-match-core-begin", "arm-prediction-match-core-end")
         + _core("final-hit-plan-parse-core-begin", "final-hit-plan-parse-core-end")
         + _core("arm-pred-align-core-begin", "arm-pred-align-core-end")
-        + "\nconst statusNum=(text,key)=>{const m=new RegExp('(?:^|\\\\s)'+key+'=(-?[0-9]+(?:\\\\.[0-9]+)?)').exec(text||'');return m?Number(m[1]):null;};\n"
+        + STATUS_NUM_JS
         + _core("final-hit-plan-ack-core-begin", "final-hit-plan-ack-core-end")
         + _core("arm-const-cal-core-begin", "arm-const-cal-core-end")
         + "console.log(JSON.stringify({acks:armPlanAcks.length,cal:armConstCal,z:ARM_HIT_Z_OFFSET}));\n"
     )
-    script = tmp_path / "final_plan_z_offset.js"
-    script.write_text(body, encoding="utf-8")
-    run = subprocess.run(
-        [NODE, str(script)], capture_output=True, text=True, encoding="utf-8", timeout=30
-    )
-    assert run.returncode == 0, run.stderr
-    result = json.loads(run.stdout)
+    result = _run(tmp_path, body)
     assert result["acks"] == 3
     assert result["cal"]["zOff"] == pytest.approx(-0.1931, abs=1e-9)
     assert result["cal"]["n"] == 3
     assert result["z"] == pytest.approx(-0.1931, abs=1e-9)
 
 
-def test_report_surfaces_plan_physics_and_disables_new_contract_fallback():
-    source = SRC.read_text(encoding="utf-8")
-    assert "return structured?null:chassisTargetForThrow" in source
-    assert "p.kind==='preaim_hint'" in source
-    assert "armPreds.filter(p=>p.kind==='final_hit_plan')" in source
-    for field in (
-        "collision_en", "collision_kt", "outgoing_vx", "landing_x",
-        "apex_z_world", "net_clearance_m", "solve_iterations", "solve_ms",
-        "model_fingerprint", "contact_rel_x", "arm_target_rel_x",
-        "car_center_x", "arm_forward_offset_m", "tennis_ball_radius_m",
-        "racket_contact_vx", "face_normal_nx",
-    ):
-        assert field in source
-    assert ("world3d_((effective_v3|topspin_v1)_(arm_center|five_axis)|topspin_v2_five_axis)_sweetspot:[0-9a-f]{16}"
-            in source)
-    assert "碰撞 / 求解" in source
+# ───────────────────────── plan_audit：臂生产代码判决 + 与臂 /tennis/status 逐字对账 ─────────────────────────
+
+def _production():
+    """臂生产代码（判决库）+ 臂自己测试里那条字段齐全、在各合同门内的方案夹具（合法方案长什么样只有臂说了算，这里不另造）。"""
+    import importlib.util
+
+    import test_src.arm_production as ap
+
+    try:
+        own = ap.arm().hit_pos.fingerprint("v05")
+    except Exception as exc:  # noqa: BLE001 —— 没有臂 checkout / g++ 的机器
+        pytest.skip(f"臂生产代码不可用：{exc}")
+    path = ap.ARM_CONTROLLER_ROOT / "tests" / "test_hit_pos_lib.py"
+    if not path.is_file():
+        pytest.skip(f"臂 checkout 没有 {path}")
+    spec = importlib.util.spec_from_file_location("arm_tests_hit_pos_lib", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return ap, own, module.plan
 
 
-def _run_plan_parse(tmp_path, events: list) -> dict:
-    body = (
-        "const isNum=v=>typeof v==='number'&&Number.isFinite(v);\n"
-        "const RK={t0:100};\n"
-        f"const ARM={{events:{json.dumps(events)}}};\n"
-        + _core("final-hit-plan-parse-core-begin", "final-hit-plan-parse-core-end")
-        + "\nconst statusNum=(text,key)=>{const m=new RegExp('(?:^|\\\\s)'+key+'=(-?[0-9]+(?:\\\\.[0-9]+)?)').exec(text||'');return m?Number(m[1]):null;};\n"
-        + _core("final-hit-plan-ack-core-begin", "final-hit-plan-ack-core-end")
-        + "\nconsole.log(JSON.stringify({plans:armFinalPlans.map(p=>p.planId),"
-          "acks:armPlanAcks.map(a=>a.plan.planId),"
-          "contractErrors:armPlanContractErrors,ackErrors:armPlanAckErrors}));\n"
-    )
-    script = tmp_path / "five_axis_plan.js"
-    script.write_text(body, encoding="utf-8")
-    run = subprocess.run(
-        [NODE, str(script)], capture_output=True, text=True, encoding="utf-8", timeout=30
-    )
-    assert run.returncode == 0, run.stderr
-    return json.loads(run.stdout)
+def _status(t: float, text: str) -> dict:
+    return {"t": t, "topic": "/tennis/status", "text": text}
 
 
-def test_five_axis_fixture_is_offset_from_six_axis_plane():
-    plan = _five_axis_plan()
-    yaw = plan["face_normal_yaw_world"]
-    plane = -math.sin(yaw) * plan["contact_rel_x"] + math.cos(yaw) * plan["contact_rel_y"]
-    # φ'=0.21 rad 时离六轴平面 ~0.2m：夹具确实走了五轴几何，不是六轴换个指纹。
-    assert abs(plane - plan["tennis_ball_radius_m"]) > 0.1
+def _ident(plan_id: str) -> str:
+    return f" plan_id={plan_id} revision=3 contact_ht=100.500000"
 
 
-def test_rk_extractor_accepts_five_axis_plan():
-    plan = _five_axis_plan()
-    mapped = _report_prediction_payload(plan)
-    assert mapped is not None
-    assert [mapped[k] for k in ("rel_x", "rel_y", "rel_z")] == pytest.approx(
-        [plan["contact_rel_x"], plan["contact_rel_y"], plan["contact_rel_z"]]
-    )
-    # φ'=0 的五轴方案与六轴几何重合（v05 实场 354 条里有 117 条），同样有效。
-    assert _report_prediction_payload(_five_axis_plan(sweet_spot_yaw=0.0)) is not None
-
-
-@pytest.mark.parametrize(
-    "mutate",
-    [
-        # 五轴几何贴六轴指纹：六轴触球平面/挥拍方向都对不上
-        lambda p: p.update(
-            model_fingerprint="world3d_effective_v3_arm_center_sweetspot:0123456789abcdef"),
-        lambda p: p.update(racket_contact_vx=p["racket_contact_vx"] + 0.001),
-        lambda p: p.update(arm_target_rel_y=p["arm_target_rel_y"] + 0.001,
-                           contact_rel_y=p["contact_rel_y"] + 0.001,
-                           contact_y=p["contact_y"] + 0.001),
-        lambda p: p.update(
-            model_fingerprint="world3d_effective_v3_five_axis_sweetspot:0123456789ABCDEF"),
-        # J1 另一侧的镜像根：速度与切向自洽，但甜点在 J1 背后
-        lambda p: p.update(_five_axis_plan(sweet_spot_yaw=0.21 + math.pi)),
-    ],
-)
-def test_rk_extractor_rejects_invalid_five_axis_plan(mutate):
-    plan = _five_axis_plan()
-    mutate(plan)
-    assert _report_prediction_payload(plan) is None
-
-
-@pytest.mark.skipif(NODE is None, reason="node not on PATH")
-def test_report_accepts_five_axis_plan_and_matches_ack(tmp_path):
-    good = _five_axis_plan("v05good", 1)
-    as_six_axis = {
-        **_five_axis_plan("as-six-axis", 1),
-        "model_fingerprint": "world3d_effective_v3_arm_center_sweetspot:0123456789abcdef",
-    }
-    bad_racket = _five_axis_plan("bad-racket", 1)
-    bad_racket["racket_contact_vy"] += 0.01
-    mirror = _five_axis_plan("mirror", 1, sweet_spot_yaw=0.21 + math.pi)
+def test_plan_audit_uses_the_arm_verdict_and_reconciles_the_arm_status():
+    ap, own, arm_plan = _production()
+    good = arm_plan("v05", plan_id="good")
+    backhand = arm_plan("v05", plan_id="back", arm_target_rel_x=-1.0, contact_rel_x=-0.97, contact_x=-0.97)
+    stale = arm_plan("v05", plan_id="stale", arm_calibration_fingerprint="00000000deadbeef")
+    old = arm_plan("v05", plan_id="old", arm_calibration_fingerprint=None)
+    late = arm_plan("v05", plan_id="late")
+    legacy = {"ct": 99.0, "ht": 99.5, "rel_x": 1.0, "rel_z": 1.0}
+    late_text = "error hit_pos: contact_ht must be after generation and receipt" + _ident("late")
     events = [
-        {"t": 0.0, "topic": "/predict_hit_pos", "text": json.dumps(good)},
-        {"t": 0.01, "topic": "/predict_hit_pos", "text": json.dumps(as_six_axis)},
-        {"t": 0.02, "topic": "/predict_hit_pos", "text": json.dumps(bad_racket)},
-        {"t": 0.03, "topic": "/predict_hit_pos", "text": json.dumps(mirror)},
-        {"t": 0.05, "topic": "/tennis/status", "text":
-         f"accepted hit x={good['arm_target_rel_x']:.4f} z={good['arm_target_rel_z']:.4f} "
-         "duration=0.5500 plan_id=v05good revision=1 contact_ht=100.600000 solve_ms=1.380"},
+        {"t": 100.01, "topic": "/predict_hit_pos", "text": json.dumps(p)}
+        for p in (good, backhand, stale, old, late, _solve_failed(), legacy)
+    ] + [
+        {"t": 100.02, "topic": "/predict_hit_pos", "text": "{not json"},
+        _status(100.05, "accepted hit x=1.0000 z=0.8127 duration=0.4500" + _ident("good")),
+        _status(100.05, "accepted hit x=1.0000 z=0.8127 duration=0.4500" + _ident("back")),
+        _status(100.05, "accepted hit x=1.0000 z=0.8127 duration=0.4500" + _ident("old")),
+        # 臂收到时 HT 已过（送达晚）：按臂 status 的发布时刻重判同文 = 送达晚造成的拒收，不算不一致
+        _status(100.6, late_text),
     ]
-    result = _run_plan_parse(tmp_path, events)
-    assert result["plans"] == ["v05good"]
-    assert result["acks"] == ["v05good"]
-    assert result["ackErrors"] == []
-    errors = result["contractErrors"]
-    assert len(errors) == 3
-    assert any("as-six-axis#1" in e and "水平触球平面" in e and "拍心世界水平速度" in e
-               for e in errors)
-    assert any("bad-racket#1" in e and "拍心世界水平速度" in e and "水平触球平面" not in e
-               for e in errors)
-    assert any("mirror#1" in e and "J1 前侧" in e for e in errors)
+    audit = ap.plan_audit({"events": events}, "v05")
+    check = {json.loads(e["text"]).get("plan_id", "legacy") if e["text"].startswith("{\"") else "garbage": e["check"]
+             for e in events if e["topic"] == "/predict_hit_pos"}
+    assert check["good"] == {"verdict": "executable", "kind": "final_hit_plan", "side": 1}
+    assert check["back"] == {"verdict": "executable", "kind": "final_hit_plan", "side": -1}
+    # 指纹不同 = 按另一份臂标定解的方案：当前代码判不了它当时该不该收 → old_version，臂原文与原因都留下
+    assert check["stale"]["verdict"] == "old_version" and own in check["stale"]["reason"]
+    assert check["stale"]["text"] == ("error hit_pos: final plan arm calibration fingerprint 00000000deadbeef differs "
+                                      f"from this arm's {own} (bot loaded another arm calibration)" + _ident("stale"))
+    assert check["old"]["verdict"] == "old_version" and "1012 前" in check["old"]["reason"]
+    assert check["late"]["verdict"] == "executable" and check["late"]["arrival_reject"] == late_text
+    assert check["throw43"] == {"verdict": "solve_failed", "kind": "final_hit_plan",
+                                "fail_reason": "no_meeting_root", "fail_detail": "meeting"}
+    assert check["legacy"]["verdict"] == "old_version" and "无 kind" in check["legacy"]["reason"]
+    assert check["garbage"]["verdict"] == "rejected" and check["garbage"]["text"].startswith("error hit_pos: json")
+    assert audit["verdicts"] == {"executable": 3, "solve_failed": 1, "rejected": 1, "old_version": 3}
+    assert audit["solve_failed_reasons"] == {"no_meeting_root/meeting": 1}
+    assert audit["arm_calibration_fingerprint"] == own
+    # 求解失败报告臂认出就丢、不发 status = 一致；旧版本不比
+    assert audit["arm_status_vs_verdict"] == {"agree": 3, "arrival": 1, "disagree": 0, "missing": 0, "not_compared": 2}
+    assert audit["arm_status_final_plans"] == {
+        "accepted": 3, "reject": {}, "error": {"error hit_pos: contact_ht must be after generation and receipt": 1},
+        "missing": 1}
+    assert audit["disagreements"] == []
 
 
-# 上旋（spin_cross_v1）：臂 control/spin_ball.hpp 的 Cross 咬合碰撞原样移植。夹具走完整模型（含摩擦上限），
-# 报告端用「零旋等效（kt = 1−c）+ spin_c·R·(ω_in×n)」对账——咬合未打滑时两者逐式相等，夹具顺带对拍这一点。
-_SPIN_ALPHA = 0.58
-_SPIN_EX = 0.08
-_SPIN_MU = 0.40
-_SPIN_FIELDS = (
-    "collision_model", "spin_c",
-    "incoming_spin_wx", "incoming_spin_wy", "incoming_spin_wz",
-    "outgoing_spin_wx", "outgoing_spin_wy", "outgoing_spin_wz",
-)
-
-
-def _cross(a, b):
-    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
-
-
-def _cross_collide(incoming, spin, racket, normal, en, radius):
-    u = [vin - vr for vin, vr in zip(incoming, racket)]
-    un = sum(a * b for a, b in zip(u, normal))
-    assert un < 0.0  # 来球压向拍面
-    slip = [ui - radius * wi for ui, wi in zip(u, _cross(spin, normal))]
-    sn = sum(a * b for a, b in zip(slip, normal))
-    slip = [si - sn * ni for si, ni in zip(slip, normal)]
-    c = _SPIN_ALPHA * (1.0 + _SPIN_EX) / (1.0 + _SPIN_ALPHA)
-    dt = [-c * si for si in slip]
-    limit = _SPIN_MU * (1.0 + en) * (-un)
-    magnitude = math.sqrt(sum(d * d for d in dt))
-    grip = magnitude <= limit
-    if not grip:
-        dt = [d * limit / magnitude for d in dt]
-    dspin = _cross(normal, dt)
-    velocity = tuple(
-        vr + ui - (1.0 + en) * un * ni + di for vr, ui, ni, di in zip(racket, u, normal, dt)
-    )
-    spin_out = tuple(wi - ds / (_SPIN_ALPHA * radius) for wi, ds in zip(spin, dspin))
-    return velocity, spin_out, grip
-
-
-def _topspin_plan(
-    plan_id: str = "throw42", revision: int = 3, *, five_axis: bool = True, racket_vz: float = 5.0
-) -> dict:
-    """上旋方案（bot_center return_topspin_racket_vz_mps>0）：几何同零旋夹具，拍头竖直速度 racket_vz；
-    来球按弹地后滚动上旋 ω = (ẑ×v_h)/R；kt 写等效 1−c、spin_c 写 c（hit_plan_codec.cpp 同式）。"""
-    plan = _five_axis_plan(plan_id, revision) if five_axis else _plan(plan_id, revision)
-    radius = plan["tennis_ball_radius_m"]
-    spin_c = _SPIN_ALPHA * (1.0 + _SPIN_EX) / (1.0 + _SPIN_ALPHA)
-    incoming = tuple(plan[f"incoming_v{axis}"] for axis in "xyz")
-    spin_in = (-incoming[1] / radius, incoming[0] / radius, 0.0)
-    racket = (plan["racket_contact_vx"], plan["racket_contact_vy"], racket_vz)
-    normal = tuple(plan[f"face_normal_n{axis}"] for axis in "xyz")
-    outgoing, spin_out, grip = _cross_collide(
-        incoming, spin_in, racket, normal, plan["collision_en"], radius
-    )
-    assert grip
-    shape = "five_axis" if five_axis else "arm_center"
-    plan.update(
-        model_fingerprint=f"world3d_topspin_v1_{shape}_sweetspot:718619524b4bab8b",
-        collision_model="spin_cross_v1",
-        spin_c=spin_c,
-        collision_kt=1.0 - spin_c,
-        racket_contact_vz=racket_vz,
-        incoming_spin_wx=spin_in[0], incoming_spin_wy=spin_in[1], incoming_spin_wz=spin_in[2],
-        outgoing_spin_wx=spin_out[0], outgoing_spin_wy=spin_out[1], outgoing_spin_wz=spin_out[2],
-        outgoing_vx=outgoing[0], outgoing_vy=outgoing[1], outgoing_vz=outgoing[2],
-    )
-    return plan
-
-
-@pytest.mark.parametrize("five_axis", [True, False])
-def test_rk_extractor_accepts_topspin_plan(five_axis):
-    plan = _topspin_plan(five_axis=five_axis)
-    mapped = _report_prediction_payload(plan)
-    assert mapped is not None
-    assert [mapped[k] for k in ("rel_x", "rel_y", "rel_z")] == pytest.approx(
-        [plan["contact_rel_x"], plan["contact_rel_y"], plan["contact_rel_z"]]
-    )
-    assert mapped["spin_c"] == plan["spin_c"]
-
-
-def test_zero_spin_reconciliation_cannot_pass_a_topspin_plan():
-    # 去掉旋转字段按零旋对账就对不上（旋转项量级 m/s）：夹具确实用到了旋转碰撞，不是零旋换个指纹
-    plan = _topspin_plan()
-    normal = tuple(plan[f"face_normal_n{axis}"] for axis in "xyz")
-    spin_in = tuple(plan[f"incoming_spin_w{axis}"] for axis in "xyz")
-    transfer = [plan["spin_c"] * plan["tennis_ball_radius_m"] * v for v in _cross(spin_in, normal)]
-    assert math.sqrt(sum(v * v for v in transfer)) > 1.0
-    for key in _SPIN_FIELDS:
-        del plan[key]
-    plan["model_fingerprint"] = "world3d_effective_v3_five_axis_sweetspot:718619524b4bab8b"
-    assert _report_prediction_payload(plan) is None
-
-
-def test_zero_spin_plan_must_not_carry_a_collision_model():
-    plan = _five_axis_plan()
-    plan["collision_model"] = "spin_cross_v1"
-    assert _report_prediction_payload(plan) is None
-
-
-@pytest.mark.parametrize(
-    "mutate",
-    [
-        lambda p: p.pop("collision_model"),
-        lambda p: p.update(collision_model="spin_cross_v2"),
-        lambda p: p.update(spin_c=0.0),
-        lambda p: p.update(spin_c=1.0),
-        lambda p: p.pop("incoming_spin_wz"),
-        lambda p: p.update(outgoing_spin_wx=float("nan")),
-        # 旋转项对不上：来球转速差 1 rad/s ⇒ 出球差 spin_c·R ≈ 0.013 m/s
-        lambda p: p.update(incoming_spin_wx=p["incoming_spin_wx"] + 1.0),
-        lambda p: p.update(outgoing_vz=p["outgoing_vz"] + 0.001),
-        # 上旋方案贴零旋指纹：零旋方案不得带 collision_model
-        lambda p: p.update(
-            model_fingerprint="world3d_effective_v3_five_axis_sweetspot:718619524b4bab8b"),
-        lambda p: p.update(model_fingerprint="world3d_topspin_v2_five_axis_sweetspot:718619524b4bab8b"),
-    ],
-)
-def test_rk_extractor_rejects_invalid_topspin_plan(mutate):
-    plan = _topspin_plan()
-    mutate(plan)
-    assert _report_prediction_payload(plan) is None
-
-
-@pytest.mark.skipif(NODE is None, reason="node not on PATH")
-def test_report_accepts_topspin_plan_and_matches_ack(tmp_path):
-    good = _topspin_plan("tsgood", 1)
-    no_model = _topspin_plan("no-model", 1)
-    del no_model["collision_model"]
-    bad_spin = _topspin_plan("bad-spin", 1)
-    bad_spin["incoming_spin_wx"] += 1.0
-    flat_with_model = {**_five_axis_plan("flat-model", 1), "collision_model": "spin_cross_v1"}
+def test_plan_audit_flags_a_status_the_verdict_cannot_explain():
+    ap, _, arm_plan = _production()
+    # 当前臂契约不收的方案（缺字段），录包里臂却说 accepted ⇒ 不一致，两边原文都留下
+    broken = arm_plan("v05", plan_id="broken", landing_x=None)
     events = [
-        {"t": 0.0, "topic": "/predict_hit_pos", "text": json.dumps(good)},
-        {"t": 0.01, "topic": "/predict_hit_pos", "text": json.dumps(no_model)},
-        {"t": 0.02, "topic": "/predict_hit_pos", "text": json.dumps(bad_spin)},
-        {"t": 0.03, "topic": "/predict_hit_pos", "text": json.dumps(flat_with_model)},
-        {"t": 0.05, "topic": "/tennis/status", "text":
-         f"accepted hit x={good['arm_target_rel_x']:.4f} z={good['arm_target_rel_z']:.4f} "
-         "duration=0.5500 plan_id=tsgood revision=1 contact_ht=100.600000 solve_ms=1.380"},
+        {"t": 100.01, "topic": "/predict_hit_pos", "text": json.dumps(broken)},
+        _status(100.05, "accepted hit x=1.0000 z=0.8127 duration=0.4500" + _ident("broken")),
     ]
-    result = _run_plan_parse(tmp_path, events)
-    assert result["plans"] == ["tsgood"]
-    assert result["acks"] == ["tsgood"]
-    assert result["ackErrors"] == []
-    errors = result["contractErrors"]
-    assert len(errors) == 3
-    assert any("no-model#1" in e and "collision_model与指纹不符" in e for e in errors)
-    assert any("bad-spin#1" in e and "碰撞前向复算一致性" in e for e in errors)
-    assert any("flat-model#1" in e and "collision_model与指纹不符" in e for e in errors)
-
-
-# 五轴上旋 v2（2026-10-09 起 v05 生产）：甜点对准冲量质心 = 球心 − R·n（含仰角）+ τ·v_切，载荷带 contact_slide_sec。
-# 夹具在 v1 五轴上旋夹具上保持甜点 / 拍速 / 法向 / 出球不动，反推球心 = 甜点 + R·n − τ·v_切（v_切 只依赖来球、拍速、法向）。
-_SLIDE_TAU = 0.00244
-
-
-def _topspin_v2_plan(plan_id: str = "throw42", revision: int = 3) -> dict:
-    plan = _topspin_plan(plan_id, revision, five_axis=True)
-    radius = plan["tennis_ball_radius_m"]
-    normal = tuple(plan[f"face_normal_n{axis}"] for axis in "xyz")
-    rel = tuple(plan[f"incoming_v{axis}"] - plan[f"racket_contact_v{axis}"] for axis in "xyz")
-    along = sum(r * n for r, n in zip(rel, normal))
-    sweet = (
-        plan["arm_target_rel_x"] - plan["arm_target_x_bias_m"],
-        plan["arm_target_rel_y"],
-        plan["arm_target_rel_z"] - plan["arm_target_z_bias_m"],
-    )
-    contact = tuple(s + radius * n - _SLIDE_TAU * (r - along * n) for s, n, r in zip(sweet, normal, rel))
-    plan.update(
-        model_fingerprint="world3d_topspin_v2_five_axis_sweetspot:718619524b4bab8b",
-        contact_slide_sec=_SLIDE_TAU,
-        contact_rel_x=contact[0], contact_rel_y=contact[1], contact_rel_z=contact[2],
-        contact_x=plan["arm_center_x"] + contact[0], contact_y=plan["arm_center_y"] + contact[1],
-        contact_z=contact[2],
-    )
-    return plan
-
-
-def test_topspin_v2_fixture_moves_the_ball_centre_off_the_old_sweet_spot():
-    plan = _topspin_v2_plan()
-    # 上旋往上刷：甜点比球心低 R·sinθ 加下滑，旧口径（甜点高 = 球心高）对不上
-    assert plan["contact_rel_z"] - (plan["arm_target_rel_z"] - plan["arm_target_z_bias_m"]) > 0.005
-
-
-def test_rk_extractor_accepts_topspin_v2_plan():
-    plan = _topspin_v2_plan()
-    mapped = _report_prediction_payload(plan)
-    assert mapped is not None
-    assert [mapped[k] for k in ("rel_x", "rel_y", "rel_z")] == pytest.approx(
-        [plan["contact_rel_x"], plan["contact_rel_y"], plan["contact_rel_z"]]
-    )
-
-
-@pytest.mark.parametrize(
-    "mutate",
-    [
-        lambda p: p.pop("contact_slide_sec"),
-        lambda p: p.update(contact_slide_sec=0.0),
-        lambda p: p.update(contact_slide_sec=0.02),
-        # τ 差 1 ms：甜点差 ~4 mm，超出对账容差
-        lambda p: p.update(contact_slide_sec=_SLIDE_TAU + 0.001),
-        # 按 v1 口径给的甜点（球心 = 甜点 + 水平 R 法向）贴 v2 指纹
-        lambda p: p.update({k: v for k, v in _topspin_plan(five_axis=True).items() if k.startswith("contact_")}),
-    ],
-)
-def test_rk_extractor_rejects_invalid_topspin_v2_plan(mutate):
-    plan = _topspin_v2_plan()
-    mutate(plan)
-    assert _report_prediction_payload(plan) is None
-
-
-@pytest.mark.skipif(NODE is None, reason="node not on PATH")
-def test_report_accepts_topspin_v2_plan_and_matches_ack(tmp_path):
-    good = _topspin_v2_plan("v2good", 1)
-    old_geometry = {
-        **_topspin_plan("v2-old-geometry", 1, five_axis=True),
-        "model_fingerprint": "world3d_topspin_v2_five_axis_sweetspot:718619524b4bab8b",
-        "contact_slide_sec": _SLIDE_TAU,
-    }
-    no_tau = _topspin_v2_plan("v2-no-tau", 1)
-    del no_tau["contact_slide_sec"]
-    events = [
-        {"t": 0.0, "topic": "/predict_hit_pos", "text": json.dumps(good)},
-        {"t": 0.01, "topic": "/predict_hit_pos", "text": json.dumps(old_geometry)},
-        {"t": 0.02, "topic": "/predict_hit_pos", "text": json.dumps(no_tau)},
-        {"t": 0.05, "topic": "/tennis/status", "text":
-         f"accepted hit x={good['arm_target_rel_x']:.4f} z={good['arm_target_rel_z']:.4f} "
-         "duration=0.5500 plan_id=v2good revision=1 contact_ht=100.600000 solve_ms=1.380"},
-    ]
-    result = _run_plan_parse(tmp_path, events)
-    assert result["plans"] == ["v2good"]
-    assert result["acks"] == ["v2good"]
-    assert result["ackErrors"] == []
-    errors = result["contractErrors"]
-    assert len(errors) == 2
-    assert any("v2-old-geometry#1" in e and "球心→拍心执行点一致性" in e for e in errors)
-    assert any("v2-no-tau#1" in e and "contact_slide_sec" in e for e in errors)
+    audit = ap.plan_audit({"events": events}, "v05")
+    check = events[0]["check"]
+    assert check["verdict"] == "rejected"
+    assert check["text"] == "error hit_pos: json: missing key landing_x" + _ident("broken")
+    assert audit["arm_status_vs_verdict"]["disagree"] == 1
+    assert audit["disagreements"][0]["arm"].startswith("accepted hit")
+    assert audit["disagreements"][0]["verdict_text"] == check["text"]

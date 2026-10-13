@@ -318,16 +318,14 @@ class CameraWorker:
         self.snapshot_bgr: Optional[np.ndarray] = None
         # 识别用
         rbm = geometry.load_test_src("racket_ht_black_marker")
-        eab = geometry.load_test_src("extract_arm_bag")
         self.car = str(spec["car"])
-        self.fk = eab.fk
         self.z_offset = geometry.marker_z_offset_m(self.car)
         self.camera = rbm._load_cameras(Path(spec["calib_path"]), list(spec["all_serials"]))[self.serial]
         vehicle = geometry.load_vehicle_reference(Path(spec["vehicle_path"]))
         self.tag_corners = geometry.tag_corners_car(vehicle, 1.0)
         self.tag_ids = set(self.tag_corners)
         self.full_tag_detector = make_tag_detector(full_frame=True)
-        self.joints = JointBuffer(eab.CAR_MODELS[self.car].slot_joint_names)
+        self.joints = JointBuffer(geometry.slot_joint_names(self.car))
         self.radius = int(spec["crop_radius_px"])
         self.tag_avg = TagWindowAverager(int(spec["tag_every_frames"]))
         self.tag_pad = float(spec["tag_window_pad_px"])
@@ -733,7 +731,7 @@ class CameraWorker:
                 status = "no_joint_state"
                 stats["no_joint_state"] += 1
             else:
-                marker = self.fk(q, car=self.car)["marker"]
+                marker = geometry.marker_points_car(q, self.car)[0]
                 anchor_m = geometry.car_to_world(marker, pose, self.z_offset)[0]
                 anchor_mm = [round(float(v) * 1000.0, 1) for v in anchor_m]
                 anchor_uv = geometry.project_m(self.camera, anchor_m)[0]

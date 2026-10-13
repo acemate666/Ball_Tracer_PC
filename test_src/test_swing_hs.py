@@ -21,7 +21,9 @@ from swing_hs.camera_proc import (  # noqa: E402
     tag_windows,
 )
 from swing_hs.joints import JointBuffer  # noqa: E402
-from swing_hs.marker_solver import FastMarkerSolver, MarkerFusion, SessionOffset  # noqa: E402
+from swing_hs.marker_solver import (  # noqa: E402
+    OFFSET_INLIER_MM, OFFSET_MIN_INLIERS, FastMarkerSolver, MarkerFusion, SessionOffset, session_marker_offset,
+)
 from swing_hs.run_swing_hs import (  # noqa: E402
     CarPose, SeqReorder, SlotAssembler, merge_detect_stats, pc_car_loc_payload, pose_from_tag_lists, video_every_slots,
 )
@@ -269,6 +271,34 @@ def test_session_offset_rejects_outliers():
         so.add(np.array([90.0, 80.0, 70.0]))
     assert so.value is not None
     assert np.linalg.norm(so.value - np.array([3.0, -2.0, -18.0])) < 2.0
+
+
+def test_session_marker_offset_is_the_inlier_median():
+    rng = np.random.default_rng(7)
+    truth = np.array([6.0, 9.0, -50.0])
+    inliers = [truth + rng.normal(0.0, [5.0, 15.0, 5.0]) for _ in range(20)]
+    # 拍框/背景假点：离真值 60–150 mm（0929 v05 实场 14 个假点的量级）
+    outliers = [truth + np.array(v) for v in (
+        [30, -40, 80], [-35, 5, 95], [-110, 20, 60], [40, -10, 50],
+        [-5, 110, -120], [30, 20, 130], [-60, -40, 10], [45, -50, 65],
+    )]
+    offset, count = session_marker_offset(inliers + outliers)
+    assert count == 20
+    assert offset == pytest.approx(np.median(np.array(inliers), axis=0))
+    assert np.linalg.norm(offset - truth) < 10.0
+
+
+def test_session_marker_offset_refuses_weak_or_minority_clusters():
+    truth = np.array([6.0, 9.0, -50.0])
+    few = [truth + np.array([k, 0.0, 0.0]) for k in range(OFFSET_MIN_INLIERS - 1)]
+    assert session_marker_offset(few) is None
+    # 聚成一团的不过半：宁可不挪锚，也不拿假点定锚
+    cluster = [truth + np.array([k, 0.0, 0.0]) for k in range(OFFSET_MIN_INLIERS)]
+    scattered = [
+        truth + (3.0 * OFFSET_INLIER_MM) * np.array([np.cos(a), np.sin(a), 0.5])
+        for a in np.linspace(0.0, 2.0 * np.pi, OFFSET_MIN_INLIERS + 1, endpoint=False)
+    ]
+    assert session_marker_offset(cluster + scattered) is None
 
 
 # ── 车位 ──

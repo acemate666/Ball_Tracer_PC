@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import re
 from pathlib import Path
 
 
@@ -34,22 +33,9 @@ CONFIG_TOPICS = {
 }
 
 _TENNIS_BALL_RADIUS_M = 0.033
-# 指纹前缀 = bot_center return_hit_model.hpp 的 kContract / kContractFiveAxis：六轴臂甜点在
-# 「过臂中心、垂直拍面法向」的线上；五轴臂（v05，没有腕转）甜点绕 J1 偏 φ'，挥拍方向随之转。
-# 上旋方案（world3d_topspin_v1_*，bot_center return_topspin_racket_vz_mps>0）几何同上，碰撞换旋转模型
-# spin_cross_v1：出球 = 零旋等效（en, kt）出球 + spin_c·R·(ω_in×n)（臂 control/spin_ball.hpp，臂端同式对账）。
-# 五轴上旋 v2（2026-10-09 起的 v05 生产方案）：甜点对准冲量质心 = 球心 − R·n（含仰角）+ τ·v_切，载荷多 contact_slide_sec（τ）。
-_FINAL_HIT_PLAN_FINGERPRINT_RE = re.compile(
-    r"world3d_((effective_v3|topspin_v1)_(arm_center|five_axis)|topspin_v2_five_axis)_sweetspot:[0-9a-f]{16}\Z"
-)
-_FINAL_HIT_PLAN_FIVE_AXIS_RE = re.compile(r"world3d_(effective_v3|topspin_v1|topspin_v2)_five_axis_sweetspot:")
-_FINAL_HIT_PLAN_SPIN_PREFIX = ("world3d_topspin_v1_", "world3d_topspin_v2_")
-_FINAL_HIT_PLAN_CENTROID_PREFIX = "world3d_topspin_v2_"
-_FINAL_HIT_PLAN_SPIN_FIELDS = (
-    "spin_c",
-    "incoming_spin_wx", "incoming_spin_wy", "incoming_spin_wz",
-    "outgoing_spin_wx", "outgoing_spin_wy", "outgoing_spin_wz",
-)
+# final_hit_plan 收不收不在这里判：抽取在 ROS2 解释器里跑、调不了臂的 C 接口库，契约 / 臂标定指纹 / 击球侧由报告生成时
+# 用臂生产代码（test_src/arm_production.py → node::receive_hit_pos）逐条判、与臂自己的 /tennis/status 对账。这里只把 bot 发出的
+# 每条方案原样映射进预测序列（缺的字段为 None）；带 plan_status 的是 bot 的求解失败报告（没有触球点），不是预测，不进序列。
 _GRAVITY_MPS2 = 9.8
 _STAGE1_LAMBDA_MIN = 0.02
 _STAGE1_LAMBDA_MAX = 0.40
@@ -61,148 +47,6 @@ def _finite(value) -> bool:
         and not isinstance(value, bool)
         and math.isfinite(value)
     )
-
-
-def _valid_final_hit_plan_physics(payload: dict) -> bool:
-    """Verify the redundant world-frame fields in FinalHitPlan/v1."""
-    tolerance = 1e-4
-    normal_tolerance = 1e-5
-    yaw = payload["face_normal_yaw_world"]
-    pitch = payload["face_pitch"]
-    horizontal_normal = (-math.sin(yaw), math.cos(yaw))
-    five_axis = _FINAL_HIT_PLAN_FIVE_AXIS_RE.match(payload["model_fingerprint"]) is not None
-
-    relative_error = math.sqrt(
-        (payload["contact_x"] - payload["arm_center_x"] - payload["contact_rel_x"]) ** 2
-        + (payload["contact_y"] - payload["arm_center_y"] - payload["contact_rel_y"]) ** 2
-        + (payload["contact_z"] - payload["contact_rel_z"]) ** 2
-    )
-    if relative_error > tolerance:
-        return False
-
-    offset_x = -payload["arm_forward_offset_m"] * math.sin(payload["car_yaw_at_ht"])
-    offset_y = payload["arm_forward_offset_m"] * math.cos(payload["car_yaw_at_ht"])
-    arm_position_error = math.hypot(
-        payload["arm_center_x"] - payload["car_center_x"] - offset_x,
-        payload["arm_center_y"] - payload["car_center_y"] - offset_y,
-    )
-    arm_velocity_error = math.hypot(
-        payload["arm_center_vx"]
-        - payload["car_center_vx"]
-        + payload["car_yaw_rate_at_ht"] * offset_y,
-        payload["arm_center_vy"]
-        - payload["car_center_vy"]
-        - payload["car_yaw_rate_at_ht"] * offset_x,
-    )
-    if arm_position_error > tolerance or arm_velocity_error > tolerance:
-        return False
-
-    # 水平触球平面只对六轴成立（拍面过臂中心）；五轴拍面离臂中心 along·tan φ'，
-    # 这层几何由下面的挥拍切向一并校验（φ' 取自臂的 face table，报告端不复算）。
-    if not five_axis:
-        contact_plane = (
-            horizontal_normal[0] * payload["contact_rel_x"]
-            + horizontal_normal[1] * payload["contact_rel_y"]
-        )
-        if abs(contact_plane - payload["tennis_ball_radius_m"]) > tolerance:
-            return False
-
-    # 甜点：旧口径 = 球心沿水平拍面法向退 R、高度 = 球心高；v2 冲量质心 = 球心 − R·n（含仰角）+ τ·v_切
-    # （v_切 = 来球相对拍速度去掉法向分量；bot_center return_hit_model.cpp physical_sweet_spot_relative 同式）。
-    radius = payload["tennis_ball_radius_m"]
-    contact = tuple(payload[f"contact_rel_{axis}"] for axis in "xyz")
-    sweet = (
-        contact[0] - radius * horizontal_normal[0],
-        contact[1] - radius * horizontal_normal[1],
-        contact[2],
-    )
-    if payload["model_fingerprint"].startswith(_FINAL_HIT_PLAN_CENTROID_PREFIX):
-        n = tuple(payload[f"face_normal_n{axis}"] for axis in "xyz")
-        rel = tuple(payload[f"incoming_v{axis}"] - payload[f"racket_contact_v{axis}"] for axis in "xyz")
-        along = sum(a * b for a, b in zip(rel, n))
-        tau = payload["contact_slide_sec"]
-        sweet = tuple(c - radius * ni + tau * (r - along * ni) for c, ni, r in zip(contact, n, rel))
-    target_error = math.sqrt(
-        (payload["arm_target_rel_x"] - sweet[0] - payload["arm_target_x_bias_m"]) ** 2
-        + (payload["arm_target_rel_y"] - sweet[1]) ** 2
-        + (payload["arm_target_rel_z"] - sweet[2] - payload["arm_target_z_bias_m"]) ** 2
-    )
-    if target_error > tolerance:
-        return False
-
-    expected_normal = (
-        horizontal_normal[0] * math.cos(pitch),
-        horizontal_normal[1] * math.cos(pitch),
-        math.sin(pitch),
-    )
-    normal_error = math.sqrt(
-        sum(
-            (payload[key] - expected) ** 2
-            for key, expected in zip(
-                ("face_normal_nx", "face_normal_ny", "face_normal_nz"),
-                expected_normal,
-            )
-        )
-    )
-    if normal_error > normal_tolerance:
-        return False
-
-    # 拍心世界水平速度 = 臂中心速度 + ω×甜点 + 补偿拍速 × 挥拍方向。挥拍方向 = 甜点绕 J1 的切向：
-    # 六轴即拍面水平法向；五轴 = ẑ×t̂（t = 臂中心→甜点水平向量，= 法向再转 φ'，bot_center
-    # solve_fixed_apex），且甜点须在 J1 前侧（along>0 ⇔ 切向与法向夹角 <90°；另一侧是镜像根）。
-    swing = horizontal_normal
-    if five_axis:
-        target_radius = math.hypot(payload["arm_target_rel_x"], payload["arm_target_rel_y"])
-        if not target_radius > 0:
-            return False
-        swing = (
-            -payload["arm_target_rel_y"] / target_radius,
-            payload["arm_target_rel_x"] / target_radius,
-        )
-        if swing[0] * horizontal_normal[0] + swing[1] * horizontal_normal[1] <= 0:
-            return False
-    expected_racket_xy = (
-        payload["arm_center_vx"]
-        - payload["car_yaw_rate_at_ht"] * payload["arm_target_rel_y"]
-        + payload["compensated_speed"] * swing[0],
-        payload["arm_center_vy"]
-        + payload["car_yaw_rate_at_ht"] * payload["arm_target_rel_x"]
-        + payload["compensated_speed"] * swing[1],
-    )
-    if math.hypot(
-        payload["racket_contact_vx"] - expected_racket_xy[0],
-        payload["racket_contact_vy"] - expected_racket_xy[1],
-    ) > tolerance:
-        return False
-
-    incoming = tuple(payload[f"incoming_v{axis}"] for axis in "xyz")
-    racket = tuple(payload[f"racket_contact_v{axis}"] for axis in "xyz")
-    normal = tuple(payload[f"face_normal_n{axis}"] for axis in "xyz")
-    relative = tuple(vin - vr for vin, vr in zip(incoming, racket))
-    relative_normal = sum(value * axis for value, axis in zip(relative, normal))
-    # 上旋加旋转项 spin_c·R·(ω_in×n)：咬合未打滑时与 Cross 模型逐式相等（spin_ball.hpp::spin_transfer）
-    transfer = (0.0, 0.0, 0.0)
-    if payload["model_fingerprint"].startswith(_FINAL_HIT_PLAN_SPIN_PREFIX):
-        k = payload["spin_c"] * payload["tennis_ball_radius_m"]
-        w = tuple(payload[f"incoming_spin_w{axis}"] for axis in "xyz")
-        transfer = (
-            k * (w[1] * normal[2] - w[2] * normal[1]),
-            k * (w[2] * normal[0] - w[0] * normal[2]),
-            k * (w[0] * normal[1] - w[1] * normal[0]),
-        )
-    replay = tuple(
-        vr
-        + payload["collision_kt"] * (value - relative_normal * axis)
-        - payload["collision_en"] * relative_normal * axis
-        + extra
-        for vr, value, axis, extra in zip(racket, relative, normal, transfer)
-    )
-    return math.sqrt(
-        sum(
-            (payload[f"outgoing_v{axis}"] - expected) ** 2
-            for axis, expected in zip("xyz", replay)
-        )
-    ) <= tolerance
 
 
 def _topic_key(topic: str) -> str:
@@ -221,94 +65,39 @@ def _payload_time(topic: str, payload: dict) -> float | None:
 
 
 def _report_prediction_payload(payload: dict) -> dict | None:
-    """Map a valid FinalHitPlan onto the historical prediction series.
+    """Map a FinalHitPlan onto the historical prediction series (raw, unjudged).
 
     Pre-aim hints are intentionally absent: they are iteration seeds and must
-    never become a report FinalHT candidate.  A declared new kind is either a
-    valid v1 plan or rejected; legacy field fallback is only for messages with
-    no kind at all.
+    never become a report FinalHT candidate.  Bot solve-failure reports
+    (``plan_status``) carry no contact point and are not predictions.  Whether
+    the arm would accept a plan is decided at report time by the arm's own
+    production code (test_src/arm_production.py); legacy field fallback is only
+    for messages with no kind at all.
     """
     kind = payload.get("kind")
     if kind is None:
         return payload
-    if kind != "final_hit_plan" or payload.get("contract") != "final_hit_plan/v1":
+    if kind != "final_hit_plan" or "plan_status" in payload:
         return None
-    required = (
-        "source_ct", "generated_at", "contact_ht", "n_points",
-        "contact_x", "contact_y", "contact_z",
-        "contact_rel_x", "contact_rel_y", "contact_rel_z",
-        "arm_target_rel_x", "arm_target_rel_y", "arm_target_rel_z",
-        "incoming_vx", "incoming_vy", "incoming_vz",
-        "arm_center_x", "arm_center_y", "arm_center_vx", "arm_center_vy",
-        "car_center_x", "car_center_y", "car_center_vx", "car_center_vy",
-        "arm_forward_offset_m", "tennis_ball_radius_m",
-        "arm_target_x_bias_m", "arm_target_z_bias_m",
-        "car_yaw_at_ht", "car_yaw_rate_at_ht",
-        "face_normal_yaw_world", "face_pitch",
-        "face_normal_nx", "face_normal_ny", "face_normal_nz",
-        "compensated_speed",
-        "racket_contact_vx", "racket_contact_vy", "racket_contact_vz",
-        "outgoing_vx", "outgoing_vy", "outgoing_vz",
-        "landing_x", "landing_y", "apex_z_world", "net_clearance_m",
-        "collision_en", "collision_kt", "solve_iterations", "solve_ms",
-    )
-    if (
-        not all(_finite(payload.get(key)) for key in required)
-        or not isinstance(payload.get("plan_id"), str)
-        or not payload["plan_id"]
-        or not isinstance(payload.get("model_fingerprint"), str)
-        or _FINAL_HIT_PLAN_FINGERPRINT_RE.fullmatch(payload["model_fingerprint"]) is None
-        or not isinstance(payload.get("revision"), int)
-        or isinstance(payload["revision"], bool)
-        or payload["revision"] < 1
-        or not isinstance(payload.get("n_points"), int)
-        or isinstance(payload["n_points"], bool)
-        or payload["n_points"] < 1
-        or not isinstance(payload.get("solve_iterations"), int)
-        or isinstance(payload["solve_iterations"], bool)
-        or not 1 <= payload["solve_iterations"] <= 4
-        or not payload["source_ct"] <= payload["generated_at"] < payload["contact_ht"]
-        or payload["solve_ms"] < 0
-        or payload["arm_forward_offset_m"] < 0
-        or payload["tennis_ball_radius_m"] <= 0
-        or payload["compensated_speed"] <= 0
-        or payload["collision_en"] < 0
-        or payload["collision_kt"] < 0
-    ):
-        return None
-    # 臂端同口径（arm_controller node/messages.hpp）：上旋指纹必须带 collision_model=spin_cross_v1，零旋指纹不得带
-    spin_model = payload["model_fingerprint"].startswith(_FINAL_HIT_PLAN_SPIN_PREFIX)
-    if spin_model != ("collision_model" in payload):
-        return None
-    if spin_model and (
-        payload["collision_model"] != "spin_cross_v1"
-        or not all(_finite(payload.get(key)) for key in _FINAL_HIT_PLAN_SPIN_FIELDS)
-        or not 0.0 < payload["spin_c"] < 1.0
-    ):
-        return None
-    if payload["model_fingerprint"].startswith(_FINAL_HIT_PLAN_CENTROID_PREFIX) and not (
-        _finite(payload.get("contact_slide_sec")) and 0.0 < payload["contact_slide_sec"] <= 0.01
-    ):
-        return None
-    if not _valid_final_hit_plan_physics(payload):
-        return None
+    get = payload.get
+    contact_ht, source_ct = get("contact_ht"), get("source_ct")
     return {
         **payload,
-        "ct": payload["source_ct"],
-        "ht": payload["contact_ht"],
-        "x": payload["contact_x"],
-        "y": payload["contact_y"],
-        "z": payload["contact_z"],
-        "rel_x": payload["contact_rel_x"],
-        "rel_y": payload["contact_rel_y"],
-        "rel_z": payload["contact_rel_z"],
+        "ct": source_ct,
+        "ht": contact_ht,
+        "x": get("contact_x"),
+        "y": get("contact_y"),
+        "z": get("contact_z"),
+        "rel_x": get("contact_rel_x"),
+        "rel_y": get("contact_rel_y"),
+        "rel_z": get("contact_rel_z"),
         "stage": 1,
-        "duration": payload["contact_ht"] - payload["source_ct"],
-        "car_pred_x": payload["car_center_x"],
-        "car_pred_y": payload["car_center_y"],
-        "arm_pred_x": payload["arm_center_x"],
-        "arm_pred_y": payload["arm_center_y"],
-        "n_bounce_fit": payload["n_points"],
+        "duration": contact_ht - source_ct if _finite(contact_ht) and _finite(source_ct) else None,
+        "car_pred_x": get("car_center_x"),
+        "car_pred_y": get("car_center_y"),
+        "arm_pred_x": get("arm_center_x"),
+        "arm_pred_y": get("arm_center_y"),
+        "n_bounce_fit": get("n_points"),
     }
 
 

@@ -582,7 +582,7 @@ def main() -> int:
             handle_control(kind, who, payload)
 
     ros: Optional[RosSide] = None
-    main_joints = JointBuffer(geometry.load_test_src("extract_arm_bag").CAR_MODELS[args.car].slot_joint_names)
+    main_joints = JointBuffer(geometry.slot_joint_names(args.car))
     marker_writer = car_writer = None
     t_record: Optional[float] = None
     interrupted = False

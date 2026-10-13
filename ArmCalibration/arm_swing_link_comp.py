@@ -4,9 +4,10 @@
 Why: to verify the J1 link (spring-twist) compensation of arm_controller_cpp against the four-camera
 black marker without a ball.  The tracker records the video + rosbag as usual; afterwards
     python test_src/extract_arm_bag.py ...          (arm json, now with /tennis/link_command)
-    python test_src/arm_swing_black_marker.py --session <s>
-    python test_src/analyze_arm_swing_marker.py --session <s>
 Run one session per configuration and compare: rule / RL  ×  --link-comp / --no-link-comp.
+(The v04 analysis scripts arm_swing_black_marker.py / analyze_arm_swing_marker.py were removed 2026-10-13: their
+FK can no longer be computed by the arm's production code — the endpoint model covers the five-axis arm only and v04
+recordings have no registered joint-zero frame.  Retrieve them from git history if v04 is ever revived.)
 
 RK side (operator):  bash scripts/run_arm_cpp_ready.sh --car v04 [--rl] [--link-comp|--no-link-comp]
                      (bot_center should be running too: the tracker's PC/RK clock bridge listens to /bot_state)

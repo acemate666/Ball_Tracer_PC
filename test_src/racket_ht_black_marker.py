@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Measure the V04/V05 fixed black racket-centre marker around report final HTs.
+"""Measure the fixed black racket-centre marker around report final HTs.
 
 候选（黑方块 2D 位置）不再从半分辨率拼接录像里找：tracker 在线在全分辨率图上截小块找好、
 写进 <run>_racket_marker.json（src/racket_marker_online.py）；这里只用报告对时后的
-精确 FK 锚在这些候选里三角化、选点、做本场「黑标 − FK」偏差校正。
+模型黑标作锚在这些候选里三角化、选点。模型黑标 = 臂生产代码的端点动态模型（test_src/arm_production.py：
+/joint_states 实测关节 → 时延 / 柔度 / 间隙 / J1 力矩轴倾斜 → 黑标，与端点标定、RL 训练器同一份）。
+不再做本场「黑标 − FK」偏差校正（re-anchor）：端点模型本身就是拿黑标拟合的；视觉 − 模型的残差逐帧写进输出、
+按正 / 反手与离 HT 的时间窗汇总（model_residual），没解释的量单独列出来，不拿锚吸收。
 """
 
 from __future__ import annotations
@@ -44,35 +47,15 @@ TRAJ_NEIGHBOR_MAX_SIDE_S = 0.095
 TRAJ_EXTRAP_MAX_S = 0.062
 ARM_STATE_MAX_GAP_S = 0.1
 CAR_LOC_MAX_GAP_S = 0.5
-# 校正锚点（见 CarMarkerPolicy）：本场「黑标 − 同曝光 FK」车体系偏差 = 第一遍解的稳健中位数
-# （离初值 40 mm 内的算内点，≥8 个内点且过半才用）；重解按相机视线深度 / 横向分开设门——
-# 深度方向三角化噪声大（v05 真检出 y 散 ±57 mm），横向真检出 ≤25 mm、假点 47–82 mm。
-REANCHOR_MIN_INLIERS = 8
-REANCHOR_INLIER_MM = 40.0
-REANCHOR_MAX_LATERAL_MM = 35.0
-REANCHOR_MAX_DEPTH_MM = 80.0
-
-
-@dataclass(frozen=True)
-class CarMarkerPolicy:
-    """黑标解算里两车不同的两件事（v05 由 tracker_20260929_221737 逐帧目视 50 帧定）。
-
-    v05 四相机都在底线后、离拍 7–8.5 m、两两视线夹角 16–55°：黑方块在录像里只有 ~5 px，1 px
-    质心误差在留一三角化里就是 ~10 mm 深度，10 mm 的 LOO 门系统性刷掉真黑方块、反而放行
-    拍框/背景小暗点（50 个检出里 14 个假点）。且真黑标一贯比 FK 拍心低 ~50 mm（车体系中位
-    (+6, +9, −50) mm、z 离散 6 mm），按「离 FK 最近」排名会选中锚点附近的假点。
-    loo_max_mm=None：不设 LOO 毫米门，一致性由重投影 2.5 px + 留一回投 6 px 把关；
-    reanchor：第一遍解完后以「FK + 本场偏差」为锚、按视线深度/横向分开设门重解。
-    """
-
-    loo_max_mm: float | None
-    reanchor: bool
-
-
-CAR_MARKER_POLICY = {
-    "v04": CarMarkerPolicy(loo_max_mm=MARKER_MAX_LOO_MM, reanchor=False),
-    "v05": CarMarkerPolicy(loo_max_mm=None, reanchor=True),
-}
+# 模型黑标锚的门（v05 四相机都在底线后、离拍 7–8.5 m、两两视线夹角 16–55°，tracker_20260929_221737 逐帧目视 50 帧定）：
+# 深度方向三角化噪声大（真检出 y 散 ±57 mm），横向真检出 ≤25 mm、拍框 / 背景假点 47–82 mm ⇒ 沿相机平均视线的深度分量与
+# 垂直视线的横向分量分开限；黑方块只有 ~5 px，1 px 质心误差在留一三角化里就是 ~10 mm 深度，不设 LOO 毫米门（一致性由
+# 重投影 2.5 px + 留一回投 6 px 把关）。锚 = 端点动态模型黑标本身，不加本场偏差。
+ANCHOR_MAX_LATERAL_MM = 35.0
+ANCHOR_MAX_DEPTH_MM = 80.0
+MARKER_LOO_MAX_MM: float | None = None
+# 视觉 − 模型残差的汇总时间窗（相对报告 FinalHT，ms）
+RESIDUAL_WINDOWS_MS = ((-450.0, -100.0), (-100.0, -20.0), (-20.0, 20.0), (20.0, 120.0))
 
 
 @dataclass(frozen=True)
@@ -568,17 +551,20 @@ def _interpolate_yaw(rows: list[dict], target: float, max_gap_s: float) -> float
     return a + fraction * delta
 
 
-def arm_states_with_marker(arm: dict) -> list[dict]:
-    """arm JSON 的 states（按 t 排序、六关节齐全），每行补 marker = 黑标（视觉标定基准、实体拍面中心），按 arm["car"] 的
-    标准运动学从 position 现算。states[].tcp 是甜点（臂瞄准的点）：v0.5 2026-10-09 起在黑标往拍喉 2 cm，黑标测量用 marker。"""
-    import extract_arm_bag as eab
+def arm_states_with_marker(arm: dict, run: str) -> list[dict]:
+    """arm JSON 的 states（按 t 排序），每行带 marker（车体系黑标，x 右 y 前、原点 = J1 轴）与 marker_h（离地高）：
+    臂生产代码的端点动态模型现算（arm_production.endpoint_for_arm；就地写进 arm 的 states）。生产代码算不了这一场
+    （车型不在端点模型里、录包零位帧未登记、调度不认识……）抛 NothingToMeasure 带原因——不另用别的 FK 凑。"""
+    import arm_production as ap
+    from extract_arm_bag import car_for_session
 
-    car = str(arm.get("car", "")).lower()
-    rows = []
-    for row in arm.get("states", []):
-        q = row.get("position")
-        if _finite(row.get("t")) and isinstance(q, list) and len(q) == 6 and all(_finite(v) for v in q):
-            rows.append({**row, "marker": [float(v) for v in eab.fk(q, car=car)["marker"]]})
+    car, _ = car_for_session(arm)
+    try:
+        arm["endpoint"] = ap.endpoint_for_arm(arm, car, run)
+    except ap.Unavailable as exc:
+        raise NothingToMeasure(f"臂端点模型算不了本场黑标锚：{exc}") from exc
+    rows = [row for row in arm.get("states", [])
+            if _finite(row.get("t")) and isinstance(row.get("marker"), list) and _finite(row.get("marker_h"))]
     return sorted(rows, key=lambda row: float(row["t"]))
 
 
@@ -589,11 +575,11 @@ def _expected_world_mm(
     car_yaw_rows: list[dict],
     rk_t0: float,
     rk_to_pc_bias: float,
-    arm_z_offset_m: float,
 ) -> np.ndarray | None:
+    """模型黑标（端点动态模型）在世界系的位置（mm）：车位姿 + R(yaw)·黑标车体系 xy，z = 车 z + 黑标离地高。"""
     rk_absolute = rk_t0 + pc_elapsed - rk_to_pc_bias
     state = _interpolate(
-        arm_states, rk_absolute, "t", ("marker",), ARM_STATE_MAX_GAP_S
+        arm_states, rk_absolute, "t", ("marker", "marker_h"), ARM_STATE_MAX_GAP_S
     )
     car = _interpolate(
         car_pos_rows, pc_elapsed, "elapsed_s", ("x", "y", "z"), CAR_LOC_MAX_GAP_S
@@ -607,7 +593,7 @@ def _expected_world_mm(
         [
             cosine * local[0] - sine * local[1],
             sine * local[0] + cosine * local[1],
-            local[2] - arm_z_offset_m,
+            float(state["marker_h"]),
         ],
         dtype=np.float64,
     )
@@ -642,29 +628,41 @@ def _world_to_car(yaw: float, vector_mm: np.ndarray) -> np.ndarray:
     )
 
 
-def _session_marker_offset(
-    samples_car_mm: list[np.ndarray],
-) -> tuple[np.ndarray, int] | None:
-    """「黑标 − 同曝光 FK」车体系偏差的稳健中位数（mm）与内点数。
+def model_residual_summary(observations: list[dict]) -> dict:
+    """视觉黑标 − 模型黑标（端点动态模型）的车体系残差（mm，x 右 y 前 z 上）按击球侧 × 离 FinalHT 的时间窗汇总：
+    帧数、3D 距离中位 / rms、各分量中位（= 模型没解释的系统量）。只汇总有模型黑标与车 yaw 的观测。"""
+    groups: dict[str, dict] = {}
+    for side_name, side in (("forehand", 1), ("backhand", -1), ("unknown", None)):
+        for lo, hi in RESIDUAL_WINDOWS_MS:
+            rows = [
+                np.asarray(obs["residual_car_mm"], dtype=np.float64)
+                for obs in observations
+                if obs.get("residual_car_mm") is not None and obs.get("side") == side
+                and lo <= float(obs["dt_ht_ms"]) < hi
+            ]
+            if not rows:
+                continue
+            values = np.asarray(rows)
+            norms = np.linalg.norm(values, axis=1)
+            groups[f"{side_name} [{lo:+.0f},{hi:+.0f}) ms"] = {
+                "n": len(rows),
+                "median_3d_mm": round(float(np.median(norms)), 1),
+                "rms_3d_mm": round(float(np.sqrt(np.mean(norms ** 2))), 1),
+                "median_xyz_car_mm": [round(float(v), 1) for v in np.median(values, axis=0)],
+                "rms_xyz_car_mm": [round(float(v), 1) for v in np.sqrt(np.mean(values ** 2, axis=0))],
+            }
+    return {
+        "definition": "visual black marker − arm endpoint dynamic-model marker, car frame (x right, y forward, z up), mm",
+        "groups": groups,
+    }
 
-    以全体中位为初值，只留离它 REANCHOR_INLIER_MM 内的内点再取中位，迭代到内点集不变。
-    内点不足 REANCHOR_MIN_INLIERS 或不过半 → None（第一遍解本身不可信，不校正）。
-    """
-    if len(samples_car_mm) < REANCHOR_MIN_INLIERS:
-        return None
-    samples = np.asarray(samples_car_mm, dtype=np.float64)
-    center = np.median(samples, axis=0)
-    inliers: np.ndarray | None = None
-    for _ in range(10):
-        mask = np.linalg.norm(samples - center, axis=1) <= REANCHOR_INLIER_MM
-        count = int(mask.sum())
-        if count < REANCHOR_MIN_INLIERS or 2 * count <= len(samples):
-            return None
-        if inliers is not None and np.array_equal(mask, inliers):
-            break
-        inliers = mask
-        center = np.median(samples[mask], axis=0)
-    return center, int(inliers.sum())
+
+def residual_lines(residual: dict) -> list[str]:
+    return [
+        f"视觉 − 模型黑标 {name}: n={g['n']} 3D 中位 {g['median_3d_mm']:.1f} / rms {g['rms_3d_mm']:.1f} mm，"
+        f"分量中位 ({g['median_xyz_car_mm'][0]:+.1f}, {g['median_xyz_car_mm'][1]:+.1f}, {g['median_xyz_car_mm'][2]:+.1f}) mm"
+        for name, g in residual.get("groups", {}).items()
+    ]
 
 
 def _mean_view_dir(
@@ -825,14 +823,14 @@ def _measurement_context(
     arm_path: Path,
     rk_path: Path,
     tables_path: Path,
-) -> tuple[dict, dict, dict, list[str], float, float, float, list[dict]]:
+) -> tuple[dict, dict, dict, list[str], list[dict]]:
     tracker = _load_json(tracker_path)
     arm = _load_json(arm_path)
     rk = _load_json(rk_path)
     tables = _load_json(tables_path)
     config = tracker.get("config") or {}
-    # 锚点 = 车位姿 + R(yaw)·黑标 FK（z 减 zOff；arm_states_with_marker）。黑标 = 车型 yaml marker_x：v04 与甜点 tool_x 同点（0905），
-    # v05 1009 起甜点 = 黑标往拍喉 2 cm，arm JSON 的 tcp 不再是黑标。车定位原点都是 z=0 地面点（v05 即 J1 轴）。
+    # 锚点 = 车位姿 + R(yaw)·模型黑标（臂端点动态模型的车体系黑标，z = 它给的离地高；arm_states_with_marker）。
+    # 车定位原点都是 z=0 地面点（v05 即 J1 轴）。
     car = str(arm.get("car", "")).lower()
     if car not in ("v04", "v05") or car not in Path(
         str(config.get("car_config_path", ""))
@@ -885,10 +883,6 @@ def _measurement_context(
     rk_t0 = float(rk["t0"])
     if not _finite(contract.get("rkT0")) or abs(float(contract["rkT0"]) - rk_t0) > 1e-6:
         raise ValueError("report arm contract and RK sidecar use different t0")
-    calibration = contract.get("calibration") or {}
-    if not _finite(calibration.get("zOff")):
-        raise ValueError("report arm contract has no calibrated z offset")
-    z_offset = float(calibration["zOff"])
     targets = []
     for row in contract.get("rows", []):
         phase = row.get("zPhase") or {}
@@ -916,12 +910,14 @@ def _measurement_context(
                 "report_row": int(row["reportRow"]),
                 "final_ht_pc_elapsed_s": expected_sample,
                 "rk_to_pc_bias_s": baseline_bias + delta_s,
+                # 击球侧（臂 node::final_plan_side，报告按 FinalHitPlan 的生产判决写进合同）：+1 正手 / −1 反手 / None 未知
+                "side": row.get("side") if row.get("side") in (1, -1) else None,
             }
         )
     targets.sort(key=lambda row: row["final_ht_pc_elapsed_s"])
     if not targets:
         raise ValueError("report arm contract has no accepted final HT with usable zPhase")
-    return tracker, arm, rk, serials, z_offset, targets
+    return tracker, arm, rk, serials, targets
 
 
 def _online_candidates(frame: dict) -> dict[str, list[MarkerCandidate]]:
@@ -953,11 +949,9 @@ def measure(
         arm,
         rk,
         serials,
-        z_offset,
         targets,
     ) = _measurement_context(tracker_path, arm_path, rk_path, tables_path)
     car = str(arm["car"]).lower()
-    policy = CAR_MARKER_POLICY[car]
     config = tracker["config"]
     calibration_path = _session_path(config["calib_config_path"], tracker_path)
     cameras = _load_cameras(calibration_path, serials)
@@ -978,7 +972,7 @@ def measure(
         for row in tracker.get("frames", [])
         if isinstance(row, dict) and "idx" in row
     }
-    arm_states = arm_states_with_marker(arm)
+    arm_states = arm_states_with_marker(arm, tracker_path.stem)
     car_locs = sorted(
         [row for row in tracker.get("car_locs", []) if _finite(row.get("elapsed_s"))],
         key=lambda row: float(row["elapsed_s"]),
@@ -1036,12 +1030,10 @@ def measure(
                         car_yaw_rows,
                         rk_t0,
                         target["rk_to_pc_bias_s"],
-                        z_offset,
                     ),
                     "car_yaw": _interpolate_yaw(
                         car_yaw_rows, center_elapsed, CAR_LOC_MAX_GAP_S
                     ),
-                    "fk_anchor": None,
                     "candidates": _online_candidates(frame),
                     "accepted": None,
                 }
@@ -1052,13 +1044,14 @@ def measure(
         dt_ms = 1000.0 * (
             job["center_elapsed"] - job["target"]["final_ht_pc_elapsed_s"]
         )
-        # 报告把 expected_distance_mm 读作「距同曝光 FK」：校正锚点解也按原始 FK 算，
-        # 离校正锚点的距离另记 anchor_distance_mm。
-        corrected = anchor_name == "fk" and job["fk_anchor"] is not None
+        # expected_distance_mm = 距同曝光模型黑标（端点动态模型；traj 锚的解也按模型黑标算）；视觉 − 模型的车体系残差另记。
+        model = job["fk_expected"]
         expected_distance = (
-            float(np.linalg.norm(fit.point.xyz_mm - job["fk_expected"]))
-            if corrected
-            else fit.expected_distance_mm
+            float(np.linalg.norm(fit.point.xyz_mm - model)) if model is not None else None
+        )
+        residual_car = (
+            _world_to_car(job["car_yaw"], fit.point.xyz_mm - model)
+            if model is not None and job["car_yaw"] is not None else None
         )
         observation = {
             "x": float(fit.point.xyz_mm[0] / 1000.0),
@@ -1080,9 +1073,12 @@ def measure(
             "heldout_max_px": max(fit.loo_heldout_px.values()),
             "expected_distance_mm": expected_distance,
             "black_marker": True,
+            "side": job["target"]["side"],
         }
-        if corrected:
-            observation["anchor_distance_mm"] = fit.expected_distance_mm
+        if model is not None:
+            observation["model_marker_world"] = [round(float(v) / 1000.0, 5) for v in model]
+        if residual_car is not None:
+            observation["residual_car_mm"] = [round(float(v), 2) for v in residual_car]
         if dropped is not None:
             observation["dropped_serial"] = dropped
         job["accepted"] = observation
@@ -1107,74 +1103,20 @@ def measure(
         ]
         return sorted(fits, key=lambda item: item[0])
 
-    # Pass 1: solve every frame that has an FK anchor.
+    # Pass 1: solve every frame that has a model anchor (端点动态模型黑标；深度 / 横向分开设门，不加本场偏差).
     anchored = [job for job in jobs if job["fk_expected"] is not None]
     for job in anchored:
+        gate = AnchorGate(
+            _mean_view_dir(cameras, serials, job["fk_expected"]),
+            ANCHOR_MAX_LATERAL_MM,
+            ANCHOR_MAX_DEPTH_MM,
+        )
         solved = _attempt_solve(
             job["candidates"], cameras, serials, job["fk_expected"], None,
-            loo_max_mm=policy.loo_max_mm,
+            loo_max_mm=MARKER_LOO_MAX_MM, fk_gate=gate,
         )
         if solved is not None:
             accept(job, solved)
-
-    # Pass 1b（policy.reanchor）：第一遍解估本场「黑标 − FK」车体系偏差，以 FK+偏差为锚、
-    # 深度/横向分开设门全部重解（候选不变）。估不出偏差 = 第一遍本身不可信，整场不出观测，
-    # 不拿假点凑数。
-    if policy.reanchor:
-        samples = [
-            _world_to_car(
-                job["car_yaw"],
-                1000.0
-                * np.asarray(
-                    [job["accepted"][key] for key in ("x", "y", "z")],
-                    dtype=np.float64,
-                )
-                - job["fk_expected"],
-            )
-            for job in anchored
-            if job["accepted"] is not None and job["car_yaw"] is not None
-        ]
-        estimate = _session_marker_offset(samples)
-        reanchor_summary = {"pass1_fits": len(samples)}
-        for job in anchored:
-            job["accepted"] = None
-        if estimate is None:
-            print(
-                f"[racket] re-anchor unavailable ({len(samples)} pass-1 fits): "
-                "no black-marker observations for this session",
-                flush=True,
-            )
-        else:
-            offset, inliers = estimate
-            reanchor_summary.update(
-                offset_car_mm=[round(float(value), 1) for value in offset],
-                inliers=inliers,
-            )
-            print(
-                f"[racket] re-anchor: marker - FK = car ({offset[0]:+.1f}, "
-                f"{offset[1]:+.1f}, {offset[2]:+.1f}) mm from {inliers}/"
-                f"{len(samples)} pass-1 fits",
-                flush=True,
-            )
-            for job in anchored:
-                if job["car_yaw"] is None:
-                    continue
-                job["fk_anchor"] = job["fk_expected"] + _car_to_world(
-                    job["car_yaw"], offset
-                )
-                gate = AnchorGate(
-                    _mean_view_dir(cameras, serials, job["fk_anchor"]),
-                    REANCHOR_MAX_LATERAL_MM,
-                    REANCHOR_MAX_DEPTH_MM,
-                )
-                solved = _attempt_solve(
-                    job["candidates"], cameras, serials, job["fk_anchor"], None,
-                    loo_max_mm=policy.loo_max_mm, fk_gate=gate,
-                )
-                if solved is not None:
-                    accept(job, solved)
-    else:
-        reanchor_summary = None
 
     # Pass 2: chain neighbour fits as trajectory anchors. The FK ladder already
     # ran in pass 1, so pass 2 solves against the trajectory anchor only, and
@@ -1195,7 +1137,7 @@ def measure(
             job["traj_tried_mm"] = traj
             solved = _attempt_solve(
                 job["candidates"], cameras, serials, None, traj,
-                loo_max_mm=policy.loo_max_mm,
+                loo_max_mm=MARKER_LOO_MAX_MM,
             )
             if solved is not None:
                 accept(job, solved)
@@ -1225,6 +1167,9 @@ def measure(
     )
     n_traj = sum(1 for row in observations if row.get("anchor") == "traj")
     n_3cam = sum(1 for row in observations if row.get("n_cam") == 3)
+    residual = model_residual_summary(observations)
+    for line in residual_lines(residual):
+        print(f"[racket] {line}", flush=True)
     return {
         "config": {
             "measurement": "fixed black marker center (V04/V05, TCP calibrated onto the marker)",
@@ -1233,26 +1178,17 @@ def measure(
                 "tracker online full-resolution candidates (car-loc frames) from report "
                 f"raw final HT {-PRE_WINDOW_S:g}s to {POST_WINDOW_S:+g}s "
                 f"(per-throw zPhase applied); max reprojection {MARKER_MAX_REPROJ_PX:g} px; "
-                + (
-                    f"leave-one-out < {policy.loo_max_mm:g} mm; "
-                    if policy.loo_max_mm is not None
-                    else "no leave-one-out mm gate; "
-                )
-                + f"held-out <= {MARKER_MAX_HELDOUT_PX:g} px; "
-                + (
-                    "FK anchor corrected by the session marker-FK car-frame offset, "
-                    f"gated lateral <= {REANCHOR_MAX_LATERAL_MM:g} mm / view depth <= "
-                    f"{REANCHOR_MAX_DEPTH_MM:g} mm; "
-                    if policy.reanchor
-                    else f"4-cam FK search distance <= {MARKER_MAX_EXPECTED_DISTANCE_MM:g} "
-                    f"mm; 3-cam <= {MARKER_MAX_EXPECTED_RECOVERY_MM:g} mm; "
-                )
-                + "neighbour-trajectory-anchored recoveries <= "
+                "no leave-one-out mm gate; "
+                f"held-out <= {MARKER_MAX_HELDOUT_PX:g} px; "
+                "anchor = arm endpoint dynamic-model marker (production arm_endpoint, no session offset), "
+                f"gated lateral <= {ANCHOR_MAX_LATERAL_MM:g} mm / view depth <= {ANCHOR_MAX_DEPTH_MM:g} mm; "
+                "neighbour-trajectory-anchored recoveries <= "
                 f"{MARKER_MAX_EXPECTED_RECOVERY_MM:g} mm (rows carry n_cam/anchor"
                 "/dropped_serial provenance)"
             ),
             "car": car,
-            "reanchor": reanchor_summary,
+            "model_anchor": arm.get("endpoint"),
+            "model_residual": residual,
             "coordinate": (
                 "multi-camera marker world position; report subtracts visual car "
                 "center on field world axes"

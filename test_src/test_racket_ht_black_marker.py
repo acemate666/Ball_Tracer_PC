@@ -9,10 +9,11 @@ import numpy as np
 import pytest
 
 from racket_ht_black_marker import (
-    CAR_MARKER_POLICY,
+    ANCHOR_MAX_DEPTH_MM,
+    ANCHOR_MAX_LATERAL_MM,
+    MARKER_LOO_MAX_MM,
     MARKER_ROI_RADIUS_PX,
-    REANCHOR_INLIER_MM,
-    REANCHOR_MIN_INLIERS,
+    RESIDUAL_WINDOWS_MS,
     AnchorGate,
     CameraModel,
     MarkerCandidate,
@@ -21,8 +22,10 @@ from racket_ht_black_marker import (
     _component_candidates,
     _grid_panels,
     _measurement_context,
-    _session_marker_offset,
     _world_to_car,
+    arm_states_with_marker,
+    model_residual_summary,
+    residual_lines,
 )
 
 
@@ -72,7 +75,6 @@ def _write_inputs(tmp_path: Path, *, align_err: float = 0.01, tab_errors=None):
                         "appliesTo": "all_pc_sampling",
                         "rkUse": "global_baseline",
                     },
-                    "calibration": {"zOff": -0.1471},
                     "rows": [
                         {
                             "reportRow": 1,
@@ -102,16 +104,28 @@ def _write_inputs(tmp_path: Path, *, align_err: float = 0.01, tab_errors=None):
 
 
 def test_measurement_context_uses_report_final_ht(tmp_path: Path):
-    # 帧时间就是曝光中点（只在 tracker 入口补一次半曝光），上下文里不再有曝光补偿量
+    # 帧时间就是曝光中点（只在 tracker 入口补一次半曝光），上下文里不再有曝光补偿量；
+    # 高度不再用报告的 zOff（模型黑标的离地高由臂端点模型给），合同里没有击球侧就是 None
     paths = _write_inputs(tmp_path)
-    _, _, _, serials, z_offset, targets = _measurement_context(*paths)
+    _, _, _, serials, targets = _measurement_context(*paths)
     assert serials == SERIALS
-    assert z_offset == pytest.approx(-0.1471)
     assert targets == [{
         "report_row": 1,
         "final_ht_pc_elapsed_s": 12.525,
         "rk_to_pc_bias_s": 2.525,
+        "side": None,
     }]
+
+
+@pytest.mark.parametrize(("side", "expected"), [(1, 1), (-1, -1), (0, None), ("forehand", None), (None, None)])
+def test_measurement_context_carries_the_contract_side(tmp_path: Path, side, expected):
+    # 击球侧由报告合同给（臂 node::final_plan_side 的生产判决或臂当时自己记的 rl_swing done），这里只认 ±1
+    paths = _write_inputs(tmp_path)
+    payload = json.loads(paths[-1].read_text(encoding="utf-8"))
+    payload["arm_contract"]["rows"][0]["side"] = side
+    paths[-1].write_text(json.dumps(payload), encoding="utf-8")
+    *_, targets = _measurement_context(*paths)
+    assert targets[0]["side"] == expected
 
 
 def test_measurement_context_requires_usable_throw_phase(tmp_path: Path):
@@ -235,7 +249,7 @@ def _set_car(paths, car: str, layout: str) -> None:
 def test_measurement_context_accepts_v05(tmp_path: Path):
     paths = _write_inputs(tmp_path)
     _set_car(paths, "v05", r"D:\robot\Ball_Tracer_PC\src\config\vehicle_v05.json")
-    _, arm, _, _, _, targets = _measurement_context(*paths)
+    _, arm, _, _, targets = _measurement_context(*paths)
     assert arm["car"] == "v05"
     assert [row["report_row"] for row in targets] == [1]
 
@@ -251,12 +265,59 @@ def test_measurement_context_rejects_car_layout_mismatch(tmp_path: Path, car, la
         _measurement_context(*paths)
 
 
-def test_car_policy_keeps_v04_gates_and_reanchors_v05():
-    # v04 已验证的解算（10 mm LOO、按原始 FK 排名）不动；v05 换成校正锚点 + 无 LOO 毫米门。
-    assert CAR_MARKER_POLICY["v04"].loo_max_mm == 10.0
-    assert CAR_MARKER_POLICY["v04"].reanchor is False
-    assert CAR_MARKER_POLICY["v05"].loo_max_mm is None
-    assert CAR_MARKER_POLICY["v05"].reanchor is True
+def test_anchor_is_the_model_marker_with_split_gates_and_no_loo_mm_gate():
+    # 锚 = 端点动态模型黑标本身（不估本场偏差）；深度 / 横向分开设门，不设 LOO 毫米门（v05 黑方块 ~5 px）
+    assert (ANCHOR_MAX_LATERAL_MM, ANCHOR_MAX_DEPTH_MM) == (35.0, 80.0)
+    assert MARKER_LOO_MAX_MM is None
+    source = Path(__file__).with_name("racket_ht_black_marker.py").read_text(encoding="utf-8")
+    for gone in ("_session_marker_offset", "REANCHOR_", "CAR_MARKER_POLICY", "eab.fk(", "zOff"):
+        assert gone not in source, gone
+
+
+def _obs(side, dt_ms, residual):
+    return {"side": side, "dt_ht_ms": dt_ms, "residual_car_mm": residual}
+
+
+def test_model_residual_summary_groups_by_side_and_window():
+    observations = [
+        _obs(1, -300.0, [1.0, 2.0, 20.0]),
+        _obs(1, -200.0, [3.0, 2.0, 30.0]),
+        _obs(1, -50.0, [0.0, 20.0, 0.0]),
+        _obs(-1, -300.0, [-10.0, 0.0, 0.0]),
+        _obs(None, 50.0, [0.0, 0.0, 4.0]),
+        _obs(1, -300.0, None),          # 缺车 yaw / 模型黑标：不进汇总
+        _obs(1, 500.0, [9.0, 9.0, 9.0]),  # 窗外
+    ]
+    summary = model_residual_summary(observations)
+    groups = summary["groups"]
+    lo, hi = RESIDUAL_WINDOWS_MS[0]
+    early = groups[f"forehand [{lo:+.0f},{hi:+.0f}) ms"]
+    assert early["n"] == 2
+    assert early["median_xyz_car_mm"] == [2.0, 2.0, 25.0]
+    norms = [np.linalg.norm([1.0, 2.0, 20.0]), np.linalg.norm([3.0, 2.0, 30.0])]
+    assert early["median_3d_mm"] == pytest.approx(round(float(np.median(norms)), 1))
+    assert early["rms_3d_mm"] == pytest.approx(round(float(np.sqrt(np.mean(np.square(norms)))), 1))
+    assert groups["forehand [-100,-20) ms"]["median_xyz_car_mm"] == [0.0, 20.0, 0.0]
+    assert groups["backhand [-450,-100) ms"]["n"] == 1
+    assert groups["unknown [+20,+120) ms"]["n"] == 1
+    assert sum(g["n"] for g in groups.values()) == 5
+    lines = residual_lines(summary)
+    assert len(lines) == len(groups)
+    assert lines[0].startswith("视觉 − 模型黑标 forehand [-450,-100) ms: n=2")
+
+
+def test_marker_anchor_refuses_what_the_production_endpoint_cannot_compute():
+    # 端点动态模型只覆盖五轴臂：v04 场次不出黑标观测（NothingToMeasure 带原因），不另用别的 FK 凑
+    import arm_production as ap
+
+    try:
+        ap.arm()
+    except ap.Unavailable as exc:
+        pytest.skip(str(exc))
+    arm = {"car": "v04", "states": [{"t": 1.0 + 0.01 * k, "position": [0.0] * 6, "effort": [0.0] * 6}
+                                    for k in range(200)]}
+    with pytest.raises(NothingToMeasure, match="五轴"):
+        arm_states_with_marker(arm, "tracker_test")
 
 
 def test_car_world_rotation_round_trips():
@@ -267,34 +328,6 @@ def test_car_world_rotation_round_trips():
         assert _world_to_car(yaw, world) == pytest.approx(offset)
     # yaw=+90°：车体 x（右）指向世界 +y
     assert _car_to_world(np.pi / 2, np.array([1.0, 0.0, 0.0])) == pytest.approx([0.0, 1.0, 0.0])
-
-
-def test_session_marker_offset_is_the_inlier_median():
-    rng = np.random.default_rng(7)
-    truth = np.array([6.0, 9.0, -50.0])
-    inliers = [truth + rng.normal(0.0, [5.0, 15.0, 5.0]) for _ in range(20)]
-    # 拍框/背景假点：离真值 60–150 mm（0929 v05 实场 14 个假点的量级）
-    outliers = [truth + np.array(v) for v in (
-        [30, -40, 80], [-35, 5, 95], [-110, 20, 60], [40, -10, 50],
-        [-5, 110, -120], [30, 20, 130], [-60, -40, 10], [45, -50, 65],
-    )]
-    offset, count = _session_marker_offset(inliers + outliers)
-    assert count == 20
-    assert offset == pytest.approx(np.median(np.array(inliers), axis=0))
-    assert np.linalg.norm(offset - truth) < 10.0
-
-
-def test_session_marker_offset_refuses_weak_or_minority_clusters():
-    truth = np.array([6.0, 9.0, -50.0])
-    few = [truth + np.array([k, 0.0, 0.0]) for k in range(REANCHOR_MIN_INLIERS - 1)]
-    assert _session_marker_offset(few) is None
-    # 聚成一团的不过半：宁可整场不出，也不拿假点定锚
-    cluster = [truth + np.array([k, 0.0, 0.0]) for k in range(REANCHOR_MIN_INLIERS)]
-    scattered = [
-        truth + (3.0 * REANCHOR_INLIER_MM) * np.array([np.cos(a), np.sin(a), 0.5])
-        for a in np.linspace(0.0, 2.0 * np.pi, REANCHOR_MIN_INLIERS + 1, endpoint=False)
-    ]
-    assert _session_marker_offset(cluster + scattered) is None
 
 
 def test_anchor_gate_separates_view_depth_from_lateral():

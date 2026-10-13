@@ -1,17 +1,14 @@
 # -*- coding: utf-8 -*-
-"""臂 FK 的车型合同：v0.3 / v0.4 / v0.5 是三台不同的臂，报告必须按本场车型算 TCP。
+"""车型合同 + 报告调臂生产代码的胶水（test_src/arm_production.py）。
 
-黄金向量取自臂端自己导出的资产（arm_controller `tools/export_cpp_assets.py` →
-`cpp/arm_controller_cpp/assets/<car>/test_vectors.json` 的 ik_hit / face_lookup 组）：
-每条是「臂端 IK 解出的位形 q」+「它本该把拍心放到的 (x, z)」。我们这边的 FK 独立算一遍，
-必须落回同一个点——这才是跨实现对账，而不是拿本文件的常数自证。
-v0.3 已随车从 arm_controller 删除（0923，连同 assets/v03），它的链是 extract_arm_bag 里冻结的抄本，
-不再有臂端黄金向量；只作「拿错车」的对照。
-
-⚠ 这组测试守的是 0816 那次事故：报告端 FK 写死 v0.3 链，v0.4 场次整场 TCP 偏
-(−5.4, −8.6)cm、FK 拍速低报 5%，而拍面 yaw/pitch 两车逐拍恒等——页面上没有任何征兆。
-所以既要验「各车自己对」，也要验「拿错车一定偏得看得见」，还要验「车型推断/缺省不猜」。
-v0.5（五轴臂）另有一条：/joint_states 只有 5 个名字，按名字进控制器的 6 个槽，槽 4 空。
+2026-10-13 起报告不再自带臂 FK（用户「report 也只用一份代码，做 fk 或者其他相关的时候，都去引用现在的生产代码」）：
+黑标 / 甜点 / 拍面 / 拍速 = 臂端点模型（arm_controller.arm_endpoint → C++ control/arm_endpoint.hpp），方案收不收 = 臂
+node::receive_hit_pos（arm_controller.hit_pos）。臂自己的黄金向量 / 对拍在臂仓库里测，这里不再复刻。这里守：
+  1. 车型推断不猜——0816 事故：报告端 FK 写死 v0.3 链，v0.4 场次整场 TCP 偏 (−5.4, −8.6) cm、页面上没有任何征兆；
+  2. 抽取脚本（ROS2 解释器里调不了臂 C 接口库）按臂槽位规则排的 /joint_states 槽 = 臂生产代码 ArmEndpoint.slot_names；
+  3. 胶水：录包零位帧（run_config 行 > 登记表）、判不了时抛 Unavailable 带原因、端点量逐值 = 生产 eval_series / pose；
+  4. 报告链源码里没有臂公式的第二份实现。
+要臂 checkout（TENNIS_MAN_ARM_CONTROLLER）与 g++ 的用例在缺时 skip。
 """
 from __future__ import annotations
 
@@ -20,116 +17,24 @@ import math
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 SRC_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SRC_DIR))
+import arm_production as ap  # noqa: E402
 import extract_arm_bag as eab  # noqa: E402
 
-# 黄金向量直接读臂端标准 checkout 导出的资产（cpp/arm_controller_cpp/assets/<car>/test_vectors.json，
-# ik_hit / face_lookup 两组）：每条 = (x, z, q6)，臂端声称该位形把拍心放在 (x, y≈0, z)。
-# 不再逐条抄进来——2026-09-05 用户定：报告端只认那一份标准文件，改标定不用来这里同步常数。
-ASSETS_ROOT = eab.ARM_CONTROLLER_ROOT / "cpp" / "arm_controller_cpp" / "assets"
+V05_SLOTS = ("joint1", "joint2", "joint3", "joint4", None, "joint5")
+SIX_SLOTS = ("joint1", "joint2", "joint3", "joint4", "joint5", "joint6")
 
 
-def _golden(car: str) -> list[tuple[float, float, list[float]]]:
-    vectors = json.loads((ASSETS_ROOT / car / "test_vectors.json").read_text(encoding="utf-8"))
-    rows = [(r["x"], r["z"], list(r["q5"]) + [0.0]) for r in vectors["ik_hit"]]
-    rows += [(r["x"], r["z"], list(r["q"])) for r in vectors["face_lookup"]]
-    assert rows, f"{car}: test_vectors.json 没有 ik_hit/face_lookup 向量"
-    return rows
-
-
-GOLDEN = {"v04": _golden("v04"), "v05": _golden("v05")}
-
-
-@pytest.mark.parametrize("car", sorted(GOLDEN))
-def test_tcp_distance_matches_current_calibration(car):
-    cak = eab.standard_kinematics(car)
-    yaml_tool_x = cak.read_car_kinematics(car)["tool_x"]
-    j6_x = float(cak.JOINTS[-1]["local0"][0, 3])
-    assert eab.CAR_MODELS[car].tcp_distance == pytest.approx(cak.TCP_DISTANCE, abs=1e-12)
-    assert cak.TCP_DISTANCE == pytest.approx(float(yaml_tool_x) - j6_x, abs=1e-12)  # 真值 = yaml tool_x
-
-
-@pytest.mark.parametrize("car", sorted(GOLDEN))
-def test_marker_is_the_yaml_black_marker(car):
-    """黑标 = yaml marker_x（视觉比对用）；甜点 = yaml tool_x（击球误差用）。v04 同点，v05 1009 起甜点在黑标往拍喉 2 cm。"""
-    cak = eab.standard_kinematics(car)
-    kin = cak.read_car_kinematics(car)
-    j6_x = float(cak.JOINTS[-1]["local0"][0, 3])
-    assert eab.CAR_MODELS[car].marker_distance == pytest.approx(float(kin["marker_x"]) - j6_x, abs=1e-12)
-    eab.use_car(car)
-    out = eab.fk([0.3, -0.2, 1.1, 0.4, 0.0, 0.2])
-    gap = float(kin["marker_x"]) - float(kin["tool_x"])
-    assert out["marker"] == pytest.approx(out["tcp"] + gap * out["handle_axis"], abs=1e-12)
-    assert gap == pytest.approx({"v04": 0.0, "v05": 0.02}[car], abs=1e-12)
-    eab.use_car("v04")  # 复位，免得影响同进程其它用例
-
-
-@pytest.mark.parametrize("car", sorted(GOLDEN))
-def test_fk_matches_arm_side_golden_vectors(car):
-    """各车 FK 落回臂端 IK 声称的击球点（含 y≈0：拍心该落在击球平面上）。
-
-    五轴臂（v0.5，没有腕转）的拍面 yaw 只能由 J1 给，臂端 IK 约束的是 J1 系里的 (x, z)
-    （J1 轴在世界原点），世界 y 随 J1 转走、不约束——见 compact_arm_kinematics.ik_hit_face。
-    """
-    pytest.importorskip("numpy")
-    eab.use_car(car)
-    five_axis = not eab.standard_kinematics(car).HAS_WRIST_YAW
-    for x, z, q in GOLDEN[car]:
-        tcp = eab.fk(q)["tcp"]
-        if five_axis:
-            c, s = math.cos(q[0]), math.sin(q[0])
-            tcp = [c * tcp[0] + s * tcp[1], -s * tcp[0] + c * tcp[1], tcp[2]]
-        assert tcp[0] == pytest.approx(x, abs=1e-3), f"{car} x @({x},{z})"
-        assert tcp[2] == pytest.approx(z, abs=1e-3), f"{car} z @({x},{z})"
-        assert abs(tcp[1]) < 0.01, f"{car} 拍心不在击球平面上 @({x},{z})"
-
-
-@pytest.mark.parametrize("car", sorted(GOLDEN))
-def test_fk_matches_standard_module(car):
-    """本文件的 fk 与臂端标准模块自己的 fk 是同一条链（关节表、基座变换、工具轴、甜点距离都是搬来的）。"""
-    np = pytest.importorskip("numpy")
-    cak = eab.standard_kinematics(car)
-    rng = np.random.default_rng(5)
-    for _ in range(50):
-        q = rng.uniform(-1.5, 1.5, 6)
-        if not cak.HAS_WRIST_YAW:
-            q[4] = 0.0  # 空槽恒 0
-        ours, theirs = eab.fk(q, car=car), cak.fk(q)
-        assert np.allclose(ours["tcp"], theirs["tcp"], atol=1e-12)
-        assert np.allclose(ours["marker"], theirs["marker"], atol=1e-12)
-        assert np.allclose(ours["handle_axis"], theirs["handle_axis"], atol=1e-12)
-
-
-def test_wrong_car_is_off_by_centimetres_not_millimetres():
-    """拿错车不是小数点级误差：当前 v0.4 黄金位形用 v0.3 链算会低约 12cm。"""
-    pytest.importorskip("numpy")
-    for x, z, q in GOLDEN["v04"]:
-        good = eab.fk(q, car="v04")["tcp"]
-        wrong = eab.fk(q, car="v03")["tcp"]
-        assert wrong[2] - good[2] < -0.05, "v0.3 链算 v0.4 位形应显著偏低"
-        assert math.hypot(wrong[0] - good[0], wrong[2] - good[2]) > 0.08
-
-
-def test_face_angles_are_identical_across_cars():
-    """拍面法向在 v0.3 / v0.4 下逐条恒等——所以角度列看不出选错车，位置列才是判据。
-    （0816 实测 11 拍逐拍相同；这条固化那个观察，免得有人拿角度列去"验证"车型。）"""
-    pytest.importorskip("numpy")
-    for _, _, q in GOLDEN["v04"]:
-        n3 = eab.fk(q, car="v03")["face_normal"]
-        n4 = eab.fk(q, car="v04")["face_normal"]
-        assert all(abs(a - b) < 1e-6 for a, b in zip(n3, n4))
-
-
-def test_no_default_car():
-    """一次都没选过车型就调 fk() 必须抛——静默用另一台车的链是这套代码最贵的错误。"""
-    pytest.importorskip("numpy")
-    eab._ACTIVE = None
-    with pytest.raises(RuntimeError, match="还没选车型"):
-        eab.fk([0.0] * 6)
-    eab.use_car("v04")  # 复位，免得影响同进程其它用例
+def _production():
+    try:
+        ap.endpoint("v05")
+    except ap.Unavailable as exc:
+        pytest.skip(f"臂生产代码不可用：{exc}")
+    return ap.arm()
 
 
 def test_car_for_tracker_json_reads_layout_config(tmp_path):
@@ -156,7 +61,7 @@ def test_car_for_tracker_json_reads_layout_config(tmp_path):
 
 
 def test_layout_configs_cover_every_tracker_car():
-    """run_tracker 能启动的每一种 --car，这里都认得出它落下的布局文件，而且都有 FK 链。"""
+    """run_tracker 能启动的每一种 --car，这里都认得出它落下的布局文件；有臂车型 yaml 的现役车都在其中。"""
     import re
 
     source = (SRC_DIR.parent / "src" / "run_tracker.py").read_text(encoding="utf-8")
@@ -165,40 +70,38 @@ def test_layout_configs_cover_every_tracker_car():
     assert layouts, "没从 run_tracker.py 读到 CAR_LAYOUT_CONFIGS"
     for car, layout in layouts.items():
         assert eab.CAR_BY_LAYOUT_CONFIG.get(layout) == car, f"{layout} 没登记成 {car}"
-        assert car in eab.CAR_MODELS, f"{car} 没有 FK 链"
+        assert car in eab.KNOWN_CARS
+    assert set(eab.CARS) <= set(layouts)
 
 
-def test_slot_joint_names_follow_arm_car_yaml():
-    """各槽的 ROS 关节名 = 臂车型 yaml 的 motors（控制器发 /joint_states 用的就是它们）。
-    v0.5 五轴臂 5 个电机进槽 0,1,2,3,5：名叫 joint5 的是拍柄滚转（槽 5），槽 4（腕转）空。"""
-    six = ("joint1", "joint2", "joint3", "joint4", "joint5", "joint6")
-    assert eab.CAR_MODELS["v03"].slot_joint_names == six
-    assert eab.CAR_MODELS["v04"].slot_joint_names == six
-    assert eab.CAR_MODELS["v05"].slot_joint_names == ("joint1", "joint2", "joint3", "joint4", None, "joint5")
+@pytest.mark.parametrize("car", ["v04", "v05"])
+def test_extractor_slots_are_the_production_slots(car):
+    """抽取在 ROS2 解释器里按臂槽位规则排槽（调不了臂 C 库）；必须与臂生产代码 ArmEndpoint.slot_names 逐槽一致。"""
+    _production()
+    assert eab.slot_joint_names(car) == ap.slot_names(car)
+    assert ap.slot_names(car) == {"v04": SIX_SLOTS, "v05": V05_SLOTS}[car]
 
 
 def test_ordered_puts_v05_roll_in_slot5():
     """v0.5 的消息只有 5 个名字：按名字进槽、槽 4 补 0；不带名字按电机顺序；字段整个缺失给全 None。"""
-    slots = eab.CAR_MODELS["v05"].slot_joint_names
     names = ["joint5", "joint1", "joint2", "joint3", "joint4"]   # 顺序无所谓，按名字取
-    assert eab._ordered([0.5, 0.1, 0.2, 0.3, 0.4], names, slots) == [0.1, 0.2, 0.3, 0.4, 0.0, 0.5]
-    assert eab._ordered([0.1, 0.2, 0.3, 0.4, 0.5], [], slots) == [0.1, 0.2, 0.3, 0.4, 0.0, 0.5]
-    assert eab._ordered([], names, slots) == [None] * 6
-    six = eab.CAR_MODELS["v04"].slot_joint_names
-    assert eab._ordered([1, 2, 3, 4, 5, 6], [], six) == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
-    assert eab._ordered([1, 2, 3, 4, 5], ["joint1", "joint2", "joint3", "joint4", "joint5"], six)[5] is None
+    assert eab._ordered([0.5, 0.1, 0.2, 0.3, 0.4], names, V05_SLOTS) == [0.1, 0.2, 0.3, 0.4, 0.0, 0.5]
+    assert eab._ordered([0.1, 0.2, 0.3, 0.4, 0.5], [], V05_SLOTS) == [0.1, 0.2, 0.3, 0.4, 0.0, 0.5]
+    assert eab._ordered([], names, V05_SLOTS) == [None] * 6
+    assert eab._ordered([1, 2, 3, 4, 5, 6], [], SIX_SLOTS) == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    assert eab._ordered([1, 2, 3, 4, 5], ["joint1", "joint2", "joint3", "joint4", "joint5"], SIX_SLOTS)[5] is None
 
 
 def test_joint_names_must_match_car():
     """v0.4 的包按 v0.5 读，腕转 joint5 会被当成滚转、算出一条看似正常的错 TCP——名字对不上必须直接失败。"""
-    v04_names = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
+    v04_names = list(SIX_SLOTS)
     v05_names = v04_names[:5]
-    eab.check_joint_names("/joint_states", v05_names, eab.CAR_MODELS["v05"].slot_joint_names, "v05")
-    eab.check_joint_names("/joint_states", v04_names, eab.CAR_MODELS["v04"].slot_joint_names, "v04")
+    eab.check_joint_names("/joint_states", v05_names, V05_SLOTS, "v05")
+    eab.check_joint_names("/joint_states", v04_names, SIX_SLOTS, "v04")
     with pytest.raises(SystemExit, match="车型选错"):
-        eab.check_joint_names("/joint_states", v04_names, eab.CAR_MODELS["v05"].slot_joint_names, "v05")
+        eab.check_joint_names("/joint_states", v04_names, V05_SLOTS, "v05")
     with pytest.raises(SystemExit, match="车型选错"):
-        eab.check_joint_names("/joint_states", v05_names, eab.CAR_MODELS["v04"].slot_joint_names, "v04")
+        eab.check_joint_names("/joint_states", v05_names, SIX_SLOTS, "v04")
 
 
 def test_car_for_session_precedence(tmp_path):
@@ -213,26 +116,16 @@ def test_car_for_session_precedence(tmp_path):
         eab.car_for_session({}, None)
 
 
-def test_recompute_tcp_rewrites_derived_field():
-    """arm JSON 的 tcp 只是派生量：换车重算即可，不必重跑 rosbag 提取。
-    关节残缺的行置 None（报告列显示 —），不能留着别的车算出来的旧值。"""
-    pytest.importorskip("numpy")
-    q = [0.1, 0.2, 1.4, 1.6, 0.0, 0.3]
-    rows = [{"position": q, "tcp": [9.0, 9.0, 9.0]},
-            {"position": [0.1, None, 1.4, 1.6, 0.0, 0.3], "tcp": [9.0, 9.0, 9.0]}]
-    eab.use_car("v04")
-    assert eab.recompute_tcp(rows) == 2
-    assert rows[0]["tcp"] == [round(float(v), 4) for v in eab.fk(q)["tcp"]]
-    assert rows[1]["tcp"] is None
-
-
-def test_extractor_records_car_in_output():
-    """出 arm JSON 必须把车型写进去（car/car_source/fk_source），报告端才不用再猜。"""
+def test_extractor_records_car_and_computes_nothing():
+    """出 arm JSON 必须把车型与臂起栈 run_config 行写进去，报告端才不用再猜；臂派生量一个都不在抽取里算。"""
     source = (SRC_DIR / "extract_arm_bag.py").read_text(encoding="utf-8")
     assert '"car": car,' in source
     assert '"car_source": car_source,' in source
-    assert '"fk_source": f"extract_arm_bag.fk({car})",' in source
-    assert '"--car"' in source and "choices=sorted(CAR_MODELS)" in source
+    assert '"run_configs": run_configs,' in source
+    assert '"--car"' in source and "choices=CARS" in source
+    for gone in ("def fk(", "compact_arm_kinematics", "standard_kinematics", "J1_TILT", "recompute_tcp", "use_car(",
+                 "face_normal", "fk_source"):
+        assert gone not in source, gone
 
 
 def test_run_tracker_passes_car_to_extractor():
@@ -240,3 +133,112 @@ def test_run_tracker_passes_car_to_extractor():
     source = (SRC_DIR.parent / "src" / "run_tracker.py").read_text(encoding="utf-8")
     assert 'arm_command.extend(["--car", car])' in source
     assert "car=args.car," in source
+
+
+def test_report_chain_has_no_second_arm_implementation():
+    """报告链（抽取 / 生成页面 / 黑标测量 / 在线黑标 / swing_hs 几何）不再有臂 FK、J1 倾斜、拍头模型的第二份实现。"""
+    files = [SRC_DIR / "extract_arm_bag.py", SRC_DIR / "extract_rk_tracking_bag.py", SRC_DIR / "generate_curve3_html.py",
+             SRC_DIR / "racket_ht_black_marker.py", SRC_DIR.parent / "src" / "racket_marker_online.py",
+             SRC_DIR.parent / "swing_hs" / "geometry.py", SRC_DIR.parent / "swing_hs" / "camera_proc.py"]
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        for gone in ("compact_arm_kinematics", "standard_kinematics", "eab.fk(", "J1_TILT", "_frozen_head_model",
+                     "CAR_MODELS", "tcp_distance"):
+            assert gone not in text, (path.name, gone)
+
+
+# ───────────────────────── 胶水：零位帧 / 判不了 / 逐值 = 生产 ─────────────────────────
+
+def _run_config(frame: str) -> dict:
+    return {"recv": 0.0, "text": f"run_config: car=v05 config=x | zero_frame={frame} offset_rad=[0,0,0,0,0,0] "
+                                 "direction=[1,-1,1,-1,0,-1] face_table_fnv1a64=0 arm_calibration_fingerprint=0"}
+
+
+def test_recorded_frame_prefers_the_run_config_line_then_the_registry():
+    m = _production()
+    current = m.endpoint.zero_frame("v05")[0]
+    assert ap.recorded_frame("v05", "whatever", [_run_config(current)])[0] == current
+    # 登记表里的录包名（臂 config/zero_frames.yaml）
+    assert ap.recorded_frame("v05", "tracker_20261013_000109", None) == (
+        "8344c70", "臂零位帧登记表（config/zero_frames.yaml 录包名 tracker_20261013_000109）")
+    with pytest.raises(ap.Unavailable, match="未登记"):
+        ap.recorded_frame("v05", "tracker_19990101_000000", [])
+    with pytest.raises(ap.Unavailable, match="unregistered"):
+        ap.recorded_frame("v05", "x", [{"recv": 0.0, "text": "run_config: zero_frame=unregistered -- the car yaml"}])
+    with pytest.raises(ap.Unavailable, match="零位帧不同"):
+        ap.recorded_frame("v05", "x", [_run_config(current), _run_config("8344c70")])
+
+
+def _synthetic_arm(n: int = 300, frame: str | None = None) -> dict:
+    """100 Hz 的五轴 /joint_states（面板直驱节拍：每拍五轴全发）+ 同刻命令；J1 在转、J2/J3 有力矩。"""
+    t = 50.0 + 0.01 * np.arange(n)
+    q = np.zeros((n, 6))
+    q[:, 0] = -0.8 + 1.6 * (t - t[0]) / (t[-1] - t[0])
+    q[:, 1], q[:, 2], q[:, 3], q[:, 5] = -0.2, 1.9, 1.7, 0.05
+    qd = np.zeros((n, 6))
+    qd[:, 0] = 1.6 / (t[-1] - t[0])
+    e = np.zeros((n, 6))
+    e[:, 0] = 25.0 * np.sin(4.0 * (t - t[0]))
+    e[:, 1], e[:, 2], e[:, 3] = -30.0, 8.0, 2.0
+    rows = [{"t": float(t[i]), "position": q[i].tolist(), "velocity": qd[i].tolist(), "effort": e[i].tolist()}
+            for i in range(n)]
+    arm = {"car": "v05", "states": rows, "commands": [dict(r) for r in rows], "events": [],
+           "state_joint_names_raw": ["joint1", "joint2", "joint3", "joint4", "joint5"]}
+    if frame:
+        arm["run_configs"] = [_run_config(frame)]
+    return arm
+
+
+def test_endpoint_for_arm_is_the_production_model_value_for_value():
+    """实测行 = 生产 eval_series（逐关节采样时刻同端点标定读包工具），命令行 = 生产刚体位形 pose；录包那一帧的读数先平移到当前帧。"""
+    m = _production()
+    arm = _synthetic_arm(frame="8344c70")
+    info = ap.endpoint_for_arm(arm, "v05", "x")
+    assert info["status"] == "ok" and info["frame"]["recorded"] == "8344c70"
+    shift = m.endpoint.zero_shift("v05", "8344c70")
+    assert info["frame"]["shift_rad"] == pytest.approx(shift.tolist(), abs=1e-9)
+    assert abs(shift[0]) > 1e-3   # 8344c70 → 当前帧 J1 零位真的动过：这条用例确实在验平移
+
+    states = arm["states"]
+    t = np.array([s["t"] for s in states])
+    q = np.array([s["position"] for s in states])
+    e = np.array([s["effort"] for s in states])
+    slots = list(m.bag.SLOTS)
+    per = m.bag.joint_samples(m.bag.rows_of(t, q[:, slots], e[:, slots]), "v05", "8344c70")
+    ep = ap.endpoint("v05")
+    out = ep.eval_series([p["t"] for p in per], [p["q"] for p in per], [p["e"] for p in per], t)
+    f = m.endpoint.field
+    for name, key, digits in (("marker", "marker", 1e-5), ("sweet", "sweet", 1e-5), ("sweet_vel", "sweet_vel", 1e-4)):
+        got = np.array([s[key] for s in states])
+        assert got == pytest.approx(f(out, name), abs=digits), key
+    assert [s["marker_h"] for s in states] == pytest.approx(f(out, "marker_height"), abs=1e-5)
+    assert [s["face_yaw"] for s in states] == pytest.approx(np.degrees(f(out, "face_yaw")), abs=1e-3)
+    assert [s["face_pitch"] for s in states] == pytest.approx(np.degrees(f(out, "face_pitch")), abs=1e-3)
+    # 力矩非零 + 在动：动态项（柔度 / 间隙 / 时延 / 力矩轴倾斜）确实把黑标从刚体位形挪开了
+    rigid = f(ep.pose(q + shift), "marker", m.endpoint.POSE)
+    assert np.max(np.linalg.norm(np.array([s["marker"] for s in states]) - rigid, axis=1)) > 1e-3
+    # 命令行 = 平移后的刚体位形
+    sweet_cmd = f(ep.pose(q + shift), "sweet", m.endpoint.POSE)
+    assert np.array([c["sweet"] for c in arm["commands"]]) == pytest.approx(sweet_cmd, abs=1e-5)
+    assert all(math.isfinite(c["j1_speed"]) and c["j1_speed"] > 0 for c in arm["commands"])
+
+
+def test_endpoint_for_arm_refuses_what_production_cannot_compute():
+    _production()
+    v04 = _synthetic_arm(frame="8344c70")
+    with pytest.raises(ap.Unavailable, match="五轴"):
+        ap.endpoint_for_arm(v04, "v04", "x")
+    wrong_names = _synthetic_arm(frame="8344c70")
+    wrong_names["state_joint_names_raw"] = list(SIX_SLOTS)
+    with pytest.raises(ap.Unavailable, match="关节名"):
+        ap.endpoint_for_arm(wrong_names, "v05", "x")
+    with pytest.raises(ap.Unavailable, match="未登记"):
+        ap.endpoint_for_arm(_synthetic_arm(), "v05", "tracker_19990101_000000")
+    with pytest.raises(ap.Unavailable, match="连续"):
+        ap.endpoint_for_arm(_synthetic_arm(n=50, frame="8344c70"), "v05", "x")
+    # 两相调度认不出（5 ms 均匀节拍不是 two_phase_j1_j4）：读包工具的原话带出来
+    odd = _synthetic_arm(frame="8344c70")
+    for i, s in enumerate(odd["states"]):
+        s["t"] = 50.0 + 0.005 * i
+    with pytest.raises(ap.Unavailable, match="调度"):
+        ap.endpoint_for_arm(odd, "v05", "x")

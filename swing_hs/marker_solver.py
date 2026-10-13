@@ -7,8 +7,10 @@
   3. 每个假设投回各相机（去畸变像素），最近候选 ≤ ASSOC_PX 算内点；
   4. 内点相机多者优先、再比误差平方和、再比离锚距离；过锚点门；
   5. 全部内点重做 DLT，最大重投影 > MAX_REPROJ_PX 就丢最差那台重来（≥ min_cams 台为止）。
-锚点 = 同曝光 FK 黑标；本场「黑标 − FK」车体系偏差（收场同一个稳健中位数 _session_marker_offset）稳定后锚点
-加上它、门换成视线深度 / 横向分开的 AnchorGate（在线 70 / 120 mm，比收场的 35 / 80 mm 宽，见 ONLINE_REANCHOR_*）。
+锚点 = 同曝光黑标（臂端点模型刚体位形，geometry.marker_points_car）；本场「黑标 − 锚」车体系偏差（稳健中位数
+session_marker_offset）稳定后锚点加上它、门换成视线深度 / 横向分开的 AnchorGate（在线 70 / 120 mm，见 ONLINE_REANCHOR_*）。
+这个偏差只在线用来把锚挪到真黑标附近、好关联候选，解出的黑标本身不加任何偏差。收场黑标（racket_ht_black_marker）2026-10-13
+起锚 = 端点动态模型、不再估本场偏差，所以这份稳健中位数只剩这里用。
 偏差没定之前用球形门：4 台 110 mm、3 台 80 mm（同收场 recovery 门）。
 至少 3 台（同收场工具）：两台的解只受一条极线约束，截块里随便两个暗点就能凑出 < 2.5 px 的解（1010 假相机
 实测锚点偏 ~10 cm 时两台解几乎全是假点）。在线结果供监看、进 bag；全部候选在 marker.jsonl 里，可离线重解。
@@ -43,7 +45,7 @@ SMOOTH_MAX_STEP_MM = 25.0
 MAX_REPROJ_PX = 2.5          # 同收场 MARKER_MAX_REPROJ_PX（实测分布见 ASSOC_PX 注）
 MAX_ANCHOR_MM = 110.0        # 同收场 MARKER_MAX_EXPECTED_DISTANCE_MM（4 台）
 MAX_ANCHOR_RECOVERY_MM = 80.0  # 同收场 MARKER_MAX_EXPECTED_RECOVERY_MM（少于 4 台）
-#: 偏差学到后的 AnchorGate（在线专用；收场仍用 racket_ht_black_marker.REANCHOR_MAX_LATERAL / DEPTH_MM = 35 / 80 mm）。
+#: 偏差学到后的 AnchorGate（在线专用；收场锚点门是 racket_ht_black_marker.ANCHOR_MAX_LATERAL / DEPTH_MM = 35 / 80 mm）。
 #: 挥拍高速段 FK 锚落后于真黑标（在线关节角晚于曝光 + 柔度）：155720 里锚速 > 2 m/s 的解沿运动方向超前 5–16 ms、
 #: 垂直偏 20–60 mm，横向 35 mm 正好挡掉挥得最快的那段（辨识时延 / 柔度最要的数据）。
 ONLINE_REANCHOR_MAX_LATERAL_MM = 70.0
@@ -53,6 +55,9 @@ MIN_CAMS = 3
 OFFSET_MIN_CAMS = 3
 OFFSET_WINDOW = 400
 OFFSET_REFRESH = 25
+#: 稳健中位数：离初值 OFFSET_INLIER_MM 内的算内点，≥ OFFSET_MIN_INLIERS 个且过半才用（原收场 re-anchor 的同一组数）
+OFFSET_MIN_INLIERS = 8
+OFFSET_INLIER_MM = 40.0
 #: 按排名最多试这么多个假设
 MAX_ATTEMPTS = 6
 
@@ -229,8 +234,31 @@ class FastMarkerSolver:
         )
 
 
+def session_marker_offset(samples_car_mm: list[np.ndarray]) -> tuple[np.ndarray, int] | None:
+    """「黑标 − 同曝光锚」车体系偏差的稳健中位数（mm）与内点数。
+
+    以全体中位为初值，只留离它 OFFSET_INLIER_MM 内的内点再取中位，迭代到内点集不变。
+    内点不足 OFFSET_MIN_INLIERS 或不过半 → None（这批解本身不可信，不挪锚）。
+    """
+    if len(samples_car_mm) < OFFSET_MIN_INLIERS:
+        return None
+    samples = np.asarray(samples_car_mm, dtype=np.float64)
+    center = np.median(samples, axis=0)
+    inliers: np.ndarray | None = None
+    for _ in range(10):
+        mask = np.linalg.norm(samples - center, axis=1) <= OFFSET_INLIER_MM
+        count = int(mask.sum())
+        if count < OFFSET_MIN_INLIERS or 2 * count <= len(samples):
+            return None
+        if inliers is not None and np.array_equal(mask, inliers):
+            break
+        inliers = mask
+        center = np.median(samples[mask], axis=0)
+    return center, int(inliers.sum())
+
+
 class SessionOffset:
-    """本场「黑标 − 同曝光 FK」车体系偏差（mm），在线滚动：收场同一个稳健中位数。"""
+    """本场「黑标 − 同曝光锚」车体系偏差（mm），在线滚动的稳健中位数（session_marker_offset）。"""
 
     def __init__(self, window: int = OFFSET_WINDOW, refresh: int = OFFSET_REFRESH) -> None:
         self._samples: deque[np.ndarray] = deque(maxlen=window)
@@ -240,15 +268,14 @@ class SessionOffset:
         self.inliers = 0
 
     def add(self, offset_car_mm: np.ndarray) -> None:
-        rbm = geometry.load_test_src("racket_ht_black_marker")
         self._samples.append(np.asarray(offset_car_mm, dtype=np.float64))
         self._since += 1
         if self._since < self._refresh and self.value is not None:
             return
-        if len(self._samples) < rbm.REANCHOR_MIN_INLIERS:
+        if len(self._samples) < OFFSET_MIN_INLIERS:
             return
         self._since = 0
-        result = rbm._session_marker_offset(list(self._samples))
+        result = session_marker_offset(list(self._samples))
         if result is not None:
             self.value, self.inliers = result
 

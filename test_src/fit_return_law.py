@@ -13,8 +13,9 @@
        重力+k_drag 二次阻力模型 Gauss-Newton 重拟初速（修短窗低估，rms 典型 2-4cm）；
      - 落点：接触态 RK4 外推到 z=GROUND_Z（本场外推仅比末点多 0.3-0.4s）；
      - 来球速度：入弧 [-380,-25]ms 同法拟合在触球时刻取导；
-     - 拍速：_arm.json 触球前窗 [-80,-6]ms TCP 二次拟合取 -6ms 瞬时（拍在加速段触球，
-       线性窗中心值低估 0.3-1.2 m/s）；拍面 pitch 同窗 FK（extract_arm_bag.fk 单源）；
+     - 拍速：_arm.json 触球前窗 [-80,-6]ms 甜点二次拟合取 -6ms 瞬时（拍在加速段触球，
+       线性窗中心值低估 0.3-1.2 m/s）；拍面 pitch 同窗——甜点与拍面都由臂生产代码的端点动态模型算
+       （test_src/arm_production.py，车体系；2026-10-13 起，之前是报告自己的 FK）；
      - 车残速：rk_tracking bot_state(IMU) 触球 ±50ms 中位 vy；
      - 臂↔PC 时轴：accepted 触球(t_acc+dur, late-ht 覆盖) ↔ PC 观测触球 共识 offset 逐抛配对
        （_arm.json 里 /predict_hit_pos 是 RK bot_center 自己的 topic，ct/ht 全 RK 轴，
@@ -37,7 +38,8 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import extract_arm_bag as eab  # noqa: E402  车型在 main() 里选定后才有 fk/JOINTS
+import arm_production as ap  # noqa: E402  臂生产代码（端点模型）
+import extract_arm_bag as eab  # noqa: E402  只用它推车型
 
 G = 9.81
 HALF_G = 4.905
@@ -375,7 +377,7 @@ def arm_at_contact(states, st_t, cl, bot_pose_t, bot_ch, rk_t0):
     i0, i1 = np.searchsorted(st_t, [t_c - 0.06, t_c + 0.06])
     t_cross = None
     for a, b in zip(states[i0:i1], states[i0 + 1:i1]):
-        ya, yb = a["tcp"][1], b["tcp"][1]
+        ya, yb = a["sweet"][1], b["sweet"][1]
         if ya <= 0.006 < yb and (b["t"] - a["t"]) < 0.05:
             f = (0.006 - ya) / max(1e-9, yb - ya)
             t_cross = a["t"] + f * (b["t"] - a["t"])
@@ -386,19 +388,13 @@ def arm_at_contact(states, st_t, cl, bot_pose_t, bot_ch, rk_t0):
     if len(win) < 4:
         return None
     tt = np.array([s["t"] - used for s in win])
-    tcp = np.array([s["tcp"] for s in win])
+    tcp = np.array([s["sweet"] for s in win])
     A2 = np.vstack([np.ones(len(win)), tt, tt * tt]).T
     vel_c = []
     for k in range(3):
         sol, *_ = np.linalg.lstsq(A2, tcp[:, k], rcond=None)
         vel_c.append(float(sol[1] + 2 * sol[2] * (-0.006)))
-    fps = []
-    for s in win:
-        # 车型由 main() 的 use_car 定；face_normal 已是该车拍面法向在臂系的单位向量
-        n0, n1, n2 = (float(v) for v in eab.fk(s["position"])["face_normal"])
-        if n1 < 0:
-            n0, n1, n2 = -n0, -n1, -n2
-        fps.append(math.degrees(math.asin(max(-1.0, min(1.0, n2)))))
+    fps = [float(s["face_pitch"]) for s in win]   # 端点动态模型的车体系拍面 pitch（°）
     A1 = np.vstack([np.ones(len(win)), tt]).T
     sol_p, *_ = np.linalg.lstsq(A1, np.array(fps), rcond=None)
     j0, j1_ = np.searchsorted(bot_pose_t, [t_c - rk_t0 - 0.05, t_c - rk_t0 + 0.05])
@@ -430,16 +426,13 @@ def main():
     arm = json.load(open(base + "_arm.json", encoding="utf-8"))
     rk = json.load(open(base + "_rk_tracking.json", encoding="utf-8"))
 
-    # 车型决定臂 FK 链（v0.3/v0.4 是两台不同的臂，TCP 差几厘米）。老 arm JSON 的 tcp 是
-    # 按 v0.3 链算的，与本场车型不符就地复算——position 才是原始记录。
+    # 甜点 / 拍面 pitch 一律由臂生产代码的端点动态模型现算（就地写进 arm 的 states）；算不了这一场就停，不另用别的 FK。
     car, car_src = eab.car_for_session(arm, base + ".json")
-    eab.use_car(car)
-    if arm.get("car") != car:
-        n = eab.recompute_tcp(arm["states"]) + eab.recompute_tcp(arm.get("commands"))
-        print(f"[fit] 车型 {car}（{car_src}）：arm JSON 的 TCP 按 "
-              f"{arm.get('car') or '旧版（v03 链）'} 算的，已就地复算 {n} 行")
-    else:
-        print(f"[fit] 车型 {car}（{car_src}）")
+    try:
+        ep = ap.endpoint_for_arm(arm, car, Path(base).name)
+    except ap.Unavailable as exc:
+        raise SystemExit(f"[fit] 车型 {car}（{car_src}）：臂端点模型算不了本场——{exc}")
+    print(f"[fit] 车型 {car}（{car_src}）；端点 {ep['arm_checkout'].get('commit')}，零位帧 {ep['frame']['recorded']}")
 
     ex = ReturnExtractor(data["observations"])
     s1 = sorted([p for p in data["predictions"] if p["stage"] == 1], key=lambda p: p["ht"])
@@ -450,7 +443,7 @@ def main():
         else:
             throws[-1].append(p)
 
-    states = arm["states"]
+    states = [s for s in arm["states"] if "sweet" in s]
     st_t = np.array([s["t"] for s in states])
     clusters = parse_arm_events(arm)
     bot_y = rk["bot"]["y"]

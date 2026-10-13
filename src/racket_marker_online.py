@@ -8,7 +8,10 @@
 
 候选 = 黑标 YOLO（swing_hs/marker_yolo.py：FK 锚为中心截 96×96，同 swing_hs 100 fps 在线识别、同一个模型
 yolo_model/black_marker_yolo.onnx；1012 用户：「40fps 也换成 yolo 识别」，原来的阈值暗块候选夜里被噪点带偏），
-FK 是同一份标准运动学（extract_arm_bag.fk → tennis-man/arm_controller 的 compact_arm_kinematics + 车型 yaml）。
+锚 = 臂生产代码的端点模型（test_src/arm_production.py → arm_controller.arm_endpoint，J1 轴倾斜 / 黑标偏置都在里面）对
+曝光时刻实测关节角的**刚体位形** pose：这里只有关节角缓存、没有力矩历史，端点动态项（时延 / 柔度 / 间隙 / J1 力矩轴倾斜）
+在挥拍里挪黑标 ~1–3 cm（< 截块半宽 48 px），收场测量（racket_ht_black_marker）的锚才用端点动态模型。关节角按臂当时
+跑的零位帧读来、不平移：默认本机臂 checkout 的车型 yaml 就是车上那一版（不是时锚会整体偏，截块仍装得下就不影响候选）。
 """
 
 from __future__ import annotations
@@ -57,12 +60,12 @@ def _load_test_src(name: str):
 class JointStateBuffer:
     """/joint_states 缓存：ROS 回调线程写，车定位线按曝光时刻（PC 轴）取关节角。
 
-    关节角按控制器 6 个槽排（五轴臂槽 4 恒 0），槽名来自车型 yaml，与 extract_arm_bag 同一规则。
+    关节角按控制器 6 个槽排（五轴臂槽 4 恒 0），槽名 = 臂生产代码的 ArmEndpoint.slot_names（车型 yaml + 控制器槽位规则）。
     """
 
     def __init__(self, car: str) -> None:
-        # 第一次取 CAR_MODELS[car] 就加载标准运动学：缺 arm_controller checkout 开场直接报错
-        self._slot_names = _load_test_src("extract_arm_bag").CAR_MODELS[car].slot_joint_names
+        # 开场就载臂生产代码的端点模型：缺 arm_controller checkout / g++ 开场直接报错
+        self._slot_names = _load_test_src("arm_production").slot_names(car)
         self._expected_names = sorted(name for name in self._slot_names if name is not None)
         self._lock = threading.Lock()
         self._stamps: deque[float] = deque()
@@ -135,7 +138,7 @@ def _sample_at(before, after, t: float, *, wrap: bool = False) -> list[float] | 
 
 class RacketMarkerLocator:
     """车定位线里每个车定位帧调用一次，把它和前面没做车定位的帧一起截块（黑标 40 fps）：
-    车位姿 + 同曝光时刻关节角 → FK 黑标 → 各相机全分辨率截块候选。"""
+    车位姿 + 同曝光时刻关节角 → 臂端点模型刚体位形的黑标 → 各相机全分辨率截块候选。"""
 
     def __init__(
         self,
@@ -146,10 +149,10 @@ class RacketMarkerLocator:
         joint_states: JointStateBuffer,
     ) -> None:
         self._ht = _load_test_src("racket_ht_black_marker")
-        eab = _load_test_src("extract_arm_bag")
+        production = _load_test_src("arm_production")
+        self._endpoint = production.endpoint(car)
+        self._pose_field = lambda pose, name: production.arm().endpoint.field(pose, name, production.arm().endpoint.POSE)
         self._car = car
-        self._fk = eab.fk
-        self._z_offset_m = float(eab.standard_kinematics(car).car_hit_pos_z_offset(car))
         self._cameras = self._ht._load_cameras(Path(calib_path), serials)
         self._joints = joint_states
         # 只在车定位线里用（单线程），一个 ONNX Runtime 会话；模型不在开相机前就报错
@@ -188,15 +191,15 @@ class RacketMarkerLocator:
             if q is None:
                 self.stats["no_joint_state"] += 1
                 continue
-            # 与收场 _expected_world_mm 同一换算：车位姿 + R(yaw)·黑标 FK，z 减臂基座高度偏移
-            marker = self._fk(q, car=self._car)["marker"]
+            # 与收场 _expected_world_mm 同一换算：车位姿 + R(yaw)·车体系黑标，z = 车 z + 黑标离地高（臂模型 z − 车型 hit_pos_z_offset_m）
+            marker = self._pose_field(self._endpoint.pose(q), "marker")
             x, y, z = xyz
             cosine, sine = math.cos(yaw[0]), math.sin(yaw[0])
             anchor_mm = 1000.0 * np.asarray(
                 [
                     x + cosine * marker[0] - sine * marker[1],
                     y + sine * marker[0] + cosine * marker[1],
-                    z + marker[2] - self._z_offset_m,
+                    z + marker[2] - self._endpoint.z_offset,
                 ],
                 dtype=np.float64,
             )

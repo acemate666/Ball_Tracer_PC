@@ -172,7 +172,7 @@ def test_throw_phase_changes_all_pc_sampling_but_not_rk_values():
     assert "const rkToPc = t => isNum(Number(t)) ? Number(t)+rkBias : null;" in source
     assert "const pcToRk =" not in source
     assert "const shifted = xs => xs.map(rkToPc);" in source
-    assert "armTcpRows.map(s=>rkToPc(s.t))" in source
+    assert "armSweetRows.map(s=>rkToPc(s.t))" in source   # TCP 曲线 = 臂端点动态模型的甜点（RK 轴，统一 rkToPc）
     assert "const pcSampleTimeForThrow = (th,t) => {" in source
     assert "const rkToPcForThrow" not in source
     assert "const pcToRkForThrow" not in source

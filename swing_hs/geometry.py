@@ -2,8 +2,8 @@
 """swing_hs 的几何：车体系↔世界、投影、黑标包络、AprilTag 角点、ROI 规划、帧率上限。
 
 纯函数，不碰相机。相机模型 / 投影 / 候选检测与收场黑标工具共用一份实现
-（test_src/racket_ht_black_marker.py），FK 用标准运动学（test_src/extract_arm_bag.fk →
-tennis-man/arm_controller 的 compact_arm_kinematics + 车型 yaml）。
+（test_src/racket_ht_black_marker.py），黑标位置用臂生产代码（tennis-man/arm_controller 的端点模型 arm_endpoint，
+经 test_src/arm_production.py 调）。
 """
 
 from __future__ import annotations
@@ -133,14 +133,22 @@ def load_envelope(path: Path, side: str, j1_range_deg: tuple[float, float]) -> n
 
 
 def marker_points_car(q_rad: np.ndarray, car: str) -> np.ndarray:
-    """各关节采样的黑标位置（车体系 m，z 为 FK 自己的零点，世界 z 还要减 car_hit_pos_z_offset）。"""
-    eab = load_test_src("extract_arm_bag")
-    return np.asarray([eab.fk(q, car=car)["marker"] for q in q_rad], dtype=np.float64)
+    """各关节采样的黑标位置（车体系 m，z 为臂模型 z，世界 z 还要减 marker_z_offset_m）：臂端点模型的刚体位形 pose
+    （生产代码，J1 轴倾斜 / 黑标偏置在内；只有关节角、没有力矩历史，动态项不在里面——只用来定 ROI / 截块中心）。"""
+    production = load_test_src("arm_production")
+    module = production.arm().endpoint
+    pose = production.endpoint(car).pose(np.atleast_2d(np.asarray(q_rad, dtype=np.float64)))
+    return np.asarray(module.field(pose, "marker", module.POSE), dtype=np.float64)
 
 
 def marker_z_offset_m(car: str) -> float:
-    eab = load_test_src("extract_arm_bag")
-    return float(eab.standard_kinematics(car).car_hit_pos_z_offset(car))
+    """臂模型 z 的零点 − 地面（车型 hit_pos_z_offset_m，端点模型载入的值）。"""
+    return float(load_test_src("arm_production").endpoint(car).z_offset)
+
+
+def slot_joint_names(car: str) -> tuple:
+    """控制器 6 槽的 ROS 关节名（臂生产代码 ArmEndpoint.slot_names；None = 空槽）。"""
+    return load_test_src("arm_production").slot_names(car)
 
 
 def inflate_hull(points: np.ndarray, radius: float) -> np.ndarray:

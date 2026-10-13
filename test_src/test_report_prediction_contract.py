@@ -803,16 +803,17 @@ def test_continuous_sweep_saved_bypasses_legacy_remaining_gate(tmp_path):
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
 def test_arm_point_world_contract_uses_yaw_and_ground_height(tmp_path):
-    """x/y 按 yaw 旋转；z 从 FK 安装面换到地面，缺任一变换量就不出数。"""
+    """x/y 按 yaw 旋转；z = 端点模型自己给的离地高（页面不再减 zOffset），缺任一量就不出数。"""
     script = (
         "const isNum=v=>typeof v==='number'&&Number.isFinite(v);\n"
         + _core("arm-point-world-core-begin", "arm-point-world-core-end")
-        + "\nconst tcp=armPointWorld([2,1,3],90,-0.5);\n"
+        + "\nconst tcp=armPointWorld({p:[2,1,3],h:3.5},90);\n"
           "const accepted=[2,4];\n"
           "const error=[(tcp[0]-accepted[0])*100,(tcp[2]-accepted[1])*100];\n"
-          "const missingYaw=armPointWorld([2,1,3],null,-0.5);\n"
-          "const missingZOffset=armPointWorld([2,1,3],90,null);\n"
-          "console.log(JSON.stringify({tcp,accepted,error,missingYaw,missingZOffset}));\n"
+          "const missingYaw=armPointWorld({p:[2,1,3],h:3.5},null);\n"
+          "const missingHeight=armPointWorld({p:[2,1,3],h:null},90);\n"
+          "const missingPoint=armPointWorld(null,90);\n"
+          "console.log(JSON.stringify({tcp,accepted,error,missingYaw,missingHeight,missingPoint}));\n"
     )
     result = _run_node(tmp_path, script)
 
@@ -820,7 +821,8 @@ def test_arm_point_world_contract_uses_yaw_and_ground_height(tmp_path):
     assert result["accepted"] == [2, 4]
     assert result["error"] == pytest.approx([-300, -50])
     assert result["missingYaw"] is None
-    assert result["missingZOffset"] is None
+    assert result["missingHeight"] is None
+    assert result["missingPoint"] is None
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
@@ -835,7 +837,7 @@ def test_arm_origin_translation_and_target_truth_preserve_historical_origin(tmp_
           "const zeroYaw=carRelativePointToArm([1,2,3],0,.045);\n"
           "const missingYaw=pcTruthForTarget(truth,{armOrigin:true},null,.045);\n"
           "const missingOffset=pcTruthForTarget(truth,{armOrigin:true},0,null);\n"
-          "const tcpArm=armPointWorld([1,.2,1.2],90,-.17);\n"
+          "const tcpArm=armPointWorld({p:[1,.2,1.2],h:1.37},90);\n"
           "const visualCar=[tcpArm[0]-.045,tcpArm[1],tcpArm[2]];\n"
           "const visualArm=carRelativePointToArm(visualCar,90,.045);\n"
           "console.log(JSON.stringify({legacy,unchanged:legacy===truth,arm,zeroYaw,"
@@ -1198,14 +1200,15 @@ def test_rk300_table_anchors_everything_on_finalht():
     assert "const accepted=fin?fin.accepted:lastAcceptedForThrow(th);" in table
     assert "const RL_TARGET_FREEZE_LEAD_S=0.030;" in source
     assert "const tRef=fin.ht-REF_LEAD_TARGET;" in source
-    # TCP 只锚 FinalHT；不另找过面
-    assert "const tcp=finalHt!=null?tcpAt(finalHt):null;" in table
+    # TCP 只锚 FinalHT；不另找过面。TCP = 臂端点动态模型的甜点（Python 生成页面时调臂生产代码算好），离地高由端点给
+    assert "const tcp=finalHt!=null?sweetAt(finalHt):null;" in table
     assert "tcpAt(accHt)" not in source
     assert "armExecutionContactAt" not in source
     assert "armTcpFiveSampleAt" not in source
     assert "const tcpYawDeg=carYawAcc;" in table
-    assert "const tcpWorld=armPointWorld(tcp,tcpYawDeg,armConstCal.zOff);" in table
-    assert "p[2]-zArmMinusWorld" in source
+    assert "const tcpWorld=armPointWorld(tcp,tcpYawDeg);" in table
+    assert "return rotated ? [rotated[0],rotated[1],pt.h] : null;" in source
+    assert "zArmMinusWorld" not in source
     assert "armZOff" not in source
     # 臂目标：RL=FinalHT 消息自身 rel_x/rel_z，规则=最后 accepted 的（late 只改 ht）；目标侧不做任何变换
     assert "const aimIsFinal=!!(fin&&(fin.source==='final_plan'||fin.source==='rl_status'||fin.source==='rl_recon'));" in table
@@ -1215,8 +1218,8 @@ def test_rk300_table_anchors_everything_on_finalht():
     assert "const tcpAimDx=tcpWorld&&aim?(tcpWorld[0]-aim[0])*100:null;" in table
     assert "const tcpAimDz=tcpWorld&&aim?(tcpWorld[2]-aim[1])*100:null;" in table
     assert "直接取上游 /predict_hit_pos rel_x/z=(" in table
-    assert "z_world=z_FK−zOffset=" in table
-    assert "zOffset=臂模型z−世界z" in table
+    assert "z_world=离地高 " in table
+    assert "端点模型给的：臂模型 z − 车型 hit_pos_z_offset_m" in table
     assert "tcp−目标 dx/dz=" in table
     assert "tableXyzCm(tcpWorld[0],tcpWorld[1],tcpWorld[2])+', '" in table
     assert table.count("<td>'+tcpCell+'</td>") == 1
@@ -1231,7 +1234,7 @@ def test_rk300_table_anchors_everything_on_finalht():
         "PC真值@Pre300HT+zPhase<br>x/y/z(cm)<br>(y为球接触面)</th>",
         "PC真值@FinalHT+zPhase<br>x/y/z(cm)<br>(y为球接触面)</th>",
         "TCP@FinalHT x/y/z(cm,世界轴)<br>相对机械臂中心地面点z=0<br>tcp−臂目标（dx，dz）</th>",
-        "视觉拍心−车心@FinalHT+zPhase附近<br>x/y/z(cm,世界轴)<br>人工轨迹或最近前/后＋ht前逐帧；视觉−同曝光FK黑标（dx，dy，dz）</th>",
+        "视觉拍心−车心@FinalHT+zPhase附近<br>x/y/z(cm,世界轴)<br>人工轨迹或最近前/后＋ht前逐帧；视觉−同曝光模型黑标（dx，dy，dz）</th>",
         "车yaw@FinalHT<br>(°)</th>",
         "目标挥拍速度/yaw/pitch<br>(m/s, °, °)<br>碰撞 / 求解</th>",
         "拍面yaw,pitch / 世界拍心speed<br>@FinalHT<br>(°,°,m/s;世界系)</th>",
@@ -1301,9 +1304,11 @@ def test_rk300_table_anchors_everything_on_finalht():
     assert "const T=ys(RK.bot,'imu_t')||[], VX=ys(RK.bot,'vx'), VY=ys(RK.bot,'vy')" in source
     assert "const vCar=botVelocityAt(t), yawDeg=botYawDegAt(t), yawRate=imuYawRateAt(t);" in source
     assert "CA.bot_center.params.arm_forward_offset_m" in source
-    # yaw 刚体项的杠杆必须是拍心点 p_head 本身（速度算的是哪个点，杠杆就得是哪个点）
+    # yaw 刚体项的杠杆必须是拍速那个点本身（端点甜点 sweet；速度 sweet_vel 也是它的）
     assert "racketWorldVelocity(vArm,head,vCar,yawDeg,yawRate,armForwardOffsetM)" in source
-    assert "const head=[0,1,2].map(k=>lerp(s.a.p_head[k],s.b.p_head[k],s.f));" in source
+    assert "const head=[0,1,2].map(k=>lerp(s.a.sweet[k],s.b.sweet[k],s.f));" in source
+    assert "const vArm=[0,1,2].map(k=>lerp(s.a.sweet_vel[k],s.b.sweet_vel[k],s.f));" in source
+    assert "p_head" not in source
     assert "不回退 arm-only" in source
     assert "const FACE_YAW_PRE_S=0.012;" in source
     assert "racketSpeedRawAt(finalHt-FACE_YAW_PRE_S)" in table
@@ -1413,220 +1418,36 @@ def test_racket_world_speed_is_vector_sum_with_car_center_offset(tmp_path):
     assert result["enMissing"] is None
 
 
-@pytest.mark.parametrize("car,fp0", [("v03", 15.42), ("v04", 15.42)])
-def test_add_face_angles_wiring_and_fk_properties(car, fp0):
-    """拍面yaw,pitch,拍心/拍速的 Python 侧：正确附加 fy/fp、跳过残缺关节；
-    FK 性质：零位 fy=fp=0（拍面朝正前且不上仰）、J1 为垂直轴（Δfy=−Δq1 精确、fp 分毫不动
-    ——这正是 pitch 列不需要减车 yaw 的依据）。
-    拍速口径按车分（arm.head_model 自报）：v0.3 无柔度标定 → 解析 Jacobian，与数值差分一致、
-    只有 J1 转时退化成 |q̇1|·r（status speed= 的口径）；v0.4 走冻结柔度模型 F，**必须同时有
-    effort** 才出 p_head/v_tcp_arm，故这里这批没 effort 的帧在 v04 下一律不出速度（F 的细节
-    见 test_add_face_angles_v04_head_is_frozen_compliance_central_difference）。
-    拍面角在两车下恒等（旋转链一致），位置/拍速则不同。"""
-    pytest.importorskip("numpy")
-    import math
-    import sys
+def test_report_arm_quantities_come_from_the_arm_production_code():
+    """页面的臂量（方案判决、黑标 / 甜点 / 拍面 / 拍速）全由 _add_production 调臂生产代码现算（test_src/arm_production.py）；
+    报告侧不再有逐帧 FK、拍面角、v04 冻结拍头这些第二份实现。"""
+    source = SRC.read_text(encoding="utf-8")
+    assert "_add_production(data[\"arm\"], tracker_json_path=input_path)" in source
+    assert "import arm_production as _ap" in source
+    for gone in ("_add_face_angles", "_frozen_head_model", "_head_effective_q", "eab.fk(", "fk_source"):
+        assert gone not in source, gone
+    # 页面读写进 states 的端点量，不自己算
+    for key in ("s.sweet_vel", "s.face_yaw", "s.face_pitch", "s.j1_speed", "c.j1_speed"):
+        assert key in source, key
 
+
+def test_add_production_reports_unavailable_production_and_keeps_the_page(tmp_path, monkeypatch):
+    """臂 checkout 里没有要调的生产代码时：plan_audit / endpoint 写 unavailable + 原因，HTML 照出（页面打橙条、相应列为 —）。"""
     sys.path.insert(0, str(SRC.parent))
     try:
-        from generate_curve3_html import _add_face_angles
-        import extract_arm_bag as eab
+        import arm_production as ap
+        import generate_curve3_html as gch
     finally:
         sys.path.pop(0)
-    eab.use_car(car)
-    fk = eab.fk
-
-    q = [0.1, -0.2, 0.3, 0.15, -0.4, 0.25]
-    q1p = [0.3] + q[1:]
-    qd = [1.3, -0.4, 0.7, 0.2, -0.9, 0.5]
-    arm = {"states": [
-        {"t": 1.0, "position": q},
-        {"t": 1.1, "position": [0.1, None, 0.3, 0.15, -0.4, 0.25]},  # 关节缺失
-        {"t": 1.2, "position": q[:5]},                               # 非 6 关节
-        {"t": 1.3},                                                  # 无 position
-        {"t": 1.4, "position": [0.0] * 6},
-        {"t": 1.5, "position": q1p},
-        {"t": 1.6, "position": q, "velocity": qd},
-        {"t": 1.7, "position": q, "velocity": [2.0, 0.0, 0.0, 0.0, 0.0, 0.0]},
-        {"t": 1.8, "position": q, "velocity": [0.0] * 6},
-        {"t": 1.9, "position": q, "velocity": [0.1, None, 0, 0, 0, 0]},  # 速度残缺
-    ]}
-    _add_face_angles(arm, car=car)
-    s = arm["states"]
-    assert arm["fk_car"] == car and arm["fk_source"].startswith(f"extract_arm_bag.fk({car})")
-    assert isinstance(s[0].get("fy"), float)
-    assert isinstance(s[0].get("fp"), float)
-    assert all("fy" not in r and "fp" not in r for r in s[1:4])
-    assert s[4]["fy"] == pytest.approx(0.0, abs=1e-6)          # 零位拍面朝正前
-    assert s[4]["fp"] == pytest.approx(0.0, abs=1e-6)          # 零位拍面不上仰
-    assert s[5]["fy"] - s[0]["fy"] == pytest.approx(           # J1 垂直轴：Δfy = −Δq1
-        -math.degrees(0.2), abs=0.02
-    )
-    assert s[5]["fp"] == s[0]["fp"]                            # 纯 z 转不动 n_z ⇒ pitch 不变
-    assert s[0]["fp"] == pytest.approx(fp0, abs=0.01)          # 该位形的拍面上仰角（回归锚）
-    # 三维速度只在有 6 个数值 velocity 的帧上出现；不再只存无法与车速向量合成的模长。
-    assert all("v_tcp_arm" not in s[i] for i in (0, 5, 9))
-    assert all("vt" not in row for row in s)
-    if car == "v04":
-        # 冻结柔度模型三个输入缺一不可：这批帧没有 effort ⇒ 整批无 p_head、无拍速
-        assert arm["head_model"]["kind"] == "frozen_compliance"
-        assert arm["head_model"]["velocity"] == "central_difference"
-        assert all("v_tcp_arm" not in row and "p_head" not in row for row in s)
-        assert "冻结柔度模型" in arm["fk_source"]
-        return
-    assert arm["head_model"]["kind"] == "rigid_fk_jacobian"     # v0.3 没有柔度标定
-    assert "拍速=解析 Jacobian" in arm["fk_source"]
-    # 解析 Jacobian 三分量 ≡ 数值差分（沿 q̇ 方向前推一小步的位移速率）
-    step = 1e-6
-    tcp0 = fk(q)["tcp"]
-    tcp1 = fk([a + step * b for a, b in zip(q, qd)])["tcp"]
-    numeric_vec = [(float(tcp1[i]) - float(tcp0[i])) / step for i in range(3)]
-    assert s[6]["v_tcp_arm"] == pytest.approx(numeric_vec, abs=1e-4)
-    assert s[6]["p_head"] == pytest.approx([float(v) for v in tcp0], abs=1e-4)  # 刚性 TCP 原样
-    # 只有 J1 转时退化成 |q̇1|·r（触球瞬间的构造，也是 status speed= 的口径）
-    lever = math.hypot(tcp0[0], tcp0[1])
-    assert math.dist(s[7]["v_tcp_arm"], [0.0, 0.0, 0.0]) == pytest.approx(
-        2.0 * lever, abs=1e-4
-    )
-    assert s[8]["v_tcp_arm"] == [0.0, 0.0, 0.0]                # 静止帧拍速为 0
-
-
-def test_add_face_angles_v04_head_is_frozen_compliance_central_difference():
-    """v0.4 的拍心/拍速合同：p_head = 冻结柔度模型 F(q, q̇, τ)，拍速 = 它的 ±10ms 中心差分。
-
-    钉四条：① 零载荷零速时 F 退化成「刚性 TCP + R·tool_offset + [dx,dy,0]」的纯几何偏置；
-    ② 有力矩时 q_eff 真的按 c·τ 偏（J1 正负载荷不同系数），p_head 随之偏离刚性 TCP；
-    ③ v_tcp_arm 就是相邻 ±10ms 两帧 p_head 的割线，不是 J(q)·q̇——同一批帧上两者数值不同；
-    ④ 差分端点被 >30ms 的断档隔开时不出速度（空闲段 20Hz 会走到这条）。"""
-    pytest.importorskip("numpy")
-    import json
-    import sys
-
-    import numpy as np
-
-    sys.path.insert(0, str(SRC.parent))
-    try:
-        from generate_curve3_html import _add_face_angles, _frozen_head_model
-        import extract_arm_bag as eab
-    finally:
-        sys.path.pop(0)
-    eab.use_car("v04")
-    model = _frozen_head_model("v04")
-    spec = json.loads(Path(model["path"]).read_text(encoding="utf-8"))
-    link6 = eab.JOINTS[-1]["child"]
-
-    def ref_point(q, qd, tau):
-        c = spec["compliance_rad_per_Nm"]
-        qe = list(map(float, q))
-        qe[0] -= (c["j1_positive_effort"] * max(tau[0], 0.0)
-                  + c["j1_negative_effort"] * min(tau[0], 0.0)
-                  + spec["j1_velocity_seconds"] * qd[0])
-        for j in (2, 3, 4):
-            qe[j] -= c[f"j{j + 1}"] * tau[j]
-        r = eab.fk(qe)
-        rot = np.asarray(r["link_transforms"][link6][:3, :3], dtype=float)
-        return (np.asarray(r["tcp"], dtype=float)
-                + rot @ np.asarray(spec["tool_offset_m"], dtype=float)
-                + np.asarray([*spec["base_xy_offset_m"], 0.0], dtype=float))
-
-    q0 = [0.1, -0.2, 0.3, 0.15, -0.4, 0.25]
-    qd = [4.0, -0.4, 0.7, 0.2, -0.9, 0.5]
-    tau = [37.0, -6.0, 3.0, -8.0, 2.5, 0.4]
-    dt = 0.010
-    # 100Hz 一段（12 帧）+ 一段 60ms 断档后的孤立帧
-    ts = [1.000 + k * dt for k in range(12)] + [1.170, 1.180]
-    states = []
-    for i, t in enumerate(ts):
-        q = [a + b * (t - ts[0]) for a, b in zip(q0, qd)]
-        states.append({"t": round(t, 6), "position": q,
-                       "velocity": list(qd), "effort": list(tau)})
-    # 静止零载荷帧（放在最后一段之后，自带 ±10ms 邻居）
-    rest_t = [1.400, 1.410, 1.420]
-    for t in rest_t:
-        states.append({"t": t, "position": list(q0), "velocity": [0.0] * 6,
-                       "effort": [0.0] * 6})
-    arm = {"car": "v04", "states": states}
-    _add_face_angles(arm, car="v04")
-    s = arm["states"]
-
-    # ① 零载荷零速 ⇒ 纯几何偏置
-    rest = s[len(ts) + 1]
-    rigid = np.asarray(eab.fk(q0)["tcp"], dtype=float)
-    assert rest["p_head"] == pytest.approx(ref_point(q0, [0.0] * 6, [0.0] * 6), abs=1e-4)
-    assert float(np.linalg.norm(np.asarray(rest["p_head"]) - rigid)) > 0.005   # 偏置非零
-    assert rest["v_tcp_arm"] == [0.0, 0.0, 0.0]                # 静止帧拍速为 0
-
-    # ② 有力矩时 q_eff 真的偏，p_head 离开刚性 TCP
-    mid = s[5]
-    assert mid["p_head"] == pytest.approx(ref_point(mid["position"], qd, tau), abs=1e-4)
-    assert float(np.linalg.norm(
-        np.asarray(mid["p_head"])
-        - np.asarray(eab.fk(mid["position"])["tcp"], dtype=float))) > 0.02
-
-    # ③ 拍速 ≡ 相邻 ±10ms 两帧 p_head 的割线，且明显不等于 J(q)·q̇
-    # p_head 落盘只留 0.1mm（4 位），拿它反算割线自带 ±0.0001/0.02 = ±5mm/s 的量化噪声
-    secant = [(b - a) / (2 * dt) for a, b in zip(s[4]["p_head"], s[6]["p_head"])]
-    assert mid["v_tcp_arm"] == pytest.approx(secant, abs=6e-3)
-    res = eab.fk(mid["position"])
-    jac = np.zeros(3)
-    for rate, joint in zip(qd, eab.JOINTS):
-        frame = res["joint_frames"][joint["name"]]
-        jac += rate * np.cross(frame[:3, :3] @ joint["axis"],
-                               res["tcp"] - frame[:3, 3])
-    assert float(np.linalg.norm(np.asarray(mid["v_tcp_arm"]) - jac)) > 0.05
-
-    # ④ 端点被 >30ms 断档隔开 ⇒ 有 p_head 但没有拍速（首尾帧同理）
-    assert "p_head" in s[len(ts) - 1] and "v_tcp_arm" not in s[len(ts) - 1]
-    assert "p_head" in s[0] and "v_tcp_arm" not in s[0]
-    assert arm["head_model"]["sha256"] == model["sha256"]
-    assert arm["head_model"]["half_window_ms"] == pytest.approx(10.0)
-
-
-def test_v04_head_point_matches_rl_arm_frozen_endpoint():
-    """报告端的 p_head 必须与 rl_arm/env/frozen_endpoint.py 逐值相同。
-
-    两边现在共用同一个资产文件，但公式是各自写的一份（报告端不 import rl_arm，避免把
-    torch 拖进报告链）。这条测试就是那份「同一口径」的锁：训练环境评分用哪个点、
-    报告页面上的拍速/e_n 就得是同一个点，否则线上线下的甜点定义会悄悄分叉。"""
-    pytest.importorskip("numpy")
-    pytest.importorskip("torch")          # frozen_endpoint 模块级 import torch
-    import sys
-
-    import numpy as np
-
-    rl_arm = Path(os.environ.get("TENNIS_MAN_ROOT", "D:/tennis-man")) / "rl_arm"
-    if not (rl_arm / "env" / "frozen_endpoint.py").is_file():
-        pytest.skip(f"rl_arm checkout 不在 {rl_arm}")
-    sys.path.insert(0, str(SRC.parent))
-    sys.path.insert(0, str(rl_arm))
-    try:
-        from generate_curve3_html import _frozen_head_model, _head_effective_q
-        import extract_arm_bag as eab
-        from env.frozen_endpoint import FrozenEndpoint
-    finally:
-        sys.path.pop(0)
-        sys.path.pop(0)
-    eab.use_car("v04")
-    head = _frozen_head_model("v04")
-    link6 = eab.JOINTS[-1]["child"]
-
-    class _FkAdapter:                      # FrozenEndpoint 的 numpy 分支只用这两样
-        fk = staticmethod(eab.fk)
-        JOINTS = eab.JOINTS
-
-    rng = np.random.default_rng(20260907)
-    q = rng.uniform(-1.0, 1.0, size=(16, 6))
-    v = rng.uniform(-6.0, 6.0, size=(16, 6))
-    tau = rng.uniform(-60.0, 60.0, size=(16, 6))
-    ref = FrozenEndpoint(_FkAdapter()).point(q, v, tau)
-    mine = []
-    for qi, vi, ti in zip(q, v, tau):
-        r = eab.fk(_head_effective_q(head, qi, vi, ti))
-        mine.append(np.asarray(r["tcp"], dtype=float)
-                    + np.asarray(r["link_transforms"][link6][:3, :3], dtype=float)
-                    @ np.asarray(head["tool_offset"], dtype=float)
-                    + np.asarray(head["base_offset"], dtype=float))
-    assert np.abs(np.asarray(mine) - ref).max() == 0.0
+    monkeypatch.setattr(ap, "ARM_CONTROLLER_ROOT", tmp_path / "no_arm_here")
+    monkeypatch.setattr(ap, "_MODS", None)
+    monkeypatch.setattr(ap, "_ENDPOINTS", {})
+    arm = {"car": "v05", "states": [], "commands": [], "events": []}
+    gch._add_production(arm)
+    assert arm["production_car"]["car"] == "v05"
+    for key in ("plan_audit", "endpoint"):
+        assert arm[key]["status"] == "unavailable"
+        assert "no_arm_here" in arm[key]["reason"]
 
 
 def test_rk300_table_puts_reject_reasons_in_finalht_cell_when_no_accepted():
@@ -1747,10 +1568,14 @@ def test_visual_racket_rows_before_ht_keep_own_throw_and_full_window(tmp_path):
     )
 
     source = SRC.read_text(encoding="utf-8")
-    # 35ms 内缺帧时，前/后条目回退到测量窗内最近帧（dt 如实显示），不做宽窗拟合。
+    # 主格只放 FinalHT±35ms 内的黑标；没有就标「无黑标」（HT 附近没有车定位帧时在线不截块），测量窗里更远的帧只进悬停，
+    # 不进格子、不进黑标统计（合同行 visualMarkerNearHt=false 供下游剔除），也不做宽窗拟合。
     assert "const RACKET_RAW_FAR_MAX_SEC=0.46;" in source
-    assert "visRawEntry(visPair.before||visPairFar.before,'前')" in source
-    assert "visRawEntry(visPair.after||visPairFar.after,'后')" in source
+    assert "[visRawEntry(visPair.before,'前'), visRawEntry(visPair.after,'后')]" in source
+    assert "visPair.before||visPairFar.before" not in source
+    assert "const noMarkerNearHt=racketBlackMarker&&!visEntries.length;" in source
+    assert "armContractRows[armContractRows.length-1].visualMarkerNearHt=racketBlackMarker?!noMarkerNearHt:null;" in source
+    assert '">无黑标</span>' in source
     assert "visualRacketRowsBeforeHt(pcRacketRows,idx+1,visPcT)" in source
 
 

@@ -42,6 +42,9 @@ def _merge_racket_json(base_data: dict, racket_data: dict, racket_json_path: str
     ):
         if key in racket_cfg:
             merged_cfg[key] = racket_cfg[key]
+    # 收场黑标测量的「视觉 − 端点动态模型黑标」残差汇总（racket_ht_black_marker.model_residual_summary），页面只显示
+    if isinstance(racket_cfg.get("model_residual"), dict):
+        merged_cfg["racket_model_residual"] = racket_cfg["model_residual"]
 
     for key in (
         "video_frame_mapping_exact",
@@ -129,26 +132,18 @@ def _merge_racket_impact_json(
     return merged
 
 
-# ---- /joint_states 关节时刻对齐（两相 CAN 调度） -------------------------------------------
+# ---- /joint_states 关节时刻对齐（两相 CAN 调度）：报告本身已不用，只留给 tennis-man rl_arm/l1pd 认调度 ------------------
+# 报告的黑标 / 甜点 / 拍面 / 拍速一律由臂生产代码现算（_add_production → test_src/arm_production.py）：逐关节真实采样时刻用的是
+# 端点标定同一个读包工具 arm_controller.tools.arm_endpoint_bag.joint_samples（只认 two_phase_j1_j4 与面板直驱 full），不再用本段。
+# 本段留着只因为 tennis-man 的 rl_arm/l1pd/data.py（层 1 灰盒辨识）还靠它认每场跑的是哪个发送调度（two_phase_j1 / two_phase_j1_j4）
+# 并按调度把各轴放回采样时刻；臂读包工具支持 two_phase_j1 之后 l1pd 改调臂、本段删除。
 # arm_controller_cpp 的 /joint_states 一条消息里各轴不是同刻采的：header.stamp 是快照里**最新一帧**
 # 反馈的 CAN 到达时刻，而每个 tick(5ms) 只按两相调度发命令（control/tx_schedule.hpp），帧间 tx_gap≈0.5ms，
 # 每帧命令触发一条反馈。各车跑过的调度（车型 yaml control.tx_schedule 的历史值）：
 #   v0.4 two_phase_j1_j5：A 相 J1,J2,J3,J5,J4（5 帧）     B 相 J1,J5,J6（3 帧）
 #   v0.5 two_phase_j1   ：A 相 J1,J2,J3,J4（4 帧）        B 相 J1,滚转（2 帧；五轴臂没有槽 4，滚转在槽 5）——2026-10-10 前
 #   v0.5 two_phase_j1_j4：A 相 J1,J2,J3,J4,滚转（5 帧）   B 相 J1,J2,J3,J4（4 帧）——2026-10-10 起（J1–J4 200 Hz）
-# 所以 J1 每相第一个采，v0.4 比戳老 4g(A)/2g(B)≈2.2/1.2ms；two_phase_j1 下 J2/J3/J4 只在 A 相刷新，
-# B 相快照里是 5ms 前的旧值（槽 5 反之）。报告端按戳线性插值 FK 会让 J1 平均滞后 ~2ms、J2-J4 ~4ms（0905 实测，
-# memory/v04-fk-vs-vision-time-shift-0905.md）。这里在页面侧把每轴样本放回真实采样时刻，再把六轴
-# 都插值到该行的戳时刻，之后的 TCP/拍面角/拍速全部基于同刻六轴。只动 states，commands 原样
-# （其 stamp=tx_done，各轴生效时刻同样早 (n−k)·g，但那是零阶保持语义，不在本函数范围）。
-# **调度按每场数据自己认，不读当前 yaml**：yaml 只说现在用什么，换调度后旧场次照样要按旧调度对齐
-# （1010 改 two_phase_j1_j4 之前这里读 yaml，一改 yaml 所有历史场次都会静默失去对齐）。
-# 臂重启（/joint_states 断开 >1s）切段，逐段在本车跑过的调度里认：戳间隔两峰 A→B≈5−d·g、B→A≈5+d·g
-# （d = A、B 两相帧数差：j1_j5 / j1 是 2，j1_j4 是 1），两峰中位数之差反解出的 g 必须落在 0.40–0.70ms
-# （实测 0828~1010 各场 0.515~0.52ms）；再用"与上一行相比哪些轴变了"复核（只在 A 相发的轴只在 A 行变，B 反之）。
-# 每行的相位：变化模式优先，静止段没变化时用戳间隔。认不出的段（老 v0.3 单相节点、全轴 full 调度、
-# 合成数据、行数太少）原样不动；整场一段都认不出就返回 None，页面与从前完全一致。
-# 相表逐项抄臂端 tx_phase（偶数拍 A、奇数拍 B）；车上没有的槽发之前剔掉，与 tx_phase(present_mask) 同。
+# 调度按每场数据自己认（两峰戳间隔 + 变化模式），认不出的段原样不动；相表逐项抄臂端 tx_phase。
 _TX_SCHEDULE_PHASES = {
     "two_phase_j1_j5": {"A": (0, 1, 2, 4, 3), "B": (0, 4, 5)},
     "two_phase_j1": {"A": (0, 1, 2, 3), "B": (0, 4, 5)},
@@ -164,83 +159,17 @@ _ALIGN_MAX_BRACKET_MS = 25.0    # 单轴相邻样本超过它视为反馈断档�
 _TX_GAP_RANGE_MS = (0.40, 0.70)  # 反解出的 g 不在此范围 ⇒ 不是这个调度（d=1 与 d=2 的两峰距离因此不重叠）
 _ALIGN_SEGMENT_GAP_S = 1.0      # /joint_states 断开超过它 = 臂重启，前后分段各认调度
 
-# ---- 拍心点：v0.4 冻结柔度模型 F（2026-09-07 定案） -----------------------------------------
-# 原来这里把「拍心」当成 FK(q) 的刚性 TCP，拍速就是解析 Jacobian J(q)·q̇。0907 的黑标三场
-# 证明那是错的：臂是弹性链，编码器角度不等于拍头实际所在——受载时拍心落在 FK 后方 ~157mm，
-# 卸载回收 66mm，卸载段视觉比编码器 FK 快 +2.5m/s（tracker_20260907_062833 的
-# codex_chain_audit/correction/mechanics/SPRING_VY.md）。冻结前向模型 F 把「反馈 → 视觉黑标点」
-# 的 XZ 残差从原始 FK 的 25.6mm（规则）/11.8mm（RL）压到 9.3 / 4.4mm：
-#   q1_eff = q1 − c1⁺·max(τ1,0) − c1⁻·min(τ1,0) − d·q̇1 ；q3/4/5_eff = q − c_j·τ_j
-#   p_head = FK(q_eff) + R_link6(q_eff)·tool_offset + [dx, dy, 0]
-# 所以**拍速必须是 p_head 的时间导数**，不再是 J(q)·q̇——两者在触球时刻差 0.4~0.9m/s（本项目
-# 0907_185746 场 8 挥全部低于旧口径 15~35%），e_n 也跟着变。
-# 导数取 ±10ms 中心差分：与 rl_arm/env/swing_env.py 的评分口径逐式一致（那边 dt=控制拍），
-# 且 /joint_states 挥拍段就是 100Hz，±10ms 正好落在相邻两帧上，不引入额外平滑。
-# 单源：模型文件只有 rl_arm/assets/v04/visual_endpoint_20260907.json 一份（与
-# arm_controller_data/link_validation_20260907/model.json 逐字节相同，sha256 973fbcd7…）。
-# v0.3 没有对应标定，仍走解析 Jacobian，靠 arm.head_model.kind 在页面上自报家门。
-_HEAD_MODEL_REL = Path("rl_arm") / "assets" / "v04" / "visual_endpoint_20260907.json"
-_HEAD_VEL_HALF_WINDOW_S = 0.010   # 中心差分半窗
-_HEAD_VEL_MAX_GAP_S = 0.030       # 差分端点所在的相邻样本间隔超过它就不出速度（空闲段 20Hz 会被挡掉）
-_HEAD_MODELS: dict[str, dict] = {}
-
-
-def _frozen_head_model(car: str) -> dict | None:
-    """加载该车的冻结柔度拍心模型；没有标定的车返回 None（不伪造、不回退到别的车）。"""
-    if car in _HEAD_MODELS:
-        return _HEAD_MODELS[car]
-    model = None
-    if car == "v04":
-        import hashlib
-
-        import extract_arm_bag as _eab
-
-        root = Path(os.environ.get(
-            "TENNIS_MAN_ROOT", Path(_eab.ARM_CONTROLLER_ROOT).parent))
-        path = root / _HEAD_MODEL_REL
-        if not path.is_file():
-            raise SystemExit(
-                f"冻结柔度拍心模型不存在：{path}"
-                "（设 TENNIS_MAN_ROOT 指向 tennis-man checkout）")
-        raw = path.read_bytes()
-        spec = json.loads(raw.decode("utf-8"))
-        model = {
-            "path": path,
-            "sha256": hashlib.sha256(raw).hexdigest(),
-            "spec": spec,
-            "compliance": spec["compliance_rad_per_Nm"],
-            "tool_offset": spec["tool_offset_m"],
-            "base_offset": [*spec["base_xy_offset_m"], 0.0],
-            "j1_velocity_s": spec["j1_velocity_seconds"],
-        }
-    _HEAD_MODELS[car] = model
-    return model
-
-
-def _head_effective_q(model: dict, q, qd, tau) -> list[float]:
-    """反馈 (q, q̇, τ) → 柔度修正后的等效关节角。逐式复刻 rl_arm/env/frozen_endpoint.py。"""
-    c = model["compliance"]
-    qe = [float(v) for v in q]
-    tau1 = float(tau[0])
-    qe[0] -= (c["j1_positive_effort"] * max(tau1, 0.0)
-              + c["j1_negative_effort"] * min(tau1, 0.0)
-              + model["j1_velocity_s"] * float(qd[0]))
-    for j in (2, 3, 4):
-        qe[j] -= c[f"j{j + 1}"] * float(tau[j])
-    return qe
-
 
 def _tx_schedules(car: str | None) -> tuple[dict, dict] | None:
     """本车跑过的两相调度 → ({调度名: {相: 槽序（已剔除车上没有的槽）}}, {槽: 关节标签 Jn})。
 
-    标签按本车 ROS 关节名（v0.5 的滚转是 joint5 → J5，虽然它在槽 5）。
-    v0.3（单相节点、臂端已无 yaml）与没登记调度的车返回 None——不对齐。
+    标签按本车 ROS 关节名（v0.5 的滚转是 joint5 → J5，虽然它在槽 5）。没登记调度的车返回 None——不对齐。
     """
     import extract_arm_bag as _eab
 
-    if car not in _eab.STANDARD_CARS or car not in _CAR_TX_SCHEDULES:
+    if car not in _eab.CARS or car not in _CAR_TX_SCHEDULES:
         return None
-    names = _eab.CAR_MODELS[car].slot_joint_names
+    names = _eab.slot_joint_names(car)
     present = {j for j, name in enumerate(names) if name is not None}
     tables = {s: {p: tuple(j for j in order if j in present)
                   for p, order in _TX_SCHEDULE_PHASES[s].items()}
@@ -430,187 +359,61 @@ def _time_align_joint_states(arm, car: str | None) -> dict | None:
     }
 
 
-def _add_face_angles(arm, *, tracker_json_path: str | None = None, car: str | None = None) -> None:
-    """给 arm.states 逐帧附加 fy/fp/p_head/v_tcp_arm，并按本场车型复算 TCP。
+def _add_production(arm, *, tracker_json_path: str | None = None, car: str | None = None) -> None:
+    """臂生产代码现算本页要的全部臂量（test_src/arm_production.py；本文件与页面 JS 不写任何臂公式 / 判据）：
 
-    fy/fp = FK 拍面法向（该车 link6 系的法向轴，前向规范化）在臂系的
-    yaw（°，atan2(x,y) 口径，与 PC回球 yaw 同式）与 pitch（°，asin(n_z)，正=开面上仰），
-    p_head = 拍心（甜点）在臂系的位置（m），v_tcp_arm = 它相对机械臂基座的三维线速度（m/s，臂系）。
-    单源复用 extract_arm_bag.fk（0801 dz/yawrate 分析脚本同一公式），不在 JS 里抄第二份 FK 链。
+    - arm["plan_audit"] + 逐条 /predict_hit_pos 的 event["check"]：臂节点收消息那一段 node::receive_hit_pos 的判决
+      （executable / solve_failed / rejected / old_version）与录包里臂自己 /tennis/status 的逐条收拒对账；
+    - arm["endpoint"] + states / commands 逐行：实测关节 → 端点动态模型（黑标 / 甜点 / 离地高 / 拍速 / 拍面 yaw·pitch），
+      命令关节 → 刚体位形（甜点），J1 杠杆拍速；读数先按零位帧登记表从录包那一帧平移到当前车型 yaml 的帧。
+    判不了（车型不在端点模型里、零位帧未登记、调度不认识、checkout 里没有生产代码……）写 status + 原因，页面照常出、相应列为 —。
+    车型：显式 car > arm JSON 的 "car" > 本场 tracker JSON 的 config.car_config_path 推断（extract_arm_bag.car_for_session 单源）。
+    """
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)   # 作为模块被别处 import 时 sys.path[0] 不是本目录
+    import traceback
 
-    **车型**：v0.3 与 v0.4 是两台不同的臂，TCP 差几厘米（见 extract_arm_bag 文件头）。
-    取值序：显式 car > arm JSON 的 "car"（新版 extract_arm_bag 写的）> 本场 tracker JSON 的
-    config.car_config_path 推断。老 arm JSON 的 tcp 是按当年写死的 v0.3 链算的，与本场车型
-    不符时**整表 tcp 就地按正确车型复算**（states 顺手、commands 补算），页面因此永远与
-    所选车型自洽，不必为了改车型重跑 rosbag 提取。
-    **pitch 不需要减车 yaw**：J1/BASE_ROT 都是纯 z（垂直）转，只搬 n 的水平分量、不动 n_z，
-    故臂系 pitch ≡ 世界 pitch（车无 roll/pitch 前提），比 yaw 少一个误差源。
-    **拍心点与拍速（2026-09-07 改口径）**：v0.4 的 p_head 走冻结柔度模型 F（见文件上方
-    `_frozen_head_model` 注释）——臂是弹性链，FK(q) 的刚性 TCP 不是拍头实际所在；拍速 =
-    p_head 的 ±10ms 中心差分（`_HEAD_VEL_HALF_WINDOW_S`），与 rl_arm swing_env 评分同式。
-    差分端点必须被间隔 ≤`_HEAD_VEL_MAX_GAP_S` 的相邻样本夹住，夹不住就不出速度（空闲段
-    /joint_states 只有 20Hz，会被这道门挡掉，挥拍段 100Hz 不受影响）。
-    v0.3 没有柔度标定，p_head 仍是 FK 的刚性 TCP，拍速走解析 Jacobian
-    v_tcp = Σ_j q̇_j·(a_j×(p_tcp−o_j))（a_j=R_j·axis、o_j=p_j 都在同一次 fk 的 joint_frames 里）。
-    两条路都必须保留三维向量，后续才能与同刻车体平移及 yaw 刚体速度做世界系向量合成。
-    缺 velocity（v0.4 还要 effort）的帧只出 fy/fp。关节残缺（None 或非 6 关节）时跳过该帧，报告列显示 —。
-    导入失败不让整份报告挂掉，但必须打到 stderr：2026-08-05 前 run_tracker 的
-    post-run 把 ROS2 pixi 的 site-packages 留在 PYTHONPATH 里，子进程 import numpy
-    命中 conda 版 C 扩展加载失败，这里静默 return 让两列拍面角整场空白，只有手工
-    重跑才有（已由 run_tracker._report_tool_env 根治）。"""
-    try:
-        _here = str(Path(__file__).resolve().parent)
-        if _here not in sys.path:
-            sys.path.insert(0, _here)   # 作为模块被别处 import 时 sys.path[0] 不是本目录
-        import numpy as _np
-        import extract_arm_bag as _eab
-    except Exception as exc:
-        print(
-            f"[report] 拍面yaw,pitch,拍速 三量不可用：import extract_arm_bag 失败（{exc!r}）",
-            file=sys.stderr,
-        )
+    import arm_production as _ap
+    import extract_arm_bag as _eab
+
+    if not isinstance(arm, dict):
         return
-    import math as _m
-    states = arm.get("states") if isinstance(arm, dict) else None
-    if not isinstance(states, list):
-        return
-    # 车型：显式 > arm JSON 自述 > tracker JSON 推断（extract_arm_bag.car_for_session 单源）。
-    # 三条都没有就整列留空——宁可空也不按错车算，那种错在页面上毫无征兆。
-    arm_car = arm.get("car") if isinstance(arm, dict) else None
     try:
         car, car_source = _eab.car_for_session(arm, tracker_json_path, car)
-    except Exception as exc:
-        print(
-            f"[report] 臂 FK 车型未知（{exc}）：TCP / 拍面角 / 拍速 全列留空。"
-            f"重跑 test_src/extract_arm_bag.py --car {'|'.join(_eab.CAR_MODELS)} 出 _arm.json 即可。",
-            file=sys.stderr,
-        )
-        return
-    model = _eab.use_car(car)
-    fk, JOINTS = _eab.fk, _eab.JOINTS
-    arm["fk_car"] = car
-    arm["fk_car_source"] = car_source
-    # 老 arm JSON（或换了车）里的 tcp 是别的车算的，commands 侧没人复算 → 这里补上。
-    stale_tcp = arm_car != car
-    arm["fk_source"] = f"extract_arm_bag.fk({car})"
-    if stale_tcp:
-        arm["fk_recomputed_from"] = arm_car or "未记车型（旧版 extract_arm_bag，即 v03 链）"
-        arm["fk_source"] += f"（页面复算；arm JSON 原为 {arm['fk_recomputed_from']}）"
-        n_cmd = _eab.recompute_tcp(arm.get("commands"))
-        print(f"[report] arm JSON 的 TCP 按 {arm['fk_recomputed_from']} 算，"
-              f"本场是 {car}（{car_source}）——就地按 {car} 复算 TCP"
-              f"（commands {n_cmd} 行，states 随下面的逐帧 FK 一起）。")
-    # 关节时刻对齐（两相 CAN 调度）：对齐后六轴同刻，TCP 必须按对齐后的关节整表复算。
-    align = _time_align_joint_states(arm, car)
-    if align:
-        arm["joint_time_alignment"] = align
-        arm["fk_source"] += "（关节时刻已按两相 CAN 调度对齐到戳，见 joint_time_alignment）"
-        print(f"[report] /joint_states 关节时刻对齐：{align['summary']}；"
-              f"states {align['rows']} 行（A {align['phase_rows']['A']} / B {align['phase_rows']['B']} / "
-              f"未判 {align['phase_rows']['unknown']}），position 对齐 "
-              f"{align['components_aligned']['position']} 分量、保留原值 "
-              f"{align['components_kept_raw']['position']}。commands 未动。")
-    rewrite_tcp = stale_tcp or bool(align)
-    link6 = JOINTS[-1]["child"]
-    face_axis = model.face_normal_in_link6
-    head = _frozen_head_model(car)
-    six = lambda v: (isinstance(v, list) and len(v) == 6
-                     and all(isinstance(x, (int, float)) for x in v))
-    head_t: list[float] = []
-    head_p: list[list[float]] = []
-    head_row: list[dict] = []
-    for s in states:
-        q = s.get("position") if isinstance(s, dict) else None
-        if not six(q):
-            continue
-        res = fk(q)
-        rot = res["link_transforms"][link6]
-        # 拍面法向 = R·(该车 link6 系法向轴)；前向规范化要同时翻 n_z，否则 pitch 会跟着 n_y 变号
-        n0, n1, n2 = (float(v) for v in rot[:3, :3] @ face_axis)
-        if n1 < 0:
-            n0, n1, n2 = -n0, -n1, -n2
-        s["fy"] = round(_m.degrees(_m.atan2(n0, n1)), 2)
-        s["fp"] = round(_m.degrees(_m.asin(max(-1.0, min(1.0, n2)))), 2)
-        tcp = res["tcp"]
-        if rewrite_tcp:
-            s["tcp"] = [round(float(v), 4) for v in tcp]
-        # 黑标（实体拍面中心）：与视觉拍心 / 黑标比对用它；tcp 是甜点（v05 1009 起在黑标往拍喉 2 cm）
-        s["marker"] = [round(float(v), 4) for v in res["marker"]]
-        qd = s.get("velocity")
-        if not six(qd):
-            continue
-        if head is None:
-            # v0.3：无柔度标定，拍心 = 刚性 TCP，拍速 = 解析 Jacobian
-            s["p_head"] = [round(float(v), 4) for v in tcp]
-            vel = _np.zeros(3)
-            for rate, joint in zip(qd, JOINTS):
-                frame = res["joint_frames"][joint["name"]]
-                axis = frame[:3, :3] @ joint["axis"]
-                vel += rate * _np.cross(axis, tcp - frame[:3, 3])
-            s["v_tcp_arm"] = [round(float(v), 4) for v in vel]
-            continue
-        tau = s.get("effort")
-        t = s.get("t")
-        if not six(tau) or not isinstance(t, (int, float)):
-            continue
-        eff = fk(_head_effective_q(head, q, qd, tau))
-        p = (eff["tcp"]
-             + eff["link_transforms"][link6][:3, :3] @ _np.asarray(head["tool_offset"])
-             + _np.asarray(head["base_offset"]))
-        s["p_head"] = [round(float(v), 4) for v in p]
-        head_t.append(float(t))
-        head_p.append([float(v) for v in p])
-        head_row.append(s)
-    if head is not None and head_t:
-        # p_head 的 ±10ms 中心差分。两个端点各自要被间隔 ≤_HEAD_VEL_MAX_GAP_S 的相邻样本夹住，
-        # 否则（空闲 20Hz 段、反馈断档）该帧不出拍速——宁可显示 — 也不跨断档线性外插。
-        arr_t = _np.asarray(head_t)
-        arr_p = _np.asarray(head_p)
-        half = _HEAD_VEL_HALF_WINDOW_S
-        n = len(head_t)
+    except Exception as exc:  # noqa: BLE001
+        car, car_source = None, str(exc)
+    arm["production_car"] = {"car": car, "source": car_source}
+    run = Path(tracker_json_path).stem if tracker_json_path else Path(str(arm.get("bag_dir") or "")).name.removesuffix("_rosbag")
 
-        def _at(t_q):
-            k = int(_np.searchsorted(arr_t, t_q))
-            # 端点正好落在某个样本上（等间隔采样常这样）：直接取它，别去看它两侧的断档——
-            # 端点本身有实测支撑，隔壁有没有空洞与这个取值无关。
-            for j in (k - 1, k):
-                if 0 <= j < n and abs(arr_t[j] - t_q) <= 1e-6:
-                    return arr_p[j]
-            if k <= 0 or k >= n:
-                return None
-            t0, t1 = arr_t[k - 1], arr_t[k]
-            if t1 - t0 > _HEAD_VEL_MAX_GAP_S:
-                return None
-            return arr_p[k - 1] + (arr_p[k] - arr_p[k - 1]) * ((t_q - t0) / (t1 - t0))
+    def guarded(label: str, compute) -> dict:
+        if car is None:
+            return {"status": "unavailable", "reason": f"推不出车型：{car_source}"}
+        try:
+            return compute()
+        except _ap.Unavailable as exc:
+            return {"status": "unavailable", "reason": str(exc), "car": car}
+        except Exception as exc:  # noqa: BLE001 —— 生产代码 / 本页的程序错误：页面红条写明，HTML 照出
+            print(f"[report] {label}出错：{exc!r}", file=sys.stderr)
+            traceback.print_exc()
+            return {"status": "error", "reason": f"{type(exc).__name__}: {exc}", "car": car}
 
-        n_vel = 0
-        for i, s in enumerate(head_row):
-            a, b = _at(arr_t[i] - half), _at(arr_t[i] + half)
-            if a is None or b is None:
-                continue
-            s["v_tcp_arm"] = [round(float(v), 4) for v in (b - a) / (2.0 * half)]
-            n_vel += 1
-        print(f"[report] 拍心走冻结柔度模型 {head['path'].name}"
-              f"（sha256 {head['sha256'][:8]}…，{head['spec'].get('session')}）："
-              f"p_head {len(head_t)} 帧、±{half * 1000:.0f}ms 中心差分出拍速 {n_vel} 帧。")
-    arm["head_model"] = ({
-        "kind": "frozen_compliance",
-        "car": car,
-        "path": str(head["path"]),
-        "sha256": head["sha256"],
-        "session": head["spec"].get("session"),
-        "formula": head["spec"].get("formula"),
-        "velocity": "central_difference",
-        "half_window_ms": _HEAD_VEL_HALF_WINDOW_S * 1000.0,
-        "max_bracket_gap_ms": _HEAD_VEL_MAX_GAP_S * 1000.0,
-    } if head is not None else {
-        "kind": "rigid_fk_jacobian",
-        "car": car,
-        "reason": f"{car} 无冻结柔度标定：拍心=FK(q) 刚性 TCP，拍速=解析 Jacobian",
-    })
-    arm["fk_source"] += ("（拍心=冻结柔度模型 " + head["path"].name
-                         + f" + ±{_HEAD_VEL_HALF_WINDOW_S * 1000:.0f}ms 中心差分）"
-                         if head is not None else "（拍心=刚性 TCP，拍速=解析 Jacobian）")
+    audit = guarded("方案判决", lambda: {"status": "ok", **_ap.plan_audit(arm, car)})
+    arm["plan_audit"] = audit
+    ep = guarded("端点", lambda: _ap.endpoint_for_arm(arm, car, run))
+    arm["endpoint"] = ep
+    if audit.get("status") == "ok":
+        v = audit["verdicts"]
+        print(f"[report] 方案判决（臂 node::receive_hit_pos，{audit['arm_checkout'].get('commit')}）：可执行 {v['executable']}、"
+              f"求解失败报告 {v['solve_failed']}、不收 {v['rejected']}、旧版本 {v['old_version']}；臂 status 对账 "
+              f"{audit['arm_status_vs_verdict']}")
+    else:
+        print(f"[report] 方案判决不可用：{audit.get('reason')}", file=sys.stderr)
+    if ep.get("status") == "ok":
+        print(f"[report] 端点（臂 arm_endpoint，{ep['arm_checkout'].get('commit')}）：{ep['rows']} 行实测、"
+              f"{ep['commands_rows']} 行命令；零位帧 {ep['frame']['recorded']}（{ep['frame']['source']}）→ {ep['frame']['current']}")
+    else:
+        print(f"[report] 端点不可用：{ep.get('reason')}", file=sys.stderr)
 
 
 def generate_html(
@@ -636,7 +439,7 @@ def generate_html(
         )
     if arm_json_path:
         data["arm"] = _load_json(arm_json_path)
-        _add_face_angles(data["arm"], tracker_json_path=input_path)
+        _add_production(data["arm"], tracker_json_path=input_path)
     if rk_tracking_json_path:
         data["rk_tracking"] = _load_json(rk_tracking_json_path)
     if rk_time_bias is not None:
@@ -1964,36 +1767,18 @@ const SWING_HT_UPDATE_MIN_REMAINING_SEC=0.060;
 // → 这里整场 catch 掉 → armPreds 空 → 回配 0 票 → 臂表整列 —，页面上却没有任何报错
 // （0809 103849 场）。截断已修，但解析失败仍要显式暴露，见 armDataWarnHtml。
 // [[final-hit-plan-parse-core-begin]]
-const FINAL_HIT_PLAN_CONTRACT='final_hit_plan/v1';
-// 指纹前缀 = bot_center return_hit_model.hpp 的 kContract / kContractFiveAxis：六轴臂甜点在
-// 「过臂中心、垂直拍面法向」的线上；五轴臂（v05，没有腕转）甜点绕 J1 偏 φ'，挥拍方向随之转。
-// 上旋方案（world3d_topspin_v1_*，bot_center return_topspin_racket_vz_mps>0）几何同上，碰撞换旋转模型
-// spin_cross_v1：出球 = 零旋等效（en, kt）出球 + spin_c·R·(ω_in×n)（臂 control/spin_ball.hpp，臂端同式对账）。
-// 五轴上旋 v2（2026-10-09 起的 v05 生产方案）：甜点对准冲量质心 = 球心 − R·n（含仰角）+ τ·v_切，载荷多 contact_slide_sec（τ）。
-const FINAL_HIT_PLAN_FINGERPRINT_RE=/^world3d_((effective_v3|topspin_v1)_(arm_center|five_axis)|topspin_v2_five_axis)_sweetspot:[0-9a-f]{16}$/;
-const FINAL_HIT_PLAN_FIVE_AXIS_RE=/^world3d_(effective_v3|topspin_v1|topspin_v2)_five_axis_sweetspot:/;
-const FINAL_HIT_PLAN_SPIN_RE=/^world3d_topspin_v[12]_/;
-const FINAL_HIT_PLAN_CENTROID_PREFIX='world3d_topspin_v2_';
-const FINAL_HIT_PLAN_SPIN_FIELDS=['spin_c','incoming_spin_wx','incoming_spin_wy','incoming_spin_wz',
-  'outgoing_spin_wx','outgoing_spin_wy','outgoing_spin_wz'];
-const FINAL_HIT_PLAN_FINITE_FIELDS=[
-  'source_ct','generated_at','contact_ht','n_points',
-  'contact_rel_x','contact_rel_y','contact_rel_z',
-  'arm_target_rel_x','arm_target_rel_y','arm_target_rel_z',
-  'contact_x','contact_y','contact_z','incoming_vx','incoming_vy','incoming_vz',
-  'arm_center_x','arm_center_y','arm_center_vx','arm_center_vy',
-  'car_center_x','car_center_y','car_center_vx','car_center_vy',
-  'arm_forward_offset_m','tennis_ball_radius_m','arm_target_x_bias_m','arm_target_z_bias_m',
-  'racket_contact_vx','racket_contact_vy','racket_contact_vz',
-  'car_yaw_at_ht','car_yaw_rate_at_ht','face_normal_yaw_world','face_pitch',
-  'face_normal_nx','face_normal_ny','face_normal_nz',
-  'compensated_speed','outgoing_vx','outgoing_vy','outgoing_vz',
-  'landing_x','landing_y','apex_z_world','net_clearance_m','collision_en','collision_kt',
-  'solve_iterations','solve_ms'
-];
+// /predict_hit_pos 逐条收不收由 Python 在生成页面时用臂生产代码判好写进 event.check（test_src/arm_production.py →
+// 臂 arm_controller.hit_pos → C++ node::receive_hit_pos，臂节点收消息那一段），页面只读、不判、不对账：
+//   executable   解析通过（臂会交给路由）→ 进 armPreds；
+//   old_version  旧契约 / 按另一份臂标定解的方案：当前生产代码判不了它当时该不该收，照用录包里臂当时的受理（ACK）→ 进 armPreds，标旧版本；
+//   rejected     当前臂契约不收 → armPlanContractErrors（文本 = 臂 /tennis/status 原文，逐字同）；
+//   solve_failed bot 求解失败报告（final_hit_plan + plan_status = solve_failed）→ armSolveFailed，单独统计原因，不算合同错误；
+//   没有 check   生成页面时臂生产代码不可用（原因在 ARM.plan_audit）→ 进 armPreds，标未判。
+// 方案要进 FinalHT 回配，至少得有身份与时刻（plan_id / revision / source_ct / generated_at / contact_ht）；缺了只能记一笔、不用。
 const planIdentityKey=(planId,revision)=>String(planId)+'\u001f'+String(revision);
 let armPredParseBad=0, armPredTotal=0, armPreaimCount=0, armPanelHitCount=0;
-const armPlanContractErrors=[];
+const armPlanContractErrors=[], armSolveFailed=[], armPlanUnusable=[];
+const armPlanVerdictCounts={executable:0, old_version:0, unchecked:0};
 let hasStructuredHitMessages=false;
 const armPreds = (()=>{
   if(!ARM) return [];
@@ -2003,154 +1788,38 @@ const armPreds = (()=>{
     armPredTotal+=1;
     try{
       const p=JSON.parse(e.text);
+      const c=e.check||null;
       if(Object.prototype.hasOwnProperty.call(p,'kind')){
         if(p.kind==='panel_hit'){
           armPanelHitCount+=1;
           return;
         }
         hasStructuredHitMessages=true;
+        if(c&&c.verdict==='solve_failed'){
+          armSolveFailed.push({t:e.t, planId:p.plan_id, revision:p.revision,
+                               reason:c.fail_reason, detail:c.fail_detail});
+          return;
+        }
+        if(c&&c.verdict==='rejected'){
+          armPlanContractErrors.push(String(c.text));
+          return;
+        }
         if(p.kind==='preaim_hint'){
           armPreaimCount+=1;
-          const bad=p.contract!=='preaim_hint/v1'||typeof p.hint_id!=='string'||!p.hint_id
-            ||!Number.isInteger(p.revision)||p.revision<1
-            ||!['source_ct','generated_at','estimate_ht','n_points',
-                'estimate_rel_x','estimate_rel_y','estimate_rel_z',
-                'car_yaw_estimate','face_normal_yaw_seed'].every(k=>isNum(p[k]))
-            ||!Number.isInteger(p.n_points)||p.n_points<1
-            ||!(p.source_ct<=p.generated_at&&p.generated_at<p.estimate_ht);
-          if(bad) armPlanContractErrors.push('PreAimHint '+String(p.hint_id||'?')+'#'+String(p.revision)+' 合同缺失/非法');
           return;
         }
         if(p.kind!=='final_hit_plan'){
-          armPlanContractErrors.push('未知 kind='+String(p.kind));
+          armPlanContractErrors.push('未知 kind='+String(p.kind)+'（生产代码未判）');
           return;
         }
-        const missing=[];
-        if(p.contract!==FINAL_HIT_PLAN_CONTRACT) missing.push('contract='+String(p.contract));
-        if(typeof p.plan_id!=='string'||!p.plan_id) missing.push('plan_id');
-        if(!Number.isInteger(p.revision)||p.revision<1) missing.push('revision');
-        if(typeof p.model_fingerprint!=='string'||!FINAL_HIT_PLAN_FINGERPRINT_RE.test(p.model_fingerprint))
-          missing.push('model_fingerprint');
-        const spinModel=typeof p.model_fingerprint==='string'
-          &&FINAL_HIT_PLAN_SPIN_RE.test(p.model_fingerprint);
-        const centroidModel=typeof p.model_fingerprint==='string'
-          &&p.model_fingerprint.startsWith(FINAL_HIT_PLAN_CENTROID_PREFIX);
-        if(centroidModel&&!(isNum(p.contact_slide_sec)&&p.contact_slide_sec>0&&p.contact_slide_sec<=0.01))
-          missing.push('contact_slide_sec(0,0.01]');
-        // 臂端同口径（node/messages.hpp）：上旋指纹必须带 collision_model=spin_cross_v1，零旋指纹不得带
-        if(spinModel!==Object.prototype.hasOwnProperty.call(p,'collision_model'))
-          missing.push('collision_model与指纹不符');
-        else if(spinModel&&p.collision_model!=='spin_cross_v1')
-          missing.push('collision_model='+String(p.collision_model));
-        if(spinModel){
-          FINAL_HIT_PLAN_SPIN_FIELDS.forEach(k=>{ if(!isNum(p[k])) missing.push(k); });
-          if(isNum(p.spin_c)&&!(p.spin_c>0&&p.spin_c<1)) missing.push('spin_c(0,1)');
-        }
-        FINAL_HIT_PLAN_FINITE_FIELDS.forEach(k=>{ if(!isNum(p[k])) missing.push(k); });
-        if(isNum(p.source_ct)&&isNum(p.contact_ht)&&!(p.source_ct<p.contact_ht)) missing.push('source_ct<contact_ht');
-        if(isNum(p.generated_at)&&isNum(p.source_ct)&&p.generated_at<p.source_ct) missing.push('generated_at>=source_ct');
-        if(isNum(p.generated_at)&&isNum(p.contact_ht)&&p.generated_at>=p.contact_ht) missing.push('generated_at<contact_ht');
-        if(isNum(p.solve_iterations)&&(!Number.isInteger(p.solve_iterations)||p.solve_iterations<1||p.solve_iterations>4))
-          missing.push('solve_iterations[1,4]');
-        if(isNum(p.solve_ms)&&p.solve_ms<0) missing.push('solve_ms>=0');
-        if(isNum(p.n_points)&&(!Number.isInteger(p.n_points)||p.n_points<1)) missing.push('n_points');
-        if(isNum(p.arm_forward_offset_m)&&p.arm_forward_offset_m<0) missing.push('arm_forward_offset_m>=0');
-        if(isNum(p.tennis_ball_radius_m)&&p.tennis_ball_radius_m<=0) missing.push('tennis_ball_radius_m>0');
-        if(isNum(p.compensated_speed)&&p.compensated_speed<=0) missing.push('compensated_speed>0');
-        if(isNum(p.collision_en)&&p.collision_en<0) missing.push('collision_en>=0');
-        if(isNum(p.collision_kt)&&p.collision_kt<0) missing.push('collision_kt>=0');
-        if(['contact_x','contact_y','contact_z','arm_center_x','arm_center_y',
-            'contact_rel_x','contact_rel_y','contact_rel_z'].every(k=>isNum(p[k]))){
-          const relErr=Math.hypot(
-            p.contact_x-p.arm_center_x-p.contact_rel_x,
-            p.contact_y-p.arm_center_y-p.contact_rel_y,
-            p.contact_z-p.contact_rel_z);
-          if(relErr>1e-4) missing.push('contact_rel_xyz一致性');
-        }
-        if(['arm_center_x','arm_center_y','arm_center_vx','arm_center_vy',
-            'car_center_x','car_center_y','car_center_vx','car_center_vy',
-            'car_yaw_at_ht','car_yaw_rate_at_ht'].every(k=>isNum(p[k]))){
-          const rx=-p.arm_forward_offset_m*Math.sin(p.car_yaw_at_ht);
-          const ry= p.arm_forward_offset_m*Math.cos(p.car_yaw_at_ht);
-          const armErr=Math.hypot(p.arm_center_x-(p.car_center_x+rx),p.arm_center_y-(p.car_center_y+ry));
-          const armVErr=Math.hypot(p.arm_center_vx-(p.car_center_vx-p.car_yaw_rate_at_ht*ry),
-                                   p.arm_center_vy-(p.car_center_vy+p.car_yaw_rate_at_ht*rx));
-          if(armErr>1e-4||armVErr>1e-4) missing.push('car→arm刚体变换一致性');
-        }
-        const fiveAxis=typeof p.model_fingerprint==='string'
-          &&FINAL_HIT_PLAN_FIVE_AXIS_RE.test(p.model_fingerprint);
-        // 水平触球平面只对六轴成立（拍面过臂中心）；五轴拍面离臂中心 along·tan φ'，
-        // 这层几何由下面的挥拍切向一并校验（φ' 取自臂的 face table，报告端不复算）。
-        if(!fiveAxis&&['contact_rel_x','contact_rel_y','face_normal_yaw_world','tennis_ball_radius_m'].every(k=>isNum(p[k]))){
-          const nhx=-Math.sin(p.face_normal_yaw_world), nhy=Math.cos(p.face_normal_yaw_world);
-          const plane=nhx*p.contact_rel_x+nhy*p.contact_rel_y;
-          if(Math.abs(plane-p.tennis_ball_radius_m)>1e-4) missing.push('水平触球平面一致性');
-        }
-        if(['face_normal_nx','face_normal_ny','face_normal_nz','face_normal_yaw_world','face_pitch'].every(k=>isNum(p[k]))){
-          const nNorm=Math.hypot(p.face_normal_nx,p.face_normal_ny,p.face_normal_nz);
-          const yaw=Math.atan2(-p.face_normal_nx,p.face_normal_ny);
-          const pitch=Math.asin(Math.max(-1,Math.min(1,p.face_normal_nz)));
-          const wrap=a=>Math.atan2(Math.sin(a),Math.cos(a));
-          if(Math.abs(nNorm-1)>1e-5||Math.abs(wrap(yaw-p.face_normal_yaw_world))>1e-5
-             ||Math.abs(pitch-p.face_pitch)>1e-5) missing.push('拍面法向/yaw/pitch一致性');
-        }
-        if(['contact_rel_x','contact_rel_y','contact_rel_z','arm_target_rel_x','arm_target_rel_y',
-            'arm_target_rel_z','face_normal_yaw_world','tennis_ball_radius_m',
-            'arm_target_x_bias_m','arm_target_z_bias_m'].every(k=>isNum(p[k]))){
-          const sn=Math.sin(p.face_normal_yaw_world), cs=Math.cos(p.face_normal_yaw_world);
-          // 甜点：旧口径 = 球心沿水平拍面法向退 R、高度 = 球心高；v2 冲量质心 = 球心 − R·n（含仰角）+ τ·v_切
-          // （v_切 = 来球相对拍速度去掉法向分量；bot_center return_hit_model.cpp physical_sweet_spot_relative 同式）
-          let sweet=[p.contact_rel_x+p.tennis_ball_radius_m*sn,p.contact_rel_y-p.tennis_ball_radius_m*cs,p.contact_rel_z];
-          if(centroidModel&&isNum(p.contact_slide_sec)
-             &&['face_normal_nx','face_normal_ny','face_normal_nz','incoming_vx','incoming_vy','incoming_vz',
-                'racket_contact_vx','racket_contact_vy','racket_contact_vz'].every(k=>isNum(p[k]))){
-            const n=[p.face_normal_nx,p.face_normal_ny,p.face_normal_nz];
-            const c=[p.contact_rel_x,p.contact_rel_y,p.contact_rel_z];
-            const rel=[p.incoming_vx-p.racket_contact_vx,p.incoming_vy-p.racket_contact_vy,p.incoming_vz-p.racket_contact_vz];
-            const along=rel.reduce((s,v,i)=>s+v*n[i],0);
-            sweet=c.map((v,i)=>v-p.tennis_ball_radius_m*n[i]+p.contact_slide_sec*(rel[i]-along*n[i]));
-          }
-          const targetErr=Math.hypot(
-            p.arm_target_rel_x-(sweet[0]+p.arm_target_x_bias_m),
-            p.arm_target_rel_y-sweet[1],
-            p.arm_target_rel_z-(sweet[2]+p.arm_target_z_bias_m));
-          if(targetErr>1e-4) missing.push('球心→拍心执行点一致性');
-        }
-        if(['arm_center_vx','arm_center_vy','car_yaw_rate_at_ht','arm_target_rel_x','arm_target_rel_y',
-            'compensated_speed','face_normal_yaw_world','racket_contact_vx','racket_contact_vy'].every(k=>isNum(p[k]))){
-          // 拍心世界水平速度 = 臂中心速度 + ω×甜点 + 补偿拍速 × 挥拍方向。挥拍方向 = 甜点绕 J1 的切向：
-          // 六轴即拍面水平法向；五轴 = ẑ×t̂（t = 臂中心→甜点水平向量，= 法向再转 φ'，bot_center
-          // solve_fixed_apex），且甜点须在 J1 前侧（along>0 ⇔ 切向与法向夹角 <90°；另一侧是镜像根）。
-          const nhx=-Math.sin(p.face_normal_yaw_world), nhy=Math.cos(p.face_normal_yaw_world);
-          const tr=Math.hypot(p.arm_target_rel_x,p.arm_target_rel_y);
-          const ux=fiveAxis?-p.arm_target_rel_y/tr:nhx, uy=fiveAxis?p.arm_target_rel_x/tr:nhy;
-          const expectedVx=p.arm_center_vx-p.car_yaw_rate_at_ht*p.arm_target_rel_y+p.compensated_speed*ux;
-          const expectedVy=p.arm_center_vy+p.car_yaw_rate_at_ht*p.arm_target_rel_x+p.compensated_speed*uy;
-          if(!(Math.hypot(p.racket_contact_vx-expectedVx,p.racket_contact_vy-expectedVy)<=1e-4))
-            missing.push('拍心世界水平速度一致性');
-          if(fiveAxis&&!(ux*nhx+uy*nhy>0)) missing.push('五轴甜点在 J1 前侧');
-        }
-        if(['incoming_vx','incoming_vy','incoming_vz','racket_contact_vx','racket_contact_vy','racket_contact_vz',
-            'face_normal_nx','face_normal_ny','face_normal_nz','collision_en','collision_kt',
-            'outgoing_vx','outgoing_vy','outgoing_vz'].every(k=>isNum(p[k]))
-           &&(!spinModel||[...FINAL_HIT_PLAN_SPIN_FIELDS,'tennis_ball_radius_m'].every(k=>isNum(p[k])))){
-          const vin=[p.incoming_vx,p.incoming_vy,p.incoming_vz];
-          const vr=[p.racket_contact_vx,p.racket_contact_vy,p.racket_contact_vz];
-          const n=[p.face_normal_nx,p.face_normal_ny,p.face_normal_nz];
-          const u=vin.map((v,i)=>v-vr[i]), un=u.reduce((s,v,i)=>s+v*n[i],0);
-          // 上旋加旋转项 spin_c·R·(ω_in×n)：咬合未打滑时与 Cross 模型逐式相等（spin_ball.hpp::spin_transfer）
-          const k=spinModel?p.spin_c*p.tennis_ball_radius_m:0;
-          const w=spinModel?[p.incoming_spin_wx,p.incoming_spin_wy,p.incoming_spin_wz]:[0,0,0];
-          const transfer=[k*(w[1]*n[2]-w[2]*n[1]),k*(w[2]*n[0]-w[0]*n[2]),k*(w[0]*n[1]-w[1]*n[0])];
-          const replay=vr.map((v,i)=>v+p.collision_kt*(u[i]-un*n[i])-p.collision_en*un*n[i]+transfer[i]);
-          const outErr=Math.hypot(replay[0]-p.outgoing_vx,replay[1]-p.outgoing_vy,replay[2]-p.outgoing_vz);
-          if(outErr>1e-4) missing.push('碰撞前向复算一致性');
-        }
-        if(missing.length){
-          armPlanContractErrors.push('FinalHitPlan '+String(p.plan_id||'?')+'#'+String(p.revision)+' 缺失/非法：'+missing.join(','));
+        if(!(typeof p.plan_id==='string'&&p.plan_id&&Number.isInteger(p.revision)
+             &&['source_ct','generated_at','contact_ht'].every(k=>isNum(p[k])))){
+          armPlanUnusable.push(String(p.plan_id||'?')+'#'+String(p.revision));
           return;
         }
-        out.push({kind:p.kind, contract:p.contract, plan:p,
+        const verdict=c?c.verdict:'unchecked';
+        armPlanVerdictCounts[verdict]=(armPlanVerdictCounts[verdict]||0)+1;
+        out.push({kind:p.kind, contract:p.contract, plan:p, check:c, verdict,
                   planId:p.plan_id, revision:p.revision,
                   t:e.t, rel_x:p.contact_rel_x, rel_y:p.contact_rel_y, rel_z:p.contact_rel_z,
                   armTargetRelX:p.arm_target_rel_x, armTargetRelY:p.arm_target_rel_y,
@@ -2244,16 +1913,16 @@ const statusNum = (text,key) => {
 const armFinalPlans=armPreds.filter(p=>p.kind==='final_hit_plan');
 const armFinalPlanByKey=new Map();
 const armFinalPlanConflictKeys=new Set();
+const armPlanAckErrors=[];
+const armPlanAcks=[];
 armFinalPlans.forEach(p=>{
   const key=planIdentityKey(p.planId,p.revision), old=armFinalPlanByKey.get(key);
   if(old && JSON.stringify(old.plan)!==JSON.stringify(p.plan)){
-    armPlanContractErrors.push('重复计划身份 '+p.planId+'#'+p.revision+' 的 payload 不一致');
+    armPlanAckErrors.push('重复计划身份 '+p.planId+'#'+p.revision+' 的 payload 不一致');
     armFinalPlanByKey.delete(key);
     armFinalPlanConflictKeys.add(key);
   } else if(!old&&!armFinalPlanConflictKeys.has(key)) armFinalPlanByKey.set(key,p);
 });
-const armPlanAckErrors=[];
-const armPlanAcks=[];
 ((ARM&&ARM.events)||[]).forEach(e=>{
   if(e.topic!=='/tennis/status') return;
   const text=String(e.text||'');
@@ -2310,7 +1979,7 @@ const acceptedRecordForPlanAck=ack=>{
 // accepted↔计划对（armPlanAcks）。臂端 z = arm_target_rel_z + hit_pos_z_offset_m（车型量，
 // v04 −0.193109308），故 zOff = 众数(acc_z − arm_target_rel_z)；用 contact_rel_z 会混进
 // arm_target_z_bias_m。x 比例与提前量只服务旧状态回配，新合同下没有消费者，不标。
-// zOff 缺失时 TCP 列、视觉−FK黑标与黑标测量整场失效（0923 155028 场 40/40 —）。
+// TCP 列 / 视觉−模型黑标 / 黑标测量的高度已由臂端点模型直接给离地高（不再用 zOff）；zOff 只剩旧状态回配的值键与悬停溯源。
 const armConstCal = (()=>{
   const t0 = (RK && isNum(RK.t0)) ? RK.t0 : 0;
   const votes=new Map(), cands=[], ratios=[];
@@ -2465,7 +2134,7 @@ const _armHit = (()=>{
     }
   });
   // 逐拍保留最后进入 update_ht() 的 raw HT/CT，供预测盲区账使用；它不是 executed profile HT。
-  // TCP 列严格在这个 raw HT 取 /joint_states FK；不另找过面时刻。
+  // TCP 列严格在这个 raw HT 取 /joint_states 的端点动态模型甜点；不另找过面时刻。
   // 旧版无 sweep_w 日志仍保留一次性触发的剩余时间门。raw HT/CT 回配失败时不退 accepted 冒充。
   out.forEach(h=>{
     if(h.label!=='hit') return;
@@ -2500,28 +2169,68 @@ const _armHit = (()=>{
 })();
 // [[arm-swing-ht-core-end]]
 const armHitMarks = _armHit.marks;
-// 本页 TCP 用的是哪台车的 FK 链（Python _add_face_angles 按 arm JSON 的 car / 本场 tracker
-// JSON 的 car_config_path 定，并按它复算过 tcp）。两台车的臂不同，这条必须显示在 TCP 列上。
-const armFkCarNote = ARM
-  ? ('FK 车型 '+(ARM.fk_car||'未知')+
-     (ARM.fk_recomputed_from?'（本页按 '+ARM.fk_car+' 复算，arm JSON 原为 '+ARM.fk_recomputed_from+'）':'')+
-     (ARM.joint_time_alignment
-       ? '；关节时刻已按两相 CAN 调度对齐到 /joint_states 戳（'
-         +ARM.joint_time_alignment.summary+'；页面 FK/拍面角/拍速均取对齐后六轴）'
-       : ''))
-  : 'FK 车型 —';
+// 本页的臂量——方案收不收、黑标 / 甜点 / 拍面 / 拍速——全是 Python 生成页面时调臂生产代码算好写进数据的
+// （generate_curve3_html._add_production → test_src/arm_production.py）；页面只取值、插值、按车 yaw 转世界轴。
+// ARM.plan_audit / ARM.endpoint 是溯源（臂 checkout 与提交、零位帧、端点参数）或判不了的原因。
+const ARM_EP=(ARM&&ARM.endpoint)||null;
+const armEndpointOk=!!(ARM_EP&&ARM_EP.status==='ok');
+const armCheckoutText = co => co
+  ? (co.commit||'?')+(co.branch?'（'+co.branch+'）':'')+(co.dirty?'，工作树有未提交改动':'')+' @ '+(co.path||'?') : '—';
+const armFkCarNote = !ARM ? '臂生产代码 —'
+  : (armEndpointOk
+    ? ('臂生产代码 '+armCheckoutText(ARM_EP.arm_checkout)+'：实测关节 → 端点动态模型 eval_series（四电机共用时延 '
+       +(ARM_EP.dynamics.delay_s*1000).toFixed(2)+' ms、J1 柔度、J1–J4 间隙开关、J1 力矩致轴倾斜；静态 J1 轴倾斜 横滚/俯仰 '
+       +ARM_EP.tilt_deg.map(v=>v.toFixed(3)).join(' / ')+'°；逐关节真实采样时刻按两相 CAN 调度还原），命令关节 → 刚体位形；'
+       +'车型 '+ARM_EP.car+'，录包零位帧 '+ARM_EP.frame.recorded+'（'+ARM_EP.frame.source+'）→ 当前 '+ARM_EP.frame.current)
+    : ('黑标 / 甜点 / 拍面 / 拍速不可用：'+((ARM_EP&&ARM_EP.reason)||'生成页面时没有算')));
 // 臂数据整体失效的两种模式，以前都只在折叠备注里留一行，页面主体只剩满屏 "—"，
-// 看上去像"这场没数据"而不是"报告读不了数据"。这里升成表头红条（部分失配用橙条）。
+// 看上去像"这场没数据"而不是"报告读不了数据"。这里升成表头红条（部分失配用橙条）；生产代码判决与对账的汇总用灰条。
 // [[arm-data-warn-core-begin]]
 const armDataWarnHtml = (()=>{
   if(!ARM) return '';
-  const bad=[], warn=[];
+  const bad=[], warn=[], info=[];
+  const PA=ARM.plan_audit||null;
   if(armPredParseBad>0){
     bad.push('/predict_hit_pos 载荷解析失败 '+armPredParseBad+'/'+armPredTotal+' 条'+
       '——可能是旧 _arm.json 曾被截断，或消息本身不是合法 JSON。重跑最新版 extract_arm_bag.py 后仍失败需查发布端。');
   }
+  if(PA&&PA.status!=='ok')
+    bad.push('方案判决不可用（'+(PA.reason||PA.status)+'）：FinalHitPlan 一律按「未判」照臂当时的受理（ACK）使用');
   if(typeof armPlanContractErrors!=='undefined'&&armPlanContractErrors.length)
-    bad.push('新击球消息合同错误 '+armPlanContractErrors.length+' 条：'+armPlanContractErrors.slice(0,4).join('；'));
+    bad.push('当前臂契约不收 '+armPlanContractErrors.length+' 条（臂 node::receive_hit_pos 判，文本 = 臂 /tennis/status 原文）：'
+      +armPlanContractErrors.slice(0,4).join('；'));
+  if(PA&&PA.status==='ok'){
+    const ag=PA.arm_status_vs_verdict||{};
+    if(ag.disagree)
+      bad.push('生产判决与录包里臂的 /tennis/status 不一致 '+ag.disagree+' 条：'+(PA.disagreements||[]).slice(0,3)
+        .map(d=>d.id+'#'+d.revision+' 判 '+d.verdict+(d.verdict_text?'「'+d.verdict_text+'」':'')+'，臂「'+d.arm+'」').join('；'));
+    if(ag.missing)
+      warn.push(ag.missing+' 条方案在录包里找不到臂的 /tennis/status（录包首尾截断？）');
+    const v=PA.verdicts||{}, st=PA.arm_status_final_plans||{};
+    const kv=o=>Object.entries(o||{}).map(([k,n])=>k+' ×'+n).join('，');
+    info.push('方案判决（臂 node::receive_hit_pos，'+armCheckoutText(PA.arm_checkout)+'，臂标定指纹 '+PA.arm_calibration_fingerprint+'）：'
+      +'可执行 '+(v.executable||0)+'、旧版本 '+(v.old_version||0)+'、不收 '+(v.rejected||0)+'、bot 求解失败报告 '+(v.solve_failed||0)
+      +(v.solve_failed?'（'+kv(PA.solve_failed_reasons)+'；臂认出就丢、不发 status，不算合同错误）':'')
+      +'；臂 /tennis/status（FinalHitPlan）受理 '+(st.accepted||0)
+      +(Object.keys(st.reject||{}).length?'、拒 '+kv(st.reject):'')+(Object.keys(st.error||{}).length?'、错 '+kv(st.error):'')
+      +'；逐条对账 一致 '+(ag.agree||0)+(ag.arrival?'、送达晚造成的拒收 '+ag.arrival:'')+(ag.not_compared?'、旧版本不比 '+ag.not_compared:''));
+  }
+  const MR=typeof cfg!=='undefined'?cfg.racket_model_residual:null;
+  if(MR&&MR.groups&&Object.keys(MR.groups).length){
+    const sgn=v=>(v>=0?'+':'')+Number(v).toFixed(1);
+    info.push('<br>视觉 − 模型黑标（收场黑标测量 racket_ht_black_marker：锚 = 端点动态模型黑标、不加本场偏差；车体系 x 右 y 前 z 上，mm；'
+      +'按击球侧 × 离 FinalHT 时间窗）：'
+      +Object.entries(MR.groups).map(([k,g])=>k.replace('forehand','正手').replace('backhand','反手').replace('unknown','侧别未知')
+        +' n='+g.n+' 3D 中位 '+Number(g.median_3d_mm).toFixed(1)+' / rms '+Number(g.rms_3d_mm).toFixed(1)
+        +'，分量中位 ('+g.median_xyz_car_mm.map(sgn).join(', ')+')').join('；'));
+  }
+  if(typeof armPlanVerdictCounts!=='undefined'&&armPlanVerdictCounts.old_version)
+    warn.push('旧版本场次，当前生产代码不校验：'+armPlanVerdictCounts.old_version+' 条 FinalHitPlan（'
+      +Object.keys((PA&&PA.old_version_reasons)||{}).join('；')+'）照用录包里臂当时的受理（ACK）');
+  if(typeof armPlanUnusable!=='undefined'&&armPlanUnusable.length)
+    warn.push(armPlanUnusable.length+' 条 FinalHitPlan 缺身份 / 时刻字段，不进 FinalHT 回配：'+armPlanUnusable.slice(0,4).join('、'));
+  if(typeof ARM_EP!=='undefined'&&ARM_EP&&!armEndpointOk)
+    warn.push('黑标 / 甜点 / 拍面 / 拍速不可用（'+ARM_EP.reason+'）：TCP、拍面、拍速、视觉−模型黑标与 e_n 各列为 —');
   if(typeof armPlanAckErrors!=='undefined'&&armPlanAckErrors.length)
     bad.push('FinalHitPlan/ACK 原子回配错误 '+armPlanAckErrors.length+' 条：'+armPlanAckErrors.slice(0,4).join('；'));
   if(typeof hasStructuredHitMessages!=='undefined'&&hasStructuredHitMessages&&armFinalPlans.length>0&&!armPlanAcks.length)
@@ -2540,40 +2249,38 @@ const armDataWarnHtml = (()=>{
       _armHit.nMatch+' 条原始 /predict_hit_pos（'+keys+'）——失配那些拍的 accepted 目标、'+
       '击球真值、TCP 各列为 —。');
   }
-  const box=(color,bg,head,msgs)=>msgs.length?('<div style="border:1px solid '+color+';'+
-    'background:'+bg+';color:'+color+';font-weight:600;border-radius:8px;'+
+  const box=(color,bg,head,msgs,weight=600)=>msgs.length?('<div style="border:1px solid '+color+';'+
+    'background:'+bg+';color:'+color+';font-weight:'+weight+';border-radius:8px;'+
     'padding:8px 12px;margin:0 0 10px">'+head+msgs.join('　')+'</div>'):'';
   return box('#e94560','rgba(233,69,96,0.12)','⚠ 臂数据读取失败：',bad)+
-    box('#e0a24a','rgba(224,162,74,0.12)','⚠ 臂数据部分失配：',warn);
+    box('#e0a24a','rgba(224,162,74,0.12)','⚠ 臂数据部分失配：',warn)+
+    box('#a0a0c0','rgba(160,160,192,0.08)','臂生产代码：',info,400);
 })();
 // [[arm-data-warn-core-end]]
-const armTcpRows = ARM ? ARM.states.filter(s=>Array.isArray(s.tcp)) : [];
-// 在机械臂 state 时间轴按 HT 有界插值 FK TCP；相邻 state 超过 100ms 时不外推。
-const tcpAt = t => {
-  const s=interpRow(armTcpRows,t,0.1);
-  if(!s || !Array.isArray(s.a.tcp) || !Array.isArray(s.b.tcp)) return null;
-  return [0,1,2].map(k=>lerp(s.a.tcp[k],s.b.tcp[k],s.f));
+// 甜点（sweet，臂瞄准的点）/ 黑标（marker，视觉标定基准）：车体系（x 右、y 前，原点 = J1 轴）+ 臂模型 z，
+// 另带离地高 sweet_h / marker_h（= z − 车型 hit_pos_z_offset_m，端点模型给的）。实测行 = 端点动态模型。
+// 按 HT 有界插值；相邻 state 超过 100ms 时不外推。
+const armSweetRows = ARM ? ARM.states.filter(s=>Array.isArray(s.sweet)&&isNum(s.sweet_h)) : [];
+const armMarkerRows = ARM ? ARM.states.filter(s=>Array.isArray(s.marker)&&isNum(s.marker_h)) : [];
+const endpointPointAt = (rows,key,hkey,t) => {
+  const s=interpRow(rows,t,0.1);
+  if(!s) return null;
+  return {p:[0,1,2].map(k=>lerp(s.a[key][k],s.b[key][k],s.f)), h:lerp(s.a[hkey],s.b[hkey],s.f)};
 };
-// 同上插值 FK 黑标（实体拍面中心）：与视觉拍心 / 黑标比对用它，TCP 是甜点（v05 1009 起在黑标往拍喉 2 cm）。
-const armMarkerRows = ARM ? ARM.states.filter(s=>Array.isArray(s.marker)) : [];
-const markerAt = t => {
-  const s=interpRow(armMarkerRows,t,0.1);
-  if(!s || !Array.isArray(s.a.marker) || !Array.isArray(s.b.marker)) return null;
-  return [0,1,2].map(k=>lerp(s.a.marker[k],s.b.marker[k],s.f));
-};
+const sweetAt = t => endpointPointAt(armSweetRows,'sweet','sweet_h',t);
+const markerAt = t => endpointPointAt(armMarkerRows,'marker','marker_h',t);
 // [[arm-point-world-core-begin]]
-// x/y 按给定车 yaw 旋到世界轴；z 从 FK 安装面零点平移到机械臂中心地面点 z=0。
-// zArmMinusWorld = 臂模型 z − 世界/地面 z（V04 为负安装高度）。
+// 车体系点 → 世界轴：x/y 按给定车 yaw 旋到世界轴（不做车心平移，原点仍是机械臂中心），z = 离地高（端点模型给的）。
 const rotateBodyVectorWorld = (v,yawDeg) => {
   if(!Array.isArray(v)||v.length!==3||!v.every(isNum)||!isNum(yawDeg)) return null;
   const a=yawDeg*Math.PI/180;
   return [v[0]*Math.cos(a)-v[1]*Math.sin(a),
           v[0]*Math.sin(a)+v[1]*Math.cos(a),v[2]];
 };
-const armPointWorld = (p,yawDeg,zArmMinusWorld) => {
-  if(!Array.isArray(p)||!isNum(yawDeg)||!isNum(zArmMinusWorld)) return null;
-  const rotated=rotateBodyVectorWorld(p,yawDeg);
-  return rotated ? [rotated[0],rotated[1],p[2]-zArmMinusWorld] : null;
+const armPointWorld = (pt,yawDeg) => {
+  if(!pt||!isNum(pt.h)) return null;
+  const rotated=rotateBodyVectorWorld(pt.p,yawDeg);
+  return rotated ? [rotated[0],rotated[1],pt.h] : null;
 };
 // 输入是世界轴下 point−车心；只平移原点，不把世界轴转成车体系。
 const carRelativePointToArm = (p,yawDeg,offsetM) => {
@@ -2590,8 +2297,8 @@ const pcTruthForTarget = (truth,target,yawDeg,offsetM) => {
 };
 // [[arm-point-world-core-end]]
 // [[racket-world-speed-core-begin]]
-// 世界系真实拍心速度 = 六轴相对臂座速度 + 车心平移 + 车体 yaw 刚体转动。
-// armForwardOffset 是录制时配置里的「臂座相对车心沿车前方偏移」；V04 当前为 0.045m。
+// 世界系真实拍心速度 = 拍心相对车体速度（端点模型给的车体系速度）+ 车心平移 + 车体 yaw 刚体转动。
+// armForwardOffset 是录制时配置里的「臂座相对车心沿车前方偏移」（bot 公告 arm_forward_offset_m；v05 为 0）。
 const racketWorldVelocity = (vArm,tcp,vCar,yawDeg,yawRate,armForwardOffset) => {
   if(!Array.isArray(vArm)||vArm.length!==3||!vArm.every(isNum) ||
      !Array.isArray(tcp)||tcp.length!==3||!tcp.every(isNum) ||
@@ -2892,15 +2599,15 @@ const pcReturnAt = tApprox => {
   return null;
 };
 // [[pc-return-core-end]]
-// 拍面世界yaw,pitch@臂最后更新HT：臂系 face_yaw/face_pitch（Python _add_face_angles 逐帧 FK，
-// 车型配置的拍面法向轴；V04 为 link6 +Y）取冲击前窗 [−80,−6]ms 线性外推到该 HT——J5 冲击突跳（触始+13ms 机械传递，
+// 拍面世界yaw,pitch@臂最后更新HT：车体系拍面 face_yaw/face_pitch（Python 生成页面时用臂端点动态模型逐行算好，
+// 拍面法向取朝 +y 那支，yaw=atan2(nx,ny)、pitch=asin(nz)）取冲击前窗 [−80,−6]ms 线性外推到该 HT——拍柄冲击突跳（触始+13ms 机械传递，
 // 本场 ≈ht−3ms）会污染跨冲击帧的直接插值（rebound 位姿采样同款约定）；车 yaw 直接取同一 RK 时刻的
 // /bot_state yaw（imu_t 轴）。ψ_world = fy − 车yaw，口径与 PC回球 yaw 同为 atan2(x,y)；纯 RK/Arm 值，
 // 不含 PC zPhase，也不含 δ6 球侧偏置。
-// **pitch 不减车 yaw**：J1/BASE_ROT 是纯 z 转、不动 n_z，故臂系 pitch ≡ 世界 pitch（车无 roll/pitch
-// 前提），θ_world 比 ψ_world 少一个车侧误差源；且 θ̇≈0（挥拍是近水平圆弧，法向在 yaw 里飞扫、
+// **pitch 不减车 yaw**：端点给的是车体系（J1 轴倾斜已转进来），车 yaw 是纯 z 转、不动 n_z，故车体系 pitch ≡ 世界 pitch
+// （车无 roll/pitch 前提），θ_world 比 ψ_world 少一个车侧误差源；且 θ̇≈0（挥拍是近水平圆弧，法向在 yaw 里飞扫、
 // 在 pitch 里冻结），故 pitch 对时序误差天然免疫，两列之差应当接近 0。
-const armFaceRows = ARM ? ARM.states.filter(s=>isNum(s.fy)&&isNum(s.fp)) : [];
+const armFaceRows = ARM ? ARM.states.filter(s=>isNum(s.face_yaw)&&isNum(s.face_pitch)) : [];
 const wrapDeg = d => ((d+180)%360+360)%360-180;
 // 冲击前窗 [−80,−6]ms（相对该 HT）线性拟合 fy 与 fp，在 tEval 处取值：
 // tEval=htRk 为 ≤6ms 外推；tEval=htRk−12ms 落在窗内，为纯插值。
@@ -2909,7 +2616,8 @@ const fitFaceAnglesTo = (accHtRk,tEval) => {
   const seg=armFaceRows.filter(s=>s.t>=accHtRk-0.08 && s.t<=accHtRk-0.006);
   if(seg.length<2) return null;
   let st=0,sy=0,stt=0,sty=0,sp=0,stp=0;
-  seg.forEach(s=>{const u=s.t-tEval; st+=u; stt+=u*u; sy+=s.fy; sty+=u*s.fy; sp+=s.fp; stp+=u*s.fp;});
+  seg.forEach(s=>{const u=s.t-tEval; st+=u; stt+=u*u; sy+=s.face_yaw; sty+=u*s.face_yaw;
+                  sp+=s.face_pitch; stp+=u*s.face_pitch;});
   const n=seg.length, den=n*stt-st*st;
   if(Math.abs(den)<1e-12) return null;
   return {fy:(sy*stt-st*sty)/den, rate:(n*sty-st*sy)/den,
@@ -2984,75 +2692,68 @@ const imuYawRateDegAt = t => {
   const w=imuYawRateAt(t);
   return w!=null ? w*180/Math.PI : null;
 };
-// 实测世界拍速@臂最后更新HT（m/s）：Python 侧按本场 arm.head_model 给每帧算拍心点 p_head
-// （v0.4=冻结柔度模型 F，见 _frozen_head_model；v0.3=刚性 TCP）并存它的 ±10ms 中心差分
-// v_tcp_arm，JS 在同一 RK 物理时刻叠加车心世界系 vx/vy 与 yaw 刚体速度，再取世界系合速度模长。
-// yaw 刚体项的杠杆用 p_head（速度算的是哪个点，杠杆就得是哪个点），不再用刚性 tcp。
-// J1 分量 |q̇1|·r 与杠杆 r=hypot(tcp_x,tcp_y) 仍按**刚性 tcp + 编码器 q̇1** 算：它只用于对齐
-// status `speed=` 的 J1 规划口径，是命令侧诊断量，不是拍心实速（两者现在不再相等，别混用）。
+// 实测世界拍速@臂最后更新HT（m/s）：Python 生成页面时用臂端点动态模型逐行算好甜点 sweet 与它的 ±5ms 中心差分
+// sweet_vel（车体系；时延 / 柔度 / 间隙 / J1 力矩轴倾斜都在模型里，差分窗 = 端点 kVelocityHalfWindowSec），JS 只在同一 RK 物理时刻
+// 叠加车心世界系 vx/vy 与 yaw 刚体速度（杠杆 = 同一个甜点），再取世界系合速度模长。
+// J1 项 j1_speed = |q̇1|·|∂甜点/∂q1|（端点刚体位形雅可比，Python 算；实测行用编码器 q̇1、命令行用命令 q̇1）：只用于对齐
+// status `speed=` 的 J1 规划口径，是命令侧诊断量，不是拍心实速（弹性链 + 动态模型下两者不相等，别混用）。
 // **拍速不外推**（与同列 yaw/pitch 不同）：挥拍段 J1 走 S 曲线，[−80,−6]ms 窗内拍速强非线性，
-// 线性外推到 HT 实测会高估 40%+；HT 处两侧都有 100Hz 采样，直接插值即可。
+// 线性外推到 HT 实测会高估 40%+；HT 处两侧都有 200Hz 采样，直接插值即可。
 // 触球锚不靠"实测峰值"找：实测 q̇1 全程叠着 ±0.5~1.4m/s 的伺服振荡（引拍段无球时同样存在，
 // 见 osc），74ms 窗里取 argmax 只会落在某个振荡波峰上——0808 首版曾据此误判"峰值=触球、
 // 触球早于 ht 39ms"，实为伪迹。真正的臂内触球用**指令自身**定位：HitTrajectory 触球后按恒 ω
 // 巡航，故指令 J1 速度进入平台的第一帧就是 finish_hit_time（本场落在 HT−5~−12ms，与臂内
 // 提前量对得上），该刻的实测/指令差才是伺服欠速。
 const armSpeedRows = ARM ? ARM.states.filter(
-  s=>Array.isArray(s.v_tcp_arm)&&s.v_tcp_arm.length===3&&s.v_tcp_arm.every(isNum)&&
-     Array.isArray(s.p_head)&&s.p_head.length===3&&s.p_head.every(isNum)&&
-     Array.isArray(s.tcp)&&s.tcp.length===3&&s.tcp.every(isNum)&&Array.isArray(s.velocity)) : [];
-const HEAD_MODEL = (ARM&&ARM.head_model)||null;
-const armCmdSpeedRows = ARM ? (ARM.commands||[]).filter(
-  c=>Array.isArray(c.tcp)&&Array.isArray(c.velocity)&&isNum(c.velocity[0])) : [];
-const j1SpeedOf = row => Math.abs(row.velocity[0])*Math.hypot(row.tcp[0],row.tcp[1]);
+  s=>Array.isArray(s.sweet_vel)&&s.sweet_vel.length===3&&s.sweet_vel.every(isNum)&&
+     Array.isArray(s.sweet)&&s.sweet.length===3&&s.sweet.every(isNum)) : [];
+const armJ1SpeedRows = ARM ? ARM.states.filter(s=>isNum(s.j1_speed)) : [];
+const armCmdSpeedRows = ARM ? (ARM.commands||[]).filter(c=>isNum(c.j1_speed)) : [];
 const RACKET_SPEED_MAX_GAP_S=0.05;
 const armForwardOffsetM=CA.bot_center&&CA.bot_center.params&&
   isNum(CA.bot_center.params.arm_forward_offset_m)
     ? CA.bot_center.params.arm_forward_offset_m : null;
-const cmdSpeedAt = t => {
-  const c=interpRow(armCmdSpeedRows,t,RACKET_SPEED_MAX_GAP_S);
-  return c?lerp(j1SpeedOf(c.a),j1SpeedOf(c.b),c.f):null;
+const j1SpeedAt = (rows,t) => {
+  const c=interpRow(rows,t,RACKET_SPEED_MAX_GAP_S);
+  return c?lerp(c.a.j1_speed,c.b.j1_speed,c.f):null;
 };
+const cmdSpeedAt = t => j1SpeedAt(armCmdSpeedRows,t);
 // 任意时刻的实测拍速（HT 与 HT−12ms 两列共用）：所有向量分量先插值再合成；任一项缺失
 // 都返回 null，绝不把 arm-only 或缺 yaw 项的数冒充世界拍速。
 const racketSpeedRawAt = t => {
   if(t==null || !armSpeedRows.length) return null;
   const s=interpRow(armSpeedRows,t,RACKET_SPEED_MAX_GAP_S);
   if(!s) return null;
-  const vArm=[0,1,2].map(k=>lerp(s.a.v_tcp_arm[k],s.b.v_tcp_arm[k],s.f));
-  const head=[0,1,2].map(k=>lerp(s.a.p_head[k],s.b.p_head[k],s.f));
-  const tcp=[0,1,2].map(k=>lerp(s.a.tcp[k],s.b.tcp[k],s.f));
+  const vArm=[0,1,2].map(k=>lerp(s.a.sweet_vel[k],s.b.sweet_vel[k],s.f));
+  const head=[0,1,2].map(k=>lerp(s.a.sweet[k],s.b.sweet[k],s.f));
   const vCar=botVelocityAt(t), yawDeg=botYawDegAt(t), yawRate=imuYawRateAt(t);
   const total=racketWorldVelocity(vArm,head,vCar,yawDeg,yawRate,armForwardOffsetM);
   if(!total) return null;
   return Object.assign(total,
-    {vJ1:lerp(j1SpeedOf(s.a),j1SpeedOf(s.b),s.f),
-     radiusJ1:Math.hypot(tcp[0],tcp[1]),cmdJ1:cmdSpeedAt(t),
-     head,headMinusTcp:[0,1,2].map(k=>head[k]-tcp[k]),
-     yawDeg,yawRate,armForwardOffsetM});
+    {vJ1:j1SpeedAt(armJ1SpeedRows,t), cmdJ1:cmdSpeedAt(t),
+     head, yawDeg, yawRate, armForwardOffsetM});
 };
 const racketSpeedAt = htRk => {
   const base=racketSpeedRawAt(htRk);
   if(!base) return null;
   // 臂内触球锚 = 指令 J1 速度平台的第一帧（挥拍段末端，之后是恒 ω 巡航）
-  const seg=armCmdSpeedRows.filter(c=>c.t>=htRk-0.30&&c.t<=htRk+0.12).map(c=>({t:c.t,v:j1SpeedOf(c)}));
+  const seg=armCmdSpeedRows.filter(c=>c.t>=htRk-0.30&&c.t<=htRk+0.12).map(c=>({t:c.t,v:c.j1_speed}));
   let contactT=null, cmdContactJ1=null, measContactJ1=null;
   if(seg.length>10){
     const vmax=seg.reduce((m,c)=>Math.max(m,c.v),0);
     const hit=seg.find(c=>c.v>=vmax*0.995);
     if(hit){
       contactT=hit.t; cmdContactJ1=vmax;
-      const ms=interpRow(armSpeedRows,contactT,RACKET_SPEED_MAX_GAP_S);
-      if(ms) measContactJ1=lerp(j1SpeedOf(ms.a),j1SpeedOf(ms.b),ms.f);
+      measContactJ1=j1SpeedAt(armJ1SpeedRows,contactT);
     }
   }
   // 单点读数的抖动量级：引拍段[−250,−120]ms（肯定无球）实测−指令 J1 拍速残差的 std
   let sum=0,sum2=0,n=0;
-  armSpeedRows.forEach(row=>{
+  armJ1SpeedRows.forEach(row=>{
     if(row.t<htRk-0.25||row.t>htRk-0.12) return;
     const c=cmdSpeedAt(row.t);
     if(c==null) return;
-    const d=j1SpeedOf(row)-c; sum+=d; sum2+=d*d; n++;
+    const d=row.j1_speed-c; sum+=d; sum2+=d*d; n++;
   });
   const oscJ1=n>=4?Math.sqrt(Math.max(0,sum2/n-(sum/n)*(sum/n))):null;
   return Object.assign({}, base,
@@ -3061,20 +2762,12 @@ const racketSpeedAt = htRk => {
 };
 const speedVectorText = v => Array.isArray(v)
   ? '('+v.map(x=>(x>=0?'+':'')+x.toFixed(2)).join(', ')+')' : '—';
-// 拍心点口径的溯源短句：拍速是**哪个点**的导数，同一句话里说清并给出它与刚性 TCP 的差。
-const headModelNote = s => {
-  if(!HEAD_MODEL) return '';
-  const d=s&&Array.isArray(s.headMinusTcp)
-    ? '，本刻 p_head−刚性TCP=('+s.headMinusTcp.map(v=>(v>=0?'+':'')+(v*1000).toFixed(1)).join(', ')+')mm' : '';
-  return HEAD_MODEL.kind==='frozen_compliance'
-    ? ('。拍心点 p_head = 冻结柔度模型 F（'+HEAD_MODEL.session+'，sha256 '
-       +String(HEAD_MODEL.sha256).slice(0,8)+'…）：'+HEAD_MODEL.formula
-       +'；拍速 = p_head 的 ±'+HEAD_MODEL.half_window_ms.toFixed(0)
-       +'ms 中心差分（与 rl_arm swing_env 评分同式）。它不是刚性 FK(q) 的解析 Jacobian——'
-       +'臂是弹性链，受载时拍心落在 FK 后方、卸载回收，0907 黑标场实测卸载段视觉比编码器 FK 快 +2.5m/s'+d)
-    : ('。拍心点 p_head = 刚性 FK(q) 的 TCP、拍速 = 解析 Jacobian（'
-       +(HEAD_MODEL.reason||HEAD_MODEL.kind)+'）');
-};
+// 拍心点口径的溯源短句：拍速是**哪个点**、按什么模型的导数。
+const headModelNote = () => armEndpointOk
+  ? ('。拍心点 = 甜点（臂瞄准的点），臂端点动态模型逐行算（'+armCheckoutText(ARM_EP.arm_checkout)
+     +'：四电机共用时延 '+(ARM_EP.dynamics.delay_s*1000).toFixed(2)+' ms、J1 柔度、J1–J4 间隙开关、J1 力矩轴倾斜）；'
+     +'拍速 = 它的 ±'+ARM_EP.velocity_half_window_ms.toFixed(0)+'ms 中心差分（端点模型内，与 RL 训练器 / 端点标定同一份）')
+  : '';
 // 固定探针偏移：0808 起 12ms（此前 10ms）。本场用指令速度平台首帧定位的臂内触球锚落在
 // HT−1.5~−18ms、中位 −11ms，故 −12ms 基本踩在真实触球上；与主列之差 = 角速度/加速度×12ms。
 const FACE_YAW_PRE_S=0.012;
@@ -3590,7 +3283,12 @@ const armRlDones=((ARM&&ARM.events)||[])
   .filter(e=>e.topic==='/tennis/status'&&armRlDoneRe.test(String(e.text||'')))
   .map(e=>{const m=armRlDoneRe.exec(String(e.text));
     return {t:e.t, mode:m[1], ct:Number(m[2]), ht:Number(m[3]), text:String(e.text),
-            nFrozen:statusNum(e.text,'n_frozen'), nTargets:statusNum(e.text,'n_targets'), tArr:statusNum(e.text,'t_arr')};});
+            nFrozen:statusNum(e.text,'n_frozen'), nTargets:statusNum(e.text,'n_targets'), tArr:statusNum(e.text,'t_arr'),
+            // 臂自己记的击球侧：a09e520（2026-10-02 反手上车）起反手行尾补 " side=-1"、正手不补；更早的臂只打正手
+            side:/ side=-1(\s|$)/.test(String(e.text))?-1:1};});
+// 本抛臂最后一条 rl_swing done（按 ct 回配到抛）
+const armRlDoneForThrow = th => armRlDones.filter(s=>s.mode==='active'&&isNum(s.ct)
+  &&matchThrowByAcceptedCt(s.ct-RK.t0)===th).pop()||null;
 const armPredsForThrow = th => (armAligned&&RK)
   ? armPreds.filter(p=>isNum(p.ct)&&matchThrowByAcceptedCt(p.ct-RK.t0)===th) : [];
 // 到达时刻代理（旧 RL bag 重建用）：序号键配到的生产状态回复时刻（RK 绝对轴）
@@ -3673,7 +3371,7 @@ const finalTargetForThrow = th => {
     note='arm_controller 按 plan_id='+pick.planId+' revision='+pick.revision
       +' 原子受理，contact_ht 与计划同值';
   } else if(ARM_SWING_MODE.mode==='rl'){
-    done=armRlDones.filter(s=>s.mode==='active'&&isNum(s.ct)&&matchThrowByAcceptedCt(s.ct-RK.t0)===th).pop()||null;
+    done=armRlDoneForThrow(th);
     if(done){
       pick=preds.find(p=>Math.abs(p.ct-done.ct)<1e-5)||null;
       source='rl_status'; nFrozen=done.nFrozen; arrival=done.tArr;
@@ -3840,7 +3538,8 @@ const publishArmHitContract = rows => {
 const rk300TableHtml = () => {
   if(!RK) return '';
   if(!reportThrows.length){ publishArmHitContract([]); return ''; }
-  const visualTcpGeometryKnown=ARM&&String(ARM.fk_car||'').toLowerCase()==='v04';
+  // 视觉−模型黑标：本场有臂端点动态模型的黑标（生产代码算得了）才比。
+  const visualTcpGeometryKnown=armEndpointOk;
   const racketBlackMarker=pcRacketRows.some(r=>r.blackMarker);
   const armContractRows=[];
   const srcLabel={final_plan:'PLAN',rl_status:'RL',rl_recon:'RL*',late_saved:'late',accepted:'acc',chassis_target:'车'};
@@ -3896,6 +3595,15 @@ const rk300TableHtml = () => {
       finalMismatch,
       swingMode:ARM_SWING_MODE.mode,
       finalHtSource:fin?fin.source:null,
+      // FinalHitPlan 的生产判决（executable / old_version / unchecked）与击球侧（+1 正手 / −1 反手）：当前臂生产代码判得了的方案
+      // 取它的 node::final_plan_side；判不了的（旧版本方案）取臂当时自己记的 rl_swing done 行（反手补 side=-1）
+      planVerdict:fin&&fin.pred&&fin.pred.verdict?fin.pred.verdict:null,
+      ...(()=>{
+        if(fin&&fin.pred&&fin.pred.check&&Number.isInteger(fin.pred.check.side))
+          return {side:fin.pred.check.side, sideSource:'plan_verdict'};
+        const done=fin&&!fin.fallback?armRlDoneForThrow(th):null;
+        return done?{side:done.side, sideSource:'arm_rl_done'}:{side:null, sideSource:null};
+      })(),
       planId:fin?fin.planId:null,
       planRevision:fin&&Number.isInteger(fin.revision)?fin.revision:null,
       finalRelOrigin:fin?(fin.armOrigin?'arm_center':'car_center'):null,
@@ -4015,9 +3723,9 @@ const rk300TableHtml = () => {
     // ⑨ TCP@FinalHT（世界轴）与 tcp − 臂目标
     const carYawAcc=finalHt!=null?botYawDegAt(finalHt):null;
     const carYawRate=finalHt!=null?imuYawRateDegAt(finalHt):null;
-    const tcp=finalHt!=null?tcpAt(finalHt):null;
+    const tcp=finalHt!=null?sweetAt(finalHt):null;
     const tcpYawDeg=carYawAcc;
-    const tcpWorld=armPointWorld(tcp,tcpYawDeg,armConstCal.zOff);
+    const tcpWorld=armPointWorld(tcp,tcpYawDeg);
     // 臂目标：RL = FinalHT 消息的 rel_x/rel_z（RL 真正瞄的）；规则 = 最后 accepted 的（late 只改 ht）
     const aimIsFinal=!!(fin&&(fin.source==='final_plan'||fin.source==='rl_status'||fin.source==='rl_recon'));
     const finalPlan=fin&&fin.source==='final_plan'?fin.plan:null;
@@ -4029,12 +3737,11 @@ const rk300TableHtml = () => {
     const tcpAimDz=tcpWorld&&aim?(tcpWorld[2]-aim[1])*100:null;
     const tcpAimErrorText=aim?tableSigned(tcpAimDx)+'/'+tableSigned(tcpAimDz):'—/—';
     const tcpCell=tcpWorld
-      ? '<span title="'+tableEsc('臂系FK TCP=('+cmFmt(tcp[0])+', '+cmFmt(tcp[1])+', '
-          +cmFmt(tcp[2])+')cm @FinalHT '+finHtTxt
+      ? '<span title="'+tableEsc('甜点（端点动态模型，车体系）=('+cmFmt(tcp.p[0])+', '+cmFmt(tcp.p[1])+', '
+          +cmFmt(tcp.p[2])+')cm（z 为臂模型 z）@FinalHT '+finHtTxt
           +'；按同刻车yaw ψ='+tableSigned(tcpYawDeg)+'° 旋到世界轴'
           +'（xw=x·cosψ−y·sinψ、yw=x·sinψ+y·cosψ）'
-          +'；z_world=z_FK−zOffset='+cmFmt(tcp[2])+'−('+cmFmt(armConstCal.zOff)+')='
-          +cmFmt(tcpWorld[2])+'cm，zOffset=臂模型z−世界z，原点=机械臂中心地面点z=0'
+          +'；z_world=离地高 '+cmFmt(tcp.h)+'cm（端点模型给的：臂模型 z − 车型 hit_pos_z_offset_m），原点=机械臂中心地面点z=0'
           +(aim
             ? ('；'+aimLabel+' 直接取上游 /predict_hit_pos rel_x/z=('
                +cmFmt(aim[0])+', '+cmFmt(aim[1])+')cm，不旋转、不加偏置'
@@ -4044,10 +3751,10 @@ const rk300TableHtml = () => {
           +tableXyzCm(tcpWorld[0],tcpWorld[1],tcpWorld[2])+', '
           +tcpAimErrorText+'</span>'
       : '—';
-    // ⑩ 视觉拍心：默认保留离 FinalHT 最近的前/后原始曝光（35ms 内优先，缺帧回退到测量窗内最近帧，
+    // ⑩ 视觉拍心：默认保留离 FinalHT 最近的前/后原始曝光（只取 35ms 内，没有就标「无黑标」，
     // dt 一律显示）；人工分相复核轨迹是逐抛 opt-in，显示全部审阅点。ht 前测量窗内的全部曝光在
     // 悬停逐帧列出。两条路径都不再用宽窗多项式把原始观测拟合成一个值。
-    // 视觉显示保留拍心−车心；比较前将视觉平移到臂中心，与同曝光 FK 黑标同原点。
+    // 视觉显示保留拍心−车心；比较前将视觉平移到臂中心，与同曝光模型黑标（臂端点动态模型）同原点。
     const visPcT=finalHtPcSample;
     const visPair=visPcT!=null?bracketVisualRacketRows(pcRacketRows,visPcT):{before:null,after:null};
     const visPairFar=visPcT!=null
@@ -4062,7 +3769,7 @@ const rk300TableHtml = () => {
       const visRel=[visSrc.x-visCar.x,visSrc.y-visCar.y,visSrc.z];
       const visRkT=finalHt!=null&&visPcT!=null?finalHt+(visSrc.t-visPcT):null;
       const visMarker=visualTcpGeometryKnown?markerAt(visRkT):null;
-      const visMarkerWorld=visMarker?armPointWorld(visMarker,botYawDegAt(visRkT),armConstCal.zOff):null;
+      const visMarkerWorld=visMarker?armPointWorld(visMarker,botYawDegAt(visRkT)):null;
       const visArmRel=carRelativePointToArm(visRel,botYawDegAt(visRkT),armForwardOffsetM);
       const comparable=visMarkerWorld&&visArmRel;
       const dx=comparable?(visArmRel[0]-visMarkerWorld[0])*100:null;
@@ -4086,7 +3793,7 @@ const rk300TableHtml = () => {
         : ('；多相机拍心三角化'+(isNum(visSrc.n_cam)?'，参与相机 '+visSrc.n_cam+' 台':''));
       const manualQc=visSrc.manualReview
         ? ('；人工同标记复核'
-           +(isNum(visSrc.expectedDistanceMm)?'，距同曝光FK '+visSrc.expectedDistanceMm.toFixed(2)+'mm':'')
+           +(isNum(visSrc.expectedDistanceMm)?'，距同曝光模型黑标 '+visSrc.expectedDistanceMm.toFixed(2)+'mm':'')
            +(visSrc.manualReviewNote?'：'+visSrc.manualReviewNote:''))
         : '';
       return {
@@ -4097,16 +3804,16 @@ const rk300TableHtml = () => {
           +cmFmt(visCar.x)+', '+cmFmt(visCar.y)+')cm，拍心−车心=('
           +cmFmt(visRel[0])+', '+cmFmt(visRel[1])+', '+cmFmt(visRel[2])+')cm'
           +(visMarkerWorld
-            ? '；同曝光 FK 黑标 x/y/z='+tableXyzCm(visMarkerWorld[0],visMarkerWorld[1],visMarkerWorld[2])
-              +'cm（臂中心原点）；视觉先扣同刻 Rz(yaw)·[0,arm_forward_offset_m,0]，视觉−FK黑标 dx/dy/dz='+deltaText+'cm'
-            : '；缺同曝光 FK 黑标、车 yaw 或录制的臂座偏置，不计算视觉−FK黑标')
+            ? '；同曝光端点动态模型黑标 x/y/z='+tableXyzCm(visMarkerWorld[0],visMarkerWorld[1],visMarkerWorld[2])
+              +'cm（臂中心原点，z=离地高）；视觉先扣同刻 Rz(yaw)·[0,arm_forward_offset_m,0]，视觉−模型黑标 dx/dy/dz='+deltaText+'cm'
+            : '；缺同曝光模型黑标、车 yaw 或录制的臂座偏置，不计算视觉−模型黑标')
           +qc+manualQc
       };
     };
     const phaseLabel={pre_contact:'前',contact_integrated:'触球窗',post_contact:'后'};
     const reviewedLabel=visSrc=>(isNum(visSrc.frameIdx)?'f'+visSrc.frameIdx+' ':'')+
       (phaseLabel[visSrc.contactPhase]||visSrc.contactPhase||'人工');
-    // 前段逐帧（悬停）：每帧 dt、拍心−车心 x/y/z、视觉−同曝光FK黑标 dx/dy/dz，全是原始单帧值。
+    // 前段逐帧（悬停）：每帧 dt、拍心−车心 x/y/z、视觉−同曝光模型黑标 dx/dy/dz，全是原始单帧值。
     const visPreEntries=visPreRows.map(r=>{
       const nums=visNumbersFor(r);
       if(!nums) return null;
@@ -4121,18 +3828,29 @@ const rk300TableHtml = () => {
         +tableSigned(Math.min(...visPreEntries.map(e=>e.dtMs)))+'…'
         +tableSigned(Math.max(...visPreEntries.map(e=>e.dtMs)))+'ms</span>'
       : '';
+    // 主格只放 FinalHT±35ms 内的黑标（或人工复核轨迹）；没有就标「无黑标」——HT 附近没有车定位帧时在线不截块，
+    // 测量窗里更远的帧只列在悬停里，不进格子、不进黑标统计（不拿模型推的或远帧冒充 HT 处的黑标）。
     const visEntries=(reviewedVisRows.length
       ? reviewedVisRows.map(visSrc=>visRawEntry(visSrc,reviewedLabel(visSrc)))
-      : [visRawEntry(visPair.before||visPairFar.before,'前'),
-         visRawEntry(visPair.after||visPairFar.after,'后')]).filter(Boolean);
-    const visTitle=visEntries.map(v=>v.title).join('；')
+      : [visRawEntry(visPair.before,'前'), visRawEntry(visPair.after,'后')]).filter(Boolean);
+    const visFarEntries=reviewedVisRows.length?[]
+      :[visRawEntry(visPairFar.before,'前'),visRawEntry(visPairFar.after,'后')].filter(Boolean);
+    const noMarkerNearHt=racketBlackMarker&&!visEntries.length;
+    armContractRows[armContractRows.length-1].visualMarkerNearHt=racketBlackMarker?!noMarkerNearHt:null;
+    const visTitle=(noMarkerNearHt
+        ? '无黑标：FinalHT±'+Math.round(RACKET_RAW_SIDE_MAX_SEC*1000)+'ms 内没有视觉黑标观测（HT 附近没有车定位帧 → 在线没截块，或解不出）；'
+          +'测量窗里最近的帧（不进格子、不进统计）：'+(visFarEntries.map(v=>v.title).join('；')||'没有')
+        : visEntries.map(v=>v.title).join('；'))
       +(visPreDetail.length
-        ? '；前段逐帧 dt/拍心−车心x,y,z(cm)/Δ视觉−FK黑标 dx/dy/dz(cm)：'+visPreDetail.join('；')
+        ? '；前段逐帧 dt/拍心−车心x,y,z(cm)/Δ视觉−模型黑标 dx/dy/dz(cm)：'+visPreDetail.join('；')
         : '');
-    const visCell=(visEntries.length||visPreDetail.length)
-      ? '<span title="'+tableEsc(visTitle+htSrcNote)+'">'
-          +[...visEntries.map(v=>v.html),visPreLine].filter(Boolean).join('<br>')+'</span>'
-      : '—';
+    const visCell=noMarkerNearHt
+      ? '<span style="color:#c98a7a" title="'+tableEsc(visTitle+htSrcNote)+'">无黑标</span>'
+          +(visPreLine?'<br>'+visPreLine:'')
+      : ((visEntries.length||visPreDetail.length)
+        ? '<span title="'+tableEsc(visTitle+htSrcNote)+'">'
+            +[...visEntries.map(v=>v.html),visPreLine].filter(Boolean).join('<br>')+'</span>'
+        : '—');
     // ⑪ 车yaw@FinalHT：取 /bot_state 瞬时值——车控 accept AprilTag 定位后 yaw 由 IMU 连续更新、
     // HT 结束后才用 AprilTag 重定位，故 HT 前采样点无重定位台阶；挥拍位姿伪迹只塌陷位置不动 yaw。
     const carYawCell=carYawAcc!=null
@@ -4207,20 +3925,21 @@ const rk300TableHtml = () => {
       ? '。世界拍心速度 |v_world|='+swingSpeed.speedWorld.toFixed(2)+'m/s，v_world='
           +speedVectorText(swingSpeed.world)+'m/s：在同一 RK 物理时刻合成 R(yaw)·v_arm'
           +' + bot_state(vx,vy,0) + yaw_speed×r；所有量都只做 50ms 内有界插值，不外推'
-          +headModelNote(swingSpeed)
-          +'。六轴臂相对 |v_arm|='+swingSpeed.speedArm.toFixed(2)+'m/s，R·v_arm='
+          +headModelNote()
+          +'。拍心相对车体 |v_arm|='+swingSpeed.speedArm.toFixed(2)+'m/s，R·v_arm='
           +speedVectorText(swingSpeed.armWorld)+'m/s；车心平移 |v_car|='
           +swingSpeed.speedCar.toFixed(2)+'m/s，v_car='+speedVectorText(swingSpeed.carWorld)
           +'m/s；车体 yaw 刚体项 |ω×r|='+swingSpeed.speedTurn.toFixed(2)+'m/s，ω×r='
           +speedVectorText(swingSpeed.turnWorld)+'m/s（IMU raw yaw_speed='
           +(swingSpeed.yawRate*180/Math.PI).toFixed(2)+'°/s；录制时臂座前移='
           +cmFmt(swingSpeed.armForwardOffsetM)+'cm；未记录的启动 yaw bias 对近期两位小数结果无影响）'
-          +'；其中命令侧对照 J1 项 |q̇1|·r='+swingSpeed.vJ1.toFixed(2)+'m/s（r='
-          +cmFmt(swingSpeed.radiusJ1)+'cm，编码器 q̇1 × 刚性 TCP 杠杆 = status speed= 的口径；'
-          +'它是规划/伺服诊断量，**不是**拍心实速——弹性链使两者在触球时刻不再相等）'
-          +(swingSpeed.cmdJ1!=null?('；同刻指令 J1 项 |v_cmd1|·r='
-            +swingSpeed.cmdJ1.toFixed(2)+'m/s ⇒ J1伺服差 '
-            +tableSigned(swingSpeed.vJ1-swingSpeed.cmdJ1)+'m/s'):'；本刻无指令帧')
+          +(isNum(swingSpeed.vJ1)
+            ? ('；其中命令侧对照 J1 项 |q̇1|·|∂甜点/∂q1|='+swingSpeed.vJ1.toFixed(2)+'m/s（编码器 q̇1 × 端点刚体位形对 q1 的杠杆 = status speed= 的口径；'
+               +'它是规划/伺服诊断量，**不是**拍心实速——弹性链 + 动态模型下两者在触球时刻不相等）'
+               +(swingSpeed.cmdJ1!=null?('；同刻指令 J1 项='
+                 +swingSpeed.cmdJ1.toFixed(2)+'m/s ⇒ J1伺服差 '
+                 +tableSigned(swingSpeed.vJ1-swingSpeed.cmdJ1)+'m/s'):'；本刻无指令帧'))
+            : '；本刻无 J1 项')
           +(swingSpeed.contactDt!=null?('；臂内触球锚@HT'+tableSigned(swingSpeed.contactDt)
             +'ms（= 指令 J1 速度进入恒 ω 巡航平台的第一帧 = HitTrajectory 的 finish_hit_time，'
             +'不靠实测峰值找）：指令J1 '+swingSpeed.cmdContactJ1.toFixed(2)+'m/s'
@@ -4230,25 +3949,25 @@ const rk300TableHtml = () => {
           +(swingSpeed.oscJ1!=null?('；J1单点抖动量级 σ='+swingSpeed.oscJ1.toFixed(2)+'m/s'
             +'（引拍段[−250,−120]ms、肯定无球时的 实测−指令 残差 std：J1 实测速度全程叠着这个'
             +'量级的伺服振荡，所以别拿单帧极值当触球探测器）'):'')
-          +(tgtSpeed!=null?('；目标拍速='+tgtSpeed.toFixed(2)
+          +(tgtSpeed!=null&&isNum(swingSpeed.vJ1)?('；目标拍速='+tgtSpeed.toFixed(2)
             +'m/s，实测J1−目标 '+tableSigned(swingSpeed.vJ1-tgtSpeed)+'m/s'):'')
-      : '。本刻无法合成世界拍速：需要 50ms 内同时有六轴 /joint_states（位置+速度+力矩，柔度模型三者都吃）'
-          +'、其 ±10ms 两个差分端点各自被间隔 ≤30ms 的样本夹住（空闲段 20Hz 会被这道门挡掉）、bot_state '
+      : '。本刻无法合成世界拍速：需要 50ms 内有端点动态模型的甜点与拍速（'
+          +(armEndpointOk?'端点已算':'端点不可用：'+((ARM_EP&&ARM_EP.reason)||'未算'))+'）、bot_state '
           +'imu_t 上的 yaw/vx/vy、IMU yaw_speed，以及录制时 arm_forward_offset_m；不回退 arm-only';
     const speedTxt=' <span style="color:#a0a0c0">'
       +(swingSpeed?swingSpeed.speedWorld.toFixed(2)+'m/s':'—m/s')+'</span>';
     const faceYawCell=(faceYaw||swingSpeed)
       ? '<span title="'+tableEsc((faceYaw
-          ? ('臂系FK face_yaw='+tableSigned(faceYaw.fy)+'°（冲击前窗['
+          ? ('车体系拍面 face_yaw（端点动态模型）='+tableSigned(faceYaw.fy)+'°（冲击前窗['
             +'−80,−6]ms '+faceYaw.n+'帧线性外推@FinalHT，ψ̇='+tableSigned(faceYaw.rate)+'°/s）'
             +(isNum(faceYaw.botYaw)
               ? ('；车yaw='+tableSigned(faceYaw.botYaw)+'°（RK /bot_state yaw@imu_t=FinalHT）')
               : '；FinalHT 处无有效 /bot_state yaw，世界yaw显示—')
             +'；世界ψ=face_yaw−车yaw，口径同PC回球yaw=atan2(x,y)；纯RK/Arm值，不受zPhase影响且不含δ6球侧偏置'
             +'。pitch='+tableSigned(faceYaw.pitch)+'°（同窗同帧拟合的 asin(n_z)，正=开面上仰，'
-            +'θ̇='+tableSigned(faceYaw.pitchRate)+'°/s）——**不减车yaw**：J1/BASE_ROT 纯 z 转不动 n_z，'
-            +'臂系pitch≡世界pitch；θ̇≈0 故 pitch 对时序免疫，与右列 pitch 之差 = θ̇×12ms')
-          : '该 HT 冲击前窗内 <2 帧 FK state，拍面角不可用')
+            +'θ̇='+tableSigned(faceYaw.pitchRate)+'°/s）——**不减车yaw**：车 yaw 纯 z 转不动 n_z，'
+            +'车体系pitch≡世界pitch；θ̇≈0 故 pitch 对时序免疫，与右列 pitch 之差 = θ̇×12ms')
+          : '该 HT 冲击前窗内 <2 帧端点拍面角，拍面角不可用')
           +speedNote+htSrcNote)+'">'
           +(faceYaw?tableSigned(faceYaw.deg)+'/'+tableSigned(faceYaw.pitch):'—/—')
           +speedTxt+'</span>'
@@ -4260,8 +3979,8 @@ const rk300TableHtml = () => {
     const speedPreNote=swingSpeedPre
       ? '。世界拍心 |v_world|='+swingSpeedPre.speedWorld.toFixed(2)+'m/s，v_world='
           +speedVectorText(swingSpeedPre.world)+'m/s（HT−12ms 同刻向量合成）'
-          +headModelNote(swingSpeedPre)
-          +'；六轴臂相对='+swingSpeedPre.speedArm.toFixed(2)+'m/s；车心平移='
+          +headModelNote()
+          +'；拍心相对车体='+swingSpeedPre.speedArm.toFixed(2)+'m/s；车心平移='
           +swingSpeedPre.speedCar.toFixed(2)+'m/s；车 yaw 刚体项='
           +swingSpeedPre.speedTurn.toFixed(2)+'m/s'
           +(swingSpeedPre.cmdJ1!=null?('；同刻指令J1='+swingSpeedPre.cmdJ1.toFixed(2)
@@ -4274,7 +3993,7 @@ const rk300TableHtml = () => {
       +(swingSpeedPre?swingSpeedPre.speedWorld.toFixed(2)+'m/s':'—m/s')+'</span>';
     const faceYawPreCell=(faceYawPre||swingSpeedPre)
       ? '<span title="'+tableEsc((faceYawPre
-          ? ('臂系FK face_yaw='+tableSigned(faceYawPre.fy)+'°（冲击前窗[−80,−6]ms '
+          ? ('车体系拍面 face_yaw（端点动态模型）='+tableSigned(faceYawPre.fy)+'°（冲击前窗[−80,−6]ms '
             +faceYawPre.n+'帧线性拟合@FinalHT−12ms取值，ψ̇='+tableSigned(faceYawPre.rate)+'°/s）'
             +'；车yaw='+tableSigned(faceYawPre.botYaw)+'°（/bot_state yaw@HT−12ms：AprilTag accept后由IMU连续更新，HT结束后才重定位）'
             +'；世界ψ=face_yaw−车yaw；HT−12ms 固定探针：臂内提前量本场='
@@ -4282,8 +4001,8 @@ const rk300TableHtml = () => {
             +'而用指令速度平台首帧定位的臂内触球锚落在 HT−1.5~−18ms（中位 −11ms），'
             +'故本列基本踩在真实触球上，并兼作时序敏感度探针（与左列之差 = ψ̇×12ms）'
             +'。pitch='+tableSigned(faceYawPre.pitch)+'°（同窗拟合@HT−12ms，θ̇='
-            +tableSigned(faceYawPre.pitchRate)+'°/s，不减车yaw：臂系pitch≡世界pitch）')
-          : '该 HT−12ms 无拍面角（冲击前窗内 <2 帧 FK state 或该刻无 /bot_state）')
+            +tableSigned(faceYawPre.pitchRate)+'°/s，不减车yaw：车体系pitch≡世界pitch）')
+          : '该 HT−12ms 无拍面角（冲击前窗内 <2 帧端点拍面角或该刻无 /bot_state）')
           +speedPreNote+htSrcNote)+'">'
           +(faceYawPre?tableSigned(faceYawPre.deg)+'/'+tableSigned(faceYawPre.pitch):'—/—')
           +speedPreTxt+'</span>'
@@ -4336,7 +4055,7 @@ const rk300TableHtml = () => {
             +'；v_in='+speedVectorText([ret.incoming.vx,ret.incoming.vy,ret.incoming.vz])
             +'m/s，v_out='+speedVectorText([ret.vx,ret.vy,ret.vz])
             +'m/s，冲击前世界拍心 v_r='+speedVectorText(enRacket.world)+'m/s'
-            +headModelNote(enRacket)
+            +headModelNote()
             +'；拍面前向 n='+speedVectorText(enResult.normal)+'，yaw/pitch='
             +tableSigned(enFace.deg)+'/'+tableSigned(enFace.pitch)+'°'
             +'；实际触球 tPC='+ret.tHit.toFixed(3)+'s → tRK='+enHitRk.toFixed(3)
@@ -4408,29 +4127,28 @@ const rk300TableHtml = () => {
     '<th title="Pre300HT 预测 − FinalHT 预测：dx/dz(cm) 与 Δht(ms)；正=300ms 前的预测更靠 +x/更高/更晚">Pre300HT−FinalHT<br>dx/dz(cm) Δht(ms)</th>'+
     '<th title="入弧拟合真值@Pre300HT 的 ht（+本抛 zPhase）：原点随对应消息，有 arm_pred_x/y 为臂中心，历史未含字段为车心；x/y=球世界坐标−原点世界坐标，y再扣球半径3.3cm；z=球心world_z；世界轴不转车yaw。格尾 φ=本抛 zPhase(ms)，0*=zPhase 不可用退回 offset=0">PC真值@Pre300HT+zPhase<br>x/y/z(cm)<br>(y为球接触面)</th>'+
     '<th title="同一套入弧拟合真值与球接触面坐标口径，评估时刻=FinalHT（原始 ht，未减臂内提前量）+本抛 zPhase。与左列之差=最后 ~300ms 内球真值随 ht 的移动">PC真值@FinalHT+zPhase<br>x/y/z(cm)<br>(y为球接触面)</th>'+
-    '<th title="'+tableEsc('前三个数严格在 FinalHT 取 /joint_states FK：TCP x/y 按同刻车yaw旋到世界轴，不做车心平移；z 用车型刚性安装高度从 FK 安装面零点换到机械臂中心地面点 z=0。后两个=该 TCP x/z − 臂目标 rel_x/rel_z（RL=FinalHT 消息；规则=最后 accepted，late 只改 ht）；目标侧不做 face_yaw、车 yaw 或位置偏置变换。'+armFkCarNote+'。悬停看 yaw 与 z 高度换算')+'">TCP@FinalHT x/y/z(cm,世界轴)<br>相对机械臂中心地面点z=0<br>tcp−臂目标（dx，dz）</th>'+
+    '<th title="'+tableEsc('前三个数严格在 FinalHT 取甜点（臂瞄准的点）：/joint_states 实测关节经臂端点动态模型（生产代码）算出的车体系位置，x/y 按同刻车yaw旋到世界轴，不做车心平移；z = 端点模型给的离地高（机械臂中心地面点 z=0）。后两个=该甜点 x/z − 臂目标 rel_x/rel_z（RL=FinalHT 消息；规则=最后 accepted，late 只改 ht）；目标侧不做 face_yaw、车 yaw 或位置偏置变换。'+armFkCarNote+'。悬停看 yaw 与高度')+'">TCP@FinalHT x/y/z(cm,世界轴)<br>相对机械臂中心地面点z=0<br>tcp−臂目标（dx，dz）</th>'+
     '<th title="'+tableEsc((racketBlackMarker
       ? '黑色拍心标记中心多相机三角化'
       : '离线多相机实测拍心三角化')+
     '−同曝光车心，世界轴（x/y=黑标 world 减同曝光车心，z=世界高度、车心 z=0）。每格显示距 FinalHT+zPhase 最近的前、后原始曝光和 signed dt'+
-    '（35ms 内优先，缺帧回退到测量窗 ht−450~+120ms 内最近帧，dt 如实显示）；'+
+    '（只取 ±35ms 内的；没有就标「无黑标」——HT 附近没有车定位帧时在线不截块，测量窗里更远的帧只在悬停里列、不进格子与统计）；'+
     'ht 前测量窗内的全部曝光逐帧列在悬停里，不做宽窗拟合。'+(visualTcpGeometryKnown
-      ? '视觉−同曝光FK黑标先把视觉从车心平移到臂中心：扣同刻 Rz(yaw)·[0,录制的arm_forward_offset_m,0]；缺变换量时差值为—。'
-      : '本车型未确认机械臂几何合同，不计算视觉−FK黑标。')+
-    '悬停看世界坐标、车心、同曝光 FK 黑标与每帧质检。')+'">'+
-    '视觉拍心−车心@FinalHT+zPhase附近<br>x/y/z(cm,世界轴)<br>人工轨迹或最近前/后＋ht前逐帧；视觉−同曝光FK黑标（dx，dy，dz）</th>'+
+      ? '视觉−模型黑标：模型黑标 = 同曝光 /joint_states 经臂端点动态模型（生产代码）算出的黑标；视觉先从车心平移到臂中心：扣同刻 Rz(yaw)·[0,录制的arm_forward_offset_m,0]；缺变换量时差值为—。'
+      : '本场臂端点模型不可用（'+((ARM_EP&&ARM_EP.reason)||'未算')+'），不计算视觉−模型黑标。')+
+    '悬停看世界坐标、车心、同曝光模型黑标与每帧质检。')+'">'+
+    '视觉拍心−车心@FinalHT+zPhase附近<br>x/y/z(cm,世界轴)<br>人工轨迹或最近前/后＋ht前逐帧；视觉−同曝光模型黑标（dx，dy，dz）</th>'+
     '<th title="车体 yaw@FinalHT（与本表所有 RK/Arm 列同锚）：取 /bot_state 瞬时值——车控 accept AprilTag 定位后 yaw 由 IMU 连续更新、HT 结束后才重定位，故采样点无重定位台阶，挥拍位姿伪迹只塌陷位置不动 yaw。悬停看 IMU yaw_speed 换算的 10ms 时序灵敏度；右侧拍面yaw 直接减同一 RK yaw，不读取PC yaw">车yaw@FinalHT<br>(°)</th>'+
     '<th title="FinalHitPlan：补偿拍速/世界拍面法向yaw/pitch；第二行显示碰撞 e_n/k_t 与联立求解迭代数/耗时，第三行显示三维出球速度与最高点/过网净空。悬停含输入/输出速度、落点、generated_at−source_ct 和模型指纹。历史消息仍显示原 speed/yaw/pitch。">目标挥拍速度/yaw/pitch<br>(m/s, °, °)<br>碰撞 / 求解</th>'+
-    '<th title="拍面法向（车型配置轴；V04 为 FK link6 +Y）的世界 yaw / pitch，同一份冲击前窗[−80,−6]ms 线性拟合@FinalHT；'+
-    '灰字为世界拍心速度 |v_world|：拍心点 p_head 的 ±10ms 中心差分（v0.4 的 p_head 走冻结柔度模型 F='+
-    'FK(q−c·τ+d·q̇)+R·tool_offset+[dx,dy,0]，不是刚性 FK(q) 的 TCP；0907 黑标三场把反馈→视觉甜点 '+
-    'XZ 从 25.6mm 压到 9.3mm）旋到世界系后，向量叠加同刻车心 vx/vy 与 '+
+    '<th title="拍面法向的世界 yaw / pitch：车体系拍面姿态由臂端点动态模型（生产代码）逐行算，同一份冲击前窗[−80,−6]ms 线性拟合@FinalHT；'+
+    '灰字为世界拍心速度 |v_world|：甜点在端点动态模型里的 ±5ms 中心差分（车体系，时延 / 柔度 / 间隙 / J1 力矩轴倾斜都在模型里）'+
+    '旋到世界系后，向量叠加同刻车心 vx/vy 与 '+
     'IMU yaw_speed×(车心到拍心杆臂)；车体位姿/速度按 bot_state imu_t，IMU t 已是物理采样时刻。'+
     '任一合同缺失即显示—，不退回 arm-only。'+
     'yaw=face_yaw−车yaw（车侧直接取 RK /bot_state yaw@imu_t=FinalHT，不受PC zPhase影响）；'+
-    'pitch=asin(n_z) 不减车yaw——J1/BASE_ROT 纯 z 转'+
-    '不动 n_z，臂系 pitch≡世界 pitch，正=开面上仰。悬停看两个角速度（ψ̇ 几百°/s 时序敏感、'+
-    'θ̇≈0 对时序免疫），以及六轴臂相对、车心平移、车 yaw 刚体项三个速度分量；J1 指令/实测、'+
+    'pitch=asin(n_z) 不减车yaw——车 yaw 是纯 z 转'+
+    '不动 n_z，车体系 pitch≡世界 pitch，正=开面上仰。悬停看两个角速度（ψ̇ 几百°/s 时序敏感、'+
+    'θ̇≈0 对时序免疫），以及拍心相对车体、车心平移、车 yaw 刚体项三个速度分量；J1 指令/实测、'+
     '臂内触球锚与抖动只按 J1 同口径比较">'+
     '拍面yaw,pitch / 世界拍心speed<br>@FinalHT<br>(°,°,m/s;世界系)</th>'+
     '<th title="同左列同一份拟合/同一套拍速口径，只把取值时刻挪到 FinalHT−12ms（角度落在窗内为纯插值，'+
@@ -4439,7 +4157,7 @@ const rk300TableHtml = () => {
     'pitch 上≈0、世界拍速差同时含臂、车心平移和车 yaw 三项变化">'+
     '拍面yaw,pitch / 世界拍心speed<br>@FinalHT−12ms<br>(°,°,m/s;世界系)</th>'+
     '<th title="Δt=PC入/出弧交点触球时刻−FinalHT 的PC取样锚；RK HT保持global baseline，只在PC查询/比较侧加本抛zPhase，质量不过门则本格—">PC回球<br>yaw/俯仰(°) / speed / Δt(ms)</th>'+
-    '<th title="逐拍实测等效法向恢复系数：e_n=−((v_out−v_r)·n)/((v_in−v_r)·n)。PC 来/回球、完整六轴+车体世界拍心速度和拍面前向法线都取同一实际触球时刻；v_r 与左边两列同口径（p_head 的 ±10ms 中心差分，v0.4 走冻结柔度模型 F）——2026-09-07 之前用的是刚性 FK 的解析 Jacobian，本场 8 挥它比现口径高 15~35%，故老报告的 e_n 与本列不可直接比。tHit 用本抛 zPhase 从 PC 轴反解到 RK。缺任一合同或法向闭合速度≤1m/s即—，不回退总速标量/J1；负值或>1保留诊断。它不是材料常数，也不是落地 cor_z/cxy 或世界y等效e。">实测 e_n,eff<br>(拍面法向)</th></tr></thead>'+
+    '<th title="逐拍实测等效法向恢复系数：e_n=−((v_out−v_r)·n)/((v_in−v_r)·n)。PC 来/回球、完整六轴+车体世界拍心速度和拍面前向法线都取同一实际触球时刻；v_r 与左边两列同口径（甜点在臂端点动态模型里的 ±5ms 中心差分）——2026-10-13 之前是报告自己算的 FK（v0.4 冻结柔度模型 F / 刚体 FK），口径不同，老报告的 e_n 与本列不可直接比。tHit 用本抛 zPhase 从 PC 轴反解到 RK。缺任一合同或法向闭合速度≤1m/s即—，不回退总速标量/J1；负值或>1保留诊断。它不是材料常数，也不是落地 cor_z/cxy 或世界y等效e。">实测 e_n,eff<br>(拍面法向)</th></tr></thead>'+
     '<tbody>'+rows.join('')+'</tbody></table></div>';
 };
 
@@ -4998,7 +4716,7 @@ buildPlots[4] = () => {
   const AXC = ['#2ecc71','#f1c40f','#5cd0ff'];
   const events = ARM.events || [];
   const states = ARM.states, cmds = ARM.commands || [];
-  // 击打标记与 FK TCP 都在共享数据层；臂数据已在 RK 相对轴，统一走 rkToPc。
+  // 击打标记与端点甜点（TCP）都在共享数据层；臂数据已在 RK 相对轴，统一走 rkToPc。
   const aligned = armAligned, hitMarks = armHitMarks;
   // 逐 trace 自适应抽稀：值变化 >1% 量程的点全保（挥拍段满分辨率），平稳段 0.3s 一点。
   // 不再按 hit 窗口区分。SVG scatter（非 scattergl）：软渲染 WebGL 画不动全量点。
@@ -5044,11 +4762,11 @@ buildPlots[4] = () => {
   const tcpSeries = () => {
     const tr=[];
     ['x','y','z'].forEach((ax,i)=>{
-      const cs=seriesXY(cmds, r=>(r.tcp&&r.tcp[i]!=null)?r.tcp[i]:null, 0.5);
+      const cs=seriesXY(cmds, r=>(r.sweet&&r.sweet[i]!=null)?r.sweet[i]:null, 0.5);
       tr.push(sv({x:cs.X, y:cs.Y,
         name:`TCP ${ax} target`, mode:'lines', line:{color:AXC[i],width:2},
         hovertemplate:`t=%{x:.3f}s<br>${ax}=%{y:.4f} m<extra>TCP ${ax} target</extra>`}));
-      const ss=seriesXY(states, r=>(r.tcp&&r.tcp[i]!=null)?r.tcp[i]:null, 1.5);
+      const ss=seriesXY(states, r=>(r.sweet&&r.sweet[i]!=null)?r.sweet[i]:null, 1.5);
       tr.push(sv({x:ss.X, y:ss.Y,
         name:`TCP ${ax} actual`, mode:'lines', line:{color:AXC[i],width:1,dash:'dot'},
         hovertemplate:`t=%{x:.3f}s<br>${ax}=%{y:.4f} m<extra>TCP ${ax} actual</extra>`}));
@@ -5087,7 +4805,7 @@ buildPlots[4] = () => {
     const axisInfo=(aligned
       ? `Axis: PC report time（PC t = RK t + ${rkBias.toFixed(4)}s，scale=1） &nbsp; `
       : 'Axis: arm data time（未对齐：需 v3 _arm.json + RK 数据） &nbsp; ') +
-      (ARM.fk_source ? `FK: ${escA(ARM.fk_source)} &nbsp; ` : '') +
+      `臂量: ${escA(armFkCarNote)} &nbsp; ` +
       (marks.length ? '| ' + marks.join(' &nbsp;|&nbsp; ') : '| no accepted commands');
     document.getElementById('armEv').innerHTML =
       alignWarnHtml + armDataWarnHtml + armAcceptedTableHtml() +
@@ -5106,7 +4824,7 @@ buildPlots[4] = () => {
     const layout={
       ...DL,
       showlegend:false,
-      title:{text:'Arm — target(solid) vs actual(dot): Position / Velocity / Effort / TCP(FK)',
+      title:{text:'Arm — target(solid) vs actual(dot): Position / Velocity / Effort / 甜点 TCP（车体系；命令=端点刚体位形，实测=端点动态模型）',
         font:{size:13,color:'#a0a0c0'}},
       xaxis:{title:aligned?'PC report time (s)':'Arm bag time (s)',...GS,domain:[0,1],anchor:'y4'},
       yaxis:{title:'Position (rad)',...GS,domain:[0.79,1]},
@@ -5246,10 +4964,10 @@ buildPlots[5] = () => {
     rkRefTr('rel_z','RK Ref Z','#84cc16'),
     pcCarTr('x','PC Car X','#d946ef'),
     pcCarTr('y','PC Car Y','#c084fc'),
-    // 机械臂 FK TCP：每个 state 用同刻车 yaw 旋到世界轴，原点为机械臂中心且 z=0。
+    // 机械臂 TCP（端点动态模型甜点）：每个 state 用同刻车 yaw 旋到世界轴，原点为机械臂中心、z = 离地高。
     ...(armAligned ? (()=>{
-      const tArm=armTcpRows.map(s=>rkToPc(s.t));
-      const tcpWorldRows=armTcpRows.map(s=>armPointWorld(s.tcp,botYawDegAt(s.t),armConstCal.zOff));
+      const tArm=armSweetRows.map(s=>rkToPc(s.t));
+      const tcpWorldRows=armSweetRows.map(s=>armPointWorld({p:s.sweet,h:s.sweet_h},botYawDegAt(s.t)));
       const val=k=>tcpWorldRows.map(p=>p?p[k]:null);
       const mk=(k,name,color,extra={})=>g2({x:tArm, y:val(k), name, mode:'markers',
         marker:{color,size:2.5}, yaxis:'y', xaxis:'x',

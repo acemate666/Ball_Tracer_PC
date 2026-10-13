@@ -1,5 +1,5 @@
-"""黑标在线候选的核心 contract：按曝光时刻取到对应的关节角；FK 锚附近的真实黑标被 YOLO 认出来；
-收场在这些候选里解出三维。"""
+"""黑标在线候选的核心 contract：按曝光时刻取到对应的关节角；锚（臂生产代码的端点模型黑标）附近的真实黑标被 YOLO 认出来；
+收场在这些候选里解出三维、给出「视觉 − 端点动态模型黑标」残差。要臂 checkout（TENNIS_MAN_ARM_CONTROLLER）与 g++，缺了整文件 skip。"""
 
 from __future__ import annotations
 
@@ -11,9 +11,14 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-import extract_arm_bag as eab
+import arm_production as ap
 import racket_ht_black_marker as ht
 from src.racket_marker_online import JointStateBuffer, RacketMarkerLocator
+
+try:
+    ap.endpoint("v05")
+except ap.Unavailable as _exc:  # pragma: no cover —— 没有臂 checkout 的机器
+    pytest.skip(f"臂生产代码不可用：{_exc}", allow_module_level=True)
 
 ROOT = Path(__file__).resolve().parent.parent
 CALIB = ROOT / "src" / "config" / "four_camera_calib_18.json"
@@ -29,7 +34,7 @@ MARKER_SAMPLES = ROOT / "test_src" / "fixtures" / "swing_hs_marker_samples.npz"
 
 def _feed(buffer: JointStateBuffer, q_of_t, *, latency_s=lambda k: 0.002) -> None:
     """200 Hz 的 /joint_states：RK 时刻 100.000…101.995 s，关节名倒序发（按名字取槽）。"""
-    slots = eab.CAR_MODELS["v05"].slot_joint_names
+    slots = ap.slot_names("v05")
     names = [name for name in reversed(slots) if name is not None]
     for k in range(400):
         stamp = 100.0 + 0.005 * k
@@ -109,8 +114,10 @@ def test_frame_between_car_locs_uses_interpolated_car_pose_and_its_own_joints():
     middle = SimpleNamespace(x=-0.25, y=1.5, z=0.0, yaw=0.03)
     # 帧时间就是曝光中点；_feed 的最小网络延时 2 ms 被当成钟差的一部分，关节角早取 2 ms
     q_middle = [READY_Q[0] + 2.0 * (0.025 - 0.002), *READY_Q[1:]]
-    marker = eab.fk(q_middle, car="v05")["marker"]
-    z_off = eab.standard_kinematics("v05").car_hit_pos_z_offset("v05")
+    # 在线锚 = 端点模型的刚体位形黑标（只有关节角缓存，没有力矩历史），z 减车型 hit_pos_z_offset_m 成离地高
+    module = ap.arm().endpoint
+    marker = module.field(ap.endpoint("v05").pose(np.asarray([q_middle])), "marker", module.POSE)[0]
+    z_off = ap.endpoint("v05").z_offset
     c, s = np.cos(middle.yaw), np.sin(middle.yaw)
     expected_mm = 1000.0 * np.array([
         middle.x + c * marker[0] - s * marker[1],
@@ -121,25 +128,36 @@ def test_frame_between_car_locs_uses_interpolated_car_pose_and_its_own_joints():
 
 
 def test_post_run_solves_the_marker_from_online_candidates(tmp_path: Path):
-    tracker_t0, rk_t0, rk_to_pc_bias, z_off = 1000.0, 100.0, 2.525, -0.1471
+    """收场锚 = 端点动态模型黑标本身（不再估本场偏差）：真黑标偏模型 (6, 4, −22) mm（车体系）时照样解出来，
+    逐帧残差与按侧 × 时间窗的汇总都回到这个量。关节 100 Hz、力矩 0、静止位形：动态项为零，模型黑标 = 刚体位形。"""
+    tracker_t0, rk_t0, rk_to_pc_bias = 1000.0, 100.0, 2.525
     final_ht_elapsed = 12.525
     exposure_us = 1000.0
-    marker_minus_fk_car_mm = np.array([6.0, 4.0, -22.0])
-    arm = {"car": "v05", "states": [{"t": 109.0 + 0.005 * k, "position": READY_Q} for k in range(400)]}
+    marker_minus_model_car_mm = np.array([6.0, 4.0, -22.0])
+    frame = ap.arm().endpoint.zero_frame("v05")[0]
+    arm = {
+        "car": "v05",
+        # 臂起栈 run_config 行（node/run_config.hpp run_identity_text）：录包零位帧 = 当前车型 yaml 的帧
+        "run_configs": [{"recv": 0.0, "text": f"run_config: car=v05 config=x | zero_frame={frame} offset_rad=[0,0,0,0,0,0]"}],
+        "states": [{"t": 109.0 + 0.01 * k, "position": READY_Q, "velocity": [0.0] * 6, "effort": [0.0] * 6}
+                   for k in range(200)],
+    }
     car_locs = [
         {"elapsed_s": 12.0 + 0.05 * k, "x": CAR_POSE.x, "y": CAR_POSE.y, "z": CAR_POSE.z,
          "yaw": CAR_POSE.yaw}
         for k in range(21)
     ]
     cameras = ht._load_cameras(CALIB, SERIALS)
-    states = ht.arm_states_with_marker(arm)
-    frames, truth = [], []
+    states = ht.arm_states_with_marker(arm, "tracker")
+    assert arm["endpoint"]["frame"]["recorded"] == frame
+    frames, truth, model = [], [], []
     for k in range(-8, 3):  # ht−400 … +100 ms，车定位帧 20 Hz
         elapsed = final_ht_elapsed + 0.05 * k
         fk_mm = ht._expected_world_mm(
-            elapsed, states, car_locs, car_locs, rk_t0, rk_to_pc_bias, z_off
+            elapsed, states, car_locs, car_locs, rk_t0, rk_to_pc_bias
         )
-        true_mm = fk_mm + ht._car_to_world(CAR_POSE.yaw, marker_minus_fk_car_mm)
+        model.append(fk_mm)
+        true_mm = fk_mm + ht._car_to_world(CAR_POSE.yaw, marker_minus_model_car_mm)
         candidates = {}
         for sn in SERIALS:
             u, v = (float(c) for c in ht._project_raw(cameras[sn], true_mm))
@@ -181,9 +199,8 @@ def test_post_run_solves_the_marker_from_online_candidates(tmp_path: Path):
             "rkT0": rk_t0,
             "zPhasePolicy": {"maxAbsOffsetMs": 100, "appliesTo": "all_pc_sampling",
                              "rkUse": "global_baseline"},
-            "calibration": {"zOff": z_off},
             "rows": [{
-                "reportRow": 1, "accepted": True, "finalMismatch": False,
+                "reportRow": 1, "accepted": True, "finalMismatch": False, "side": 1,
                 "finalHtRkAbs": 110.0, "finalHtPcBaselineElapsed": 12.5,
                 "finalHtPcSampleElapsed": final_ht_elapsed,
                 "zPhase": {"usable": True, "deltaS": 0.025},
@@ -195,11 +212,18 @@ def test_post_run_solves_the_marker_from_online_candidates(tmp_path: Path):
 
     result = ht.measure(tracker_path, marker_path, arm_path, rk_path, tables_path)
 
-    assert result["config"]["reanchor"]["offset_car_mm"] == pytest.approx(
-        marker_minus_fk_car_mm.tolist(), abs=0.05
-    )
+    assert "reanchor" not in result["config"]
+    assert result["config"]["model_anchor"]["status"] == "ok"
+    groups = result["config"]["model_residual"]["groups"]
+    assert set(groups) == {"forehand [-450,-100) ms", "forehand [-100,-20) ms", "forehand [-20,+20) ms",
+                           "forehand [+20,+120) ms"}
+    for group in groups.values():
+        assert group["median_xyz_car_mm"] == pytest.approx(marker_minus_model_car_mm.tolist(), abs=0.5)
     observations = result["racket_observations"]
-    assert [row["frame_idx"] for row in observations] == [frame["frame_idx"] for frame in frames]
-    assert [row["video_frame_idx"] for row in observations] == [frame["frame_idx"] for frame in frames]
-    for row, point in zip(observations, truth):
+    assert [row["frame_idx"] for row in observations] == [f["frame_idx"] for f in frames]
+    assert [row["video_frame_idx"] for row in observations] == [f["frame_idx"] for f in frames]
+    for row, point, anchor in zip(observations, truth, model):
         assert [row["x"], row["y"], row["z"]] == pytest.approx(point.tolist(), abs=5e-4)
+        assert row["side"] == 1
+        assert row["model_marker_world"] == pytest.approx((anchor / 1000.0).tolist(), abs=1e-5)
+        assert row["residual_car_mm"] == pytest.approx(marker_minus_model_car_mm.tolist(), abs=0.5)

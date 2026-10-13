@@ -39,7 +39,27 @@
 
 ## 近期变更
 
+- `2026-10-13`
+  - **报告只用一份臂代码**（用户「请你把report 也修了把，也只用一份代码，做fk或者其他相关的时候，都去引用现在的生产代码，
+    这样生产代码变了，report使用也是一样的」）：报告的臂量全部调臂生产代码现算，入口 `test_src/arm_production.py`
+    （臂仓库 = `TENNIS_MAN_ARM_CONTROLLER`，缺省 `D:/tennis-man/arm_controller`；臂的 Python 包装按源码指纹现场编 C 接口库，要 WinLibs g++）。
+    - `/predict_hit_pos` 收不收 = 臂 `arm_controller.hit_pos` → C++ `node::receive_hit_pos`：不收的文本与臂 `/tennis/status` 逐字同；
+      bot 求解失败报告单列原因、不算合同错误；方案指纹 ≠ 当前臂 / 没有指纹 / 没有 kind = 「旧版本场次，当前生产代码不校验」，照用臂当时的 ACK。
+      页面 JS 只读 Python 写进的 `event.check`。报告原来自己复刻的方案物理对账（刚体变换 / 球心→拍心 / 碰撞 / 上旋 / 五轴切向）整套删了。
+    - 黑标 / 甜点 / 拍面 yaw·pitch / 拍速 = 臂端点模型 `arm_controller.arm_endpoint`：实测关节 → **动态模型** `eval_series`
+      （时延 / J1 柔度 / J1–J4 间隙 / J1 力矩轴倾斜 / 静态 J1 轴倾斜；逐关节采样时刻 = 端点标定同一个读包工具 `arm_endpoint_bag.joint_samples`），
+      命令关节 → 刚体位形 `pose`。读数先按臂零位帧登记表（录包里臂起栈的 run_config 行优先）平移到当前车型 yaml 的帧；
+      判不了（v04 / 零位帧未登记 / 调度不认识 / 臂 checkout 没有这些代码）页面打橙条、相应列为 —，不另写旧逻辑。
+    - `extract_arm_bag.py` / `extract_rk_tracking_bag.py` 只抽原始数据（ROS2 解释器里没有 g++，调不了臂 C 库）；`_arm.json` 新增 `run_configs`。
+    - 黑标测量 `racket_ht_black_marker.py`：锚 = 端点动态模型黑标，**不再估本场「黑标 − FK」偏差（re-anchor 删）**；逐帧写
+      `model_marker_world` / `residual_car_mm`，按正 / 反手 × 离 FinalHT 时间窗汇总进 `config.model_residual`（页面表头显示）。
+      FinalHT±35 ms 内没有黑标的行标「无黑标」，合同行 `visualMarkerNearHt=false`，不拿远帧冒充。
+    - 删：`_add_face_angles` / `_frozen_head_model` / `_head_effective_q`（下面 09-07 那条的实现）、`extract_arm_bag` 的内置 FK、
+      `test_src/arm_swing_black_marker.py` / `analyze_arm_swing_marker.py`（v04 专用，臂端点模型只覆盖五轴臂）。swing_hs 在线锚改调端点刚体位形，
+      它自己的在线偏差中位数搬进 `swing_hs/marker_solver.py`。细节：`tennis-man/memory/report-one-impl-1013.md`。
+
 - `2026-09-07`
+  - （2026-10-13 起已被上面那条取代：拍心 / 拍速改调臂端点模型，本条的实现已删，留作历史。）
   - **报告端「拍心/拍速」换口径（用户定案：冻结柔度模型 + 直接替换旧列）**。原来拍心 = 刚性 `FK(q)` 的 TCP、
     拍速 = 解析 Jacobian `J(q)·q̇`；0907 黑标三场证明臂是弹性链（受载拍心落后 FK 157mm、卸载回收 66mm、
     卸载段视觉比 FK 快 +2.5m/s），所以现在：
@@ -87,7 +107,7 @@
     - 当前剩余主要开销约为：`decode ~11.6ms`，`yolo ~26.7ms`，后台写视频 `~35ms`
 
 - `2026-07-03`: HTML 报表新增 Arm tab（仿 tennis-man arm_controller 的 session_viewer）。
-  - `test_src/extract_arm_bag.py` 在 ROS2 环境（经 `ros2/run_ros2.bat`）读 `{run_id}_rosbag`，输出 `{run_id}_arm.json`：`/joint_states` 实际 + `/tennis/motor_command` 目标（首个轨迹点）+ status/arm_command/hit_pos/predict_hit_pos 事件；TCP 由本文件内置 FK 正解（逐值抄自 `arm_controller.compact_arm_kinematics`，不依赖隔壁 checkout）。
+  - `test_src/extract_arm_bag.py` 在 ROS2 环境（经 `ros2/run_ros2.bat`）读 `{run_id}_rosbag`，输出 `{run_id}_arm.json`：`/joint_states` 实际 + `/tennis/motor_command` 目标（首个轨迹点）+ status/arm_command/hit_pos/predict_hit_pos 事件；TCP 由本文件内置 FK 正解（逐值抄自 `arm_controller.compact_arm_kinematics`，不依赖隔壁 checkout）——2026-10-13 起抽取不再算任何臂量，见上。
     - `2026-08-16` 起 FK **按车型分链**：`--car v03|v04`（不给就从本场 tracker JSON 的 `config.car_config_path` 推），选中的车写进 `_arm.json` 的 `car/car_source/fk_source`，报告端 `_add_face_angles` 按它复算；老 `_arm.json` 车型不符时页面就地复算 TCP。⚠ 两台车的臂不同（v0.4 肩高 +11.1cm、拍长 +5.3cm），选错车只会静默偏几厘米：0816_081524 用 v0.3 链算 v0.4，TCP 两列整场偏 (−5.4, −8.6)cm、FK 拍速低报 5%，而拍面 yaw/pitch 两车逐拍恒等（旋转链一致）——角度列看不出来。合同见 `test_src/test_arm_kinematics_cars.py`（黄金向量取自臂端导出的 `assets/<car>/test_vectors.json`）。
   - `generate_curve3_html.py` 新增 `--arm-json`（缺省自动探测 `<input>_arm.json`），Arm tab 为单 plot 四层 subplot（Position/Velocity/Effort/TCP，target 实线 vs actual 虚线，事件竖线）。
   - `run_tracker.py` post_run 链：bag 存在时先 Extract arm rosbag 再生成 HTML。
