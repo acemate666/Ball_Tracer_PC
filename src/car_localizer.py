@@ -66,11 +66,6 @@ _CAR_X_BOUNDS_M = (-3.0, 3.0)
 _CAR_Y_BOUNDS_M = (0.0, 9.0)
 _CAR_MAX_SPEED_MPS = 4.0
 _CAR_JUMP_SLACK_M = 0.10
-# 单 tag 退化拟合时，冻结用的「最近一次双 tag yaw」允许多陈旧 (s)。
-# 车 yaw 变化慢：0811 场实测各定位空洞两端 yaw 差 1~5°/1.2~2.2s（≈3°/s 上界），
-# 0.5s 陈旧 ⇒ ~1.5°，经 tag0 的 0.42m 安装杠杆只值 ~11mm，比整帧丢定位好两个量级。
-# 再旧就不发——单 tag 自己的印面短基线 yaw（0.161m）不拿来解位置，见 locate()。
-_SINGLE_TAG_YAW_MAX_AGE_S = 0.5
 
 
 @dataclass
@@ -249,10 +244,6 @@ class CarLocalizer:
         self._prefer_enhanced = False
         self._raw_fail_streak = 0
         self._enhanced_since_probe = 0
-        # 单 tag 退化路径用的冻结 yaw：只由「双 tag 且 yaw_valid」的结果刷新，
-        # 单 tag 帧自己解出的 yaw 绝不回灌（否则误差会沿着退化链自我累积）。
-        self._hold_yaw: Optional[float] = None
-        self._hold_yaw_t: Optional[float] = None
         self._last_accepted_loc: Optional[CarLoc] = None
         self.single_tag_frames = 0     # 诊断计数：走退化路径发出的帧数
 
@@ -554,13 +545,17 @@ class CarLocalizer:
         **首选路径**是 min_tags 块 tag 联合拟合（默认 2），x/y/yaw 全解。
 
         **退化路径**（single_tag_fallback，2026-08-11 加）：首选路径拿不到结果、
-        但仍有一块 tag 被 >=2 台相机看到时，用最近一次可信 yaw 冻结着只解 x/y，
-        返回 `yaw=None` 的 CarLoc。动机是 0811 053055 场实测：tag1 被臂座自遮挡，
-        373/378 两台常年看不到它，而与门要求两块都在，于是击球瞬间成片丢定位
-        （18 抛里 4 抛的真值因此为空，空洞 0.65~2.2s）；同批 miss 帧里 tag0 在
-        >=2 台相机的检出率是 15/15。位置来自 tag 中心多视图三角化（无短基线
-        问题），只有 0.42m 安装杠杆要乘 yaw 误差：冻结 yaw 陈旧 <=0.5s ⇒ ~1.5°
-        ⇒ ~11mm，远好于整帧丢定位。yaw 一律不发（None），由消费端保持自身值。
+        但仍有一块 tag 被 >=2 台相机看到时，按车 yaw=0 只解 x/y，返回 `yaw=None`
+        的 CarLoc：yaw 一律不发，消费端（RK）只更新 x/y、yaw 继续用自己积分的。
+        动机是 0811 053055 场实测：tag1 被臂座自遮挡，373/378 两台常年看不到它，
+        而与门要求两块都在，于是击球瞬间成片丢定位（18 抛里 4 抛的真值因此为空，
+        空洞 0.65~2.2s）；同批 miss 帧里 tag0 在 >=2 台相机的检出率是 15/15。
+        位置来自 tag 中心多视图三角化，误差 = 安装杠杆（v05 tag0 ≈0.49m）×
+        车真实 yaw（1° ≈ 9mm）。
+        yaw=0 是 2026-10-13 用户定的：原先冻结最近一次双 tag yaw、超过 0.5s 就
+        整帧不发，1013_182644 场车停在原点时 tag1 解不出、tag0 被 3~4 台相机
+        看着，却因此成段丢定位 4~15s，RK 的 WAIT 起步门随之卡住 4 抛。
+        多久没双 tag 才不许起步由 RK 起步门自己判。
 
         Args:
             images: {序列号: BGR 图像}
@@ -605,12 +600,7 @@ class CarLocalizer:
 
         if not single_tag_fallback:
             return None
-        yaw = self._fresh_hold_yaw(t)
-        if yaw is None:
-            # 还没锁定过 yaw（或已经太旧）：单 tag 的印面短基线 yaw 不足以撑住
-            # 0.42m 杠杆，宁可不发，别用一个说不清误差的位置污染下游。
-            return None
-        result = self.estimate_car_pose(tag_cameras, t, fixed_yaw=yaw)
+        result = self.estimate_car_pose(tag_cameras, t, fixed_yaw=0.0)
         if result is None:
             return None
         return self._finalize_location(result, single_tag_fallback=True)
@@ -650,21 +640,9 @@ class CarLocalizer:
                 return None
 
         self._last_accepted_loc = result
-        if result.yaw is not None and result.yaw_valid:
-            self._hold_yaw = result.yaw
-            self._hold_yaw_t = result.t
         if single_tag_fallback:
             self.single_tag_frames += 1
         return result
-
-    def _fresh_hold_yaw(self, t: float) -> Optional[float]:
-        """最近一次可信 yaw，超过 _SINGLE_TAG_YAW_MAX_AGE_S 就作废。"""
-        if self._hold_yaw is None or self._hold_yaw_t is None:
-            return None
-        age = t - self._hold_yaw_t
-        if not (0.0 <= age <= _SINGLE_TAG_YAW_MAX_AGE_S):
-            return None
-        return self._hold_yaw
 
     # ── 内部方法 ──────────────────────────────────────────────────────
 
