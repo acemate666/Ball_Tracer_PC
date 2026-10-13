@@ -1,0 +1,246 @@
+{
+  "contract": "ASUS 相机曝光中点时间（perf_counter；tracker 1010 ee34909 起帧时间 = 曝光开始 + 曝光 / 2）− Jetson CLOCK_MONOTONIC（曝光中心） = 那一刻的局域网 offset + bias_s。局域网 offset 用 ArmCalibration/lan_clock_sync.py 的 offset_at（前后 5 s、往返最短 20% 取中位）；bias = 逐抛按 z 对时（弹地前后各 8 点、时移 + 常值 z 放开，与观测补偿重拟迭代到收敛）− 同一刻局域网 offset，是常数（用户 2026-10-06 定，2026-10-11 用户令按新口径更新）",
+  "bias_s": -0.0003168,
+  "bias_ms": -0.317,
+  "estimator": "两场 18 抛均值（本场 15 抛 + 1006 场 3 抛同法重算）",
+  "summary": {
+    "pooled": {
+      "n": 18,
+      "bias_ms_median": -0.3313941415399313,
+      "bias_ms_mean": -0.31677273929946953,
+      "bias_ms_std": 0.5422666600230247,
+      "bias_ms_sem": 0.12781347750455363
+    },
+    "tracker_20261010_230145": {
+      "n": 15,
+      "bias_ms_median": -0.02911454066634178,
+      "bias_ms_mean": -0.25393906980752945,
+      "bias_ms_std": 0.5737602438734714,
+      "bias_ms_sem": 0.1481442579491907
+    },
+    "tracker_20261006_200933": {
+      "n": 3,
+      "bias_ms_median": -0.6377969402819872,
+      "bias_ms_mean": -0.6309410867591699,
+      "bias_ms_std": 0.1318436071118098,
+      "bias_ms_sem": 0.07611994205693466
+    }
+  },
+  "pc_half_exposure_added_ms": {
+    "tracker_20261010_230145": 0.4,
+    "tracker_20261006_200933": 1.0
+  },
+  "throws": [
+    {
+      "session": "tracker_20261010_230145",
+      "throw": 3,
+      "pc_bounce_t": 2165210.483708798,
+      "ball_pc_minus_rk": 2150340.416105956,
+      "lan_pc_minus_rk": 2150340.417106491,
+      "bias_ms": -1.0005352087318897,
+      "lan_kept_spread_ms": 1.4078225940465927,
+      "lan_rtt_min_ms": 2.38489564799238,
+      "lan_rtt_p50_ms": 5.625923762636376
+    },
+    {
+      "session": "tracker_20261010_230145",
+      "throw": 4,
+      "pc_bounce_t": 2165215.5834700475,
+      "ball_pc_minus_rk": 2150340.416202936,
+      "lan_pc_minus_rk": 2150340.417303821,
+      "bias_ms": -1.1008852161467075,
+      "lan_kept_spread_ms": 1.7170263454318047,
+      "lan_rtt_min_ms": 2.38489564799238,
+      "lan_rtt_p50_ms": 5.781112104159547
+    },
+    {
+      "session": "tracker_20261010_230145",
+      "throw": 5,
+      "pc_bounce_t": 2165222.600731729,
+      "ball_pc_minus_rk": 2150340.4176600007,
+      "lan_pc_minus_rk": 2150340.417273922,
+      "bias_ms": 0.386078841984272,
+      "lan_kept_spread_ms": 1.4887657016515732,
+      "lan_rtt_min_ms": 2.460156078086584,
+      "lan_rtt_p50_ms": 5.814383664983325
+    },
+    {
+      "session": "tracker_20261010_230145",
+      "throw": 6,
+      "pc_bounce_t": 2165228.1680852748,
+      "ball_pc_minus_rk": 2150340.4176434684,
+      "lan_pc_minus_rk": 2150340.417668094,
+      "bias_ms": -0.024625565856695175,
+      "lan_kept_spread_ms": 1.4235824346542358,
+      "lan_rtt_min_ms": 2.5332720506412443,
+      "lan_rtt_p50_ms": 5.426463960247929
+    },
+    {
+      "session": "tracker_20261010_230145",
+      "throw": 7,
+      "pc_bounce_t": 2165234.359872114,
+      "ball_pc_minus_rk": 2150340.418000858,
+      "lan_pc_minus_rk": 2150340.4179931143,
+      "bias_ms": 0.007743481546640396,
+      "lan_kept_spread_ms": 1.5103984624147415,
+      "lan_rtt_min_ms": 2.2553161725227255,
+      "lan_rtt_p50_ms": 5.275523870295729
+    },
+    {
+      "session": "tracker_20261010_230145",
+      "throw": 8,
+      "pc_bounce_t": 2165263.6930688536,
+      "ball_pc_minus_rk": 2150340.41845597,
+      "lan_pc_minus_rk": 2150340.419470328,
+      "bias_ms": -1.0143578983843327,
+      "lan_kept_spread_ms": 1.7037391662597656,
+      "lan_rtt_min_ms": 2.360247653996339,
+      "lan_rtt_p50_ms": 5.360392167858663
+    },
+    {
+      "session": "tracker_20261010_230145",
+      "throw": 9,
+      "pc_bounce_t": 2165268.538244997,
+      "ball_pc_minus_rk": 2150340.4185253554,
+      "lan_pc_minus_rk": 2150340.419438243,
+      "bias_ms": -0.9128875099122524,
+      "lan_kept_spread_ms": 1.6742581501603127,
+      "lan_rtt_min_ms": 2.360247653996339,
+      "lan_rtt_p50_ms": 5.2780002406507265
+    },
+    {
+      "session": "tracker_20261010_230145",
+      "throw": 11,
+      "pc_bounce_t": 2165292.8382030562,
+      "ball_pc_minus_rk": 2150340.4202877507,
+      "lan_pc_minus_rk": 2150340.420316865,
+      "bias_ms": -0.02911454066634178,
+      "lan_kept_spread_ms": 1.1467793956398964,
+      "lan_rtt_min_ms": 2.9020437177678104,
+      "lan_rtt_p50_ms": 4.9316758104396285
+    },
+    {
+      "session": "tracker_20261010_230145",
+      "throw": 12,
+      "pc_bounce_t": 2165300.3031695364,
+      "ball_pc_minus_rk": 2150340.420352725,
+      "lan_pc_minus_rk": 2150340.420813093,
+      "bias_ms": -0.4603681154549122,
+      "lan_kept_spread_ms": 1.081627793610096,
+      "lan_rtt_min_ms": 2.1523790619539795,
+      "lan_rtt_p50_ms": 4.591495895510889
+    },
+    {
+      "session": "tracker_20261010_230145",
+      "throw": 15,
+      "pc_bounce_t": 2165376.388442218,
+      "ball_pc_minus_rk": 2150340.423161459,
+      "lan_pc_minus_rk": 2150340.4238151098,
+      "bias_ms": -0.6536506116390228,
+      "lan_kept_spread_ms": 1.5674452297389507,
+      "lan_rtt_min_ms": 2.5028201835084474,
+      "lan_rtt_p50_ms": 4.994424149117549
+    },
+    {
+      "session": "tracker_20261010_230145",
+      "throw": 16,
+      "pc_bounce_t": 2165383.4212105153,
+      "ball_pc_minus_rk": 2150340.424263808,
+      "lan_pc_minus_rk": 2150340.423983148,
+      "bias_ms": 0.28066011145710945,
+      "lan_kept_spread_ms": 1.0361210443079472,
+      "lan_rtt_min_ms": 2.1802883929922245,
+      "lan_rtt_p50_ms": 4.8528477618674515
+    },
+    {
+      "session": "tracker_20261010_230145",
+      "throw": 17,
+      "pc_bounce_t": 2165391.0889381054,
+      "ball_pc_minus_rk": 2150340.424566415,
+      "lan_pc_minus_rk": 2150340.42447704,
+      "bias_ms": 0.08937530219554901,
+      "lan_kept_spread_ms": 1.3073110021650791,
+      "lan_rtt_min_ms": 2.517591947253095,
+      "lan_rtt_p50_ms": 4.821828140848083
+    },
+    {
+      "session": "tracker_20261010_230145",
+      "throw": 18,
+      "pc_bounce_t": 2165396.77523496,
+      "ball_pc_minus_rk": 2150340.4255638346,
+      "lan_pc_minus_rk": 2150340.4248028714,
+      "bias_ms": 0.760963186621666,
+      "lan_kept_spread_ms": 0.9925318881869316,
+      "lan_rtt_min_ms": 2.721151860896498,
+      "lan_rtt_p50_ms": 4.803260264452547
+    },
+    {
+      "session": "tracker_20261010_230145",
+      "throw": 19,
+      "pc_bounce_t": 2165408.696764521,
+      "ball_pc_minus_rk": 2150340.4250280103,
+      "lan_pc_minus_rk": 2150340.4252304304,
+      "bias_ms": -0.2024201676249504,
+      "lan_kept_spread_ms": 1.2046322226524353,
+      "lan_rtt_min_ms": 2.6213558867311804,
+      "lan_rtt_p50_ms": 4.896675787676941
+    },
+    {
+      "session": "tracker_20261010_230145",
+      "throw": 20,
+      "pc_bounce_t": 2165414.6599867553,
+      "ball_pc_minus_rk": 2150340.425161771,
+      "lan_pc_minus_rk": 2150340.425096833,
+      "bias_ms": 0.06493786349892616,
+      "lan_kept_spread_ms": 1.2652832083404064,
+      "lan_rtt_min_ms": 2.9743911345576635,
+      "lan_rtt_p50_ms": 5.191456039028708
+    },
+    {
+      "session": "tracker_20261006_200933",
+      "throw": 0,
+      "pc_bounce_t": 1809304.0000297157,
+      "ball_pc_minus_rk": 1792683.9654569472,
+      "lan_pc_minus_rk": 1792683.9659527505,
+      "bias_ms": -0.49580330960452557,
+      "lan_kept_spread_ms": 1.2068124487996101,
+      "lan_rtt_min_ms": 2.542443784477655,
+      "lan_rtt_p50_ms": 4.393712035380304
+    },
+    {
+      "session": "tracker_20261006_200933",
+      "throw": 1,
+      "pc_bounce_t": 1809308.8324747959,
+      "ball_pc_minus_rk": 1792683.9655289424,
+      "lan_pc_minus_rk": 1792683.9661667394,
+      "bias_ms": -0.6377969402819872,
+      "lan_kept_spread_ms": 0.6635214667767286,
+      "lan_rtt_min_ms": 2.3895038866612595,
+      "lan_rtt_p50_ms": 4.392031998577295
+    },
+    {
+      "session": "tracker_20261006_200933",
+      "throw": 4,
+      "pc_bounce_t": 1809328.7353141522,
+      "ball_pc_minus_rk": 1792683.9654248934,
+      "lan_pc_minus_rk": 1792683.9661841164,
+      "bias_ms": -0.7592230103909969,
+      "lan_kept_spread_ms": 1.1387327685952187,
+      "lan_rtt_min_ms": 2.1884438647248317,
+      "lan_rtt_p50_ms": 4.610919131664559
+    }
+  ],
+  "method_scripts": "D:/tennis-man/scratch/v05_lansync_static_1010/（pipeline.py + lanbias_dump.py；PC_MID=1）",
+  "superseded": {
+    "bias_ms": -3.0185,
+    "contract": "ASUS 相机曝光时间（perf_counter）− Jetson CLOCK_MONOTONIC = 那一刻的局域网 offset + bias_s。局域网 offset 用 ArmCalibration/lan_clock_sync.py 的 offset_at（前后 5 s、往返最短 20% 取中位）；bias = 网球在线对时 − 同一刻局域网 offset，是常数，测一次以后一直用（用户 2026-10-06 定）",
+    "summary": {
+      "n": 4,
+      "bias_ms_median": -3.0184657080098987,
+      "bias_ms_mean": -2.520110283512622,
+      "bias_ms_std": 1.1767895075564596,
+      "bias_ms_sem": 0.5883947537782298
+    },
+    "why": "旧值 = tracker 在线对时 4 次 accepted − 局域网（PC 帧时间为曝光开始）；在线对时每次 ±3 ms 噪声（1010 晚 17 次 sd 3.35 ms），不能定常数"
+  }
+}
