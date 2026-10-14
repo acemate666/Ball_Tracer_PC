@@ -288,19 +288,44 @@ if ($before.Pids.Count -gt 0) {
 
 # ConPTY 一开场就清屏，本地先打的字会被冲掉，所以提示由远端在清屏之后打印
 $banner = "[run_tracker_asus] {0}> .\run_tracker_with_predict.ps1 {1}`n[run_tracker_asus] Ctrl+C once to stop. After the tracker exits, the new session is pulled to {2}" -f $RemoteRepo, $argText, $LocalRoot
+$exitName = 'run_tracker_asus_' + [guid]::NewGuid().ToString('N') + '.exitcode'
+# Ctrl+C 会跳过 try 内原生命令之后的语句，退出码必须在 finally 里保存。
 $runBody = @(
+    '$ErrorActionPreference = ''Stop'''
+    '$exitPath = Join-Path $env:TEMP ' + (ConvertTo-PsLiteral $exitName)
+    '$LASTEXITCODE = 1'
+    'try {'
     'Set-Location -LiteralPath ' + (ConvertTo-PsLiteral $RemoteRepo) + ' -ErrorAction Stop'
     'Write-Host ' + (ConvertTo-PsLiteral $banner) + ' -ForegroundColor Cyan'
     "if (Test-Path -LiteralPath '.venv_ros2\Scripts\Activate.ps1') { . '.\.venv_ros2\Scripts\Activate.ps1' }"
     "& '.\run_tracker_with_predict.ps1' $argText"
-    'exit $LASTEXITCODE'
+    '} catch { $LASTEXITCODE = 1; Write-Host $_ -ForegroundColor Red } finally {'
+    '$trackerExit = $LASTEXITCODE'
+    '[System.IO.File]::WriteAllText($exitPath, [string]$trackerExit + "`n", (New-Object System.Text.UTF8Encoding $false))'
+    '}'
+    'exit $trackerExit'
 ) -join "`n"
 $b64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($runBody))
-$rc = Invoke-Console $sshExe @('-t', '-o', 'LogLevel=ERROR', $AsusHost, "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand $b64")
+$sshRc = Invoke-Console $sshExe @('-t', '-o', 'LogLevel=ERROR', $AsusHost, "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand $b64")
+
+# Windows ssh -t/ConPTY 会把远端失败码报成 0；真实结果从本次运行的文件经非终端 ssh 读取。
+$exitBody = @(
+    '$exitPath = Join-Path $env:TEMP ' + (ConvertTo-PsLiteral $exitName)
+    'if (Test-Path -LiteralPath $exitPath -PathType Leaf) {'
+    'try { [System.IO.File]::ReadAllText($exitPath).Trim() } finally { Remove-Item -LiteralPath $exitPath -Force }'
+    '}'
+) -join "`n"
+$exitLines = @(Invoke-AsusPs $exitBody)
+$rc = 1
+if ($exitLines.Count -eq 1 -and $exitLines[0] -match '^-?\d+$') {
+    $rc = [int]$exitLines[0]
+} else {
+    Write-Warning 'ASUS did not record the tracker exit code; treating this run as failed.'
+}
 
 Write-Host ''
 Write-Host ("Tracker on ASUS exited (code {0})." -f $rc)
-if ($rc -eq 255) {
+if ($sshRc -eq 255) {
     Write-Warning 'The ssh connection was lost; the tracker on ASUS most likely died with it, so this session is probably incomplete. If ASUS is unreachable now, pull later with -PullOnly.'
 }
 $after = Wait-AsusIdle
@@ -311,4 +336,4 @@ if ($new.Count -eq 0) {
 }
 $allOk = $true
 foreach ($n in $new) { if (-not (Sync-AsusSession $n)) { $allOk = $false } }
-if ($allOk) { exit 0 } else { exit 1 }
+if ($allOk) { exit $rc } else { exit 1 }
