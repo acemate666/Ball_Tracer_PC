@@ -1,5 +1,5 @@
 {
-    "tile_size": 1280,
+    "tile_size": 928,
     "tile_resize": 416,
     "track_timeout_s": 0.3,
     "search_hold_frames": 4,
@@ -19,7 +19,7 @@
         "min_occurrences": 6
     },
     "racket_imu": {
-        "enabled": true,
+        "enabled": false,
         "address": "F4:69:A2:72:B4:23"
     },
     "racket_impact": {
