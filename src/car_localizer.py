@@ -12,15 +12,15 @@ src/config/vehicle_v04.json；v0.3 车的布局仍在 src/config/arm_poe_racket_
   1. 接收多台相机的同步 BGR 图像
   2. cv2.aruco 检测 AprilTag (tag36h11) 的 4 个角点
   3. 所有相机 × 所有已配置 tag 的角点纳入同一刚体模型：
-     世界角点 = 车位姿 (x, y, yaw) ∘ 车体系 tag 布局 ∘ tag 印面角点
-  4. 在原始畸变像素域联合优化车的 x/y/yaw
+     世界角点 = 车体三维位姿 ∘ 车体系 tag 布局 ∘ tag 印面角点
+  4. 在原始畸变像素域联合优化 x/y/z/roll/pitch/yaw
   5. 按 (相机, tag) 视图的四角重投影误差剔除异常视图
-  6. 直接输出车底盘中心位姿（车心即优化变量，无需 tag→车心换算）
+  6. 输出车底盘中心的地面投影 x/y 和 yaw；高度、俯仰和侧倾由内部拟合吸收
 
 双 tag 同时可见时 ~0.9 m 的中心基线让 yaw 远优于单 tag 16 cm 边长的短基线。
-产品约定：locate() 首选两块 tag 联合拟合（x/y/yaw 全解）；只剩一块 tag 时退化为
-「冻结最近一次可信 yaw、只解 x/y」并返回 yaw=None，由消费端保持自身 yaw 不更新
-（2026-08-11 起；此前是单 tag 一律不发布）。自由 yaw 的单 tag 拟合仍只供诊断
+产品约定：locate() 首选两块 tag 联合拟合三维位姿；只剩一块 tag 时约束 yaw=0，
+继续拟合 x/y/z/roll/pitch，并返回 yaw=None，由消费端保持自身 yaw 不更新。
+自由 yaw 的单 tag 拟合仍只供诊断
 （estimate_car_pose / estimate_pose 直调）。
 
 用法：
@@ -49,6 +49,7 @@ import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 
 from .cv_linalg import (
+    matvec,
     projection_matrix,
     smallest_right_singular_vector,
     solve_least_squares,
@@ -82,14 +83,14 @@ class CarLoc:
     """车辆底盘中心在球场世界系中的定位结果。"""
     x: float                       # 世界坐标 X (m)
     y: float                       # 世界坐标 Y (m)
-    z: float                       # 世界坐标 Z (m)
+    z: float                       # 地面投影 Z，恒为 0；内部车体高度不在此输出
     t: float                       # 时间戳 (perf_counter)
     tag_id: int                    # 主 tag（拟合中相机数最多；并列取小 id）
     cameras_used: list[str]        # 参与最终刚体拟合的相机序列号
     pixels: dict[str, tuple[float, float]]  # {序列号: 主 tag 中心 (u, v)}
     reprojection_error: float      # 平均重投影误差 (px)
     # 底盘绕 z 轴旋转角 (rad)。None = 本帧给不出可信 yaw（单 tag 退化，位置是拿
-    # 冻结的历史 yaw 解出来的），消费端必须保持自身 yaw 不更新，只吃 x/y。
+    # yaw=0 约束下解出来的），消费端必须保持自身 yaw 不更新，只吃 x/y。
     yaw: Optional[float]
     yaw_valid: bool                # 双 tag 或 3+ 相机、且四角误差合格才允许修正底盘 yaw
     tag_ids: list[int] = field(default_factory=list)  # 参与最终拟合的全部 tag
@@ -101,7 +102,7 @@ class CarLoc:
 class _TagSpec:
     """单块车载 tag 的布局参数（车体系）。"""
     tag_id: int
-    center_car_mm: np.ndarray      # (3,) 车体系中心，z 为离地高度
+    center_car_mm: np.ndarray      # (3,) 车体系中心，含名义高度；随车体姿态变换
     R_tag_car: np.ndarray          # 3x3，列 = [印面右 e1, 印面上 e2, 朝外法线 n]
 
 
@@ -132,7 +133,7 @@ class CarLocalizer:
     多目车辆定位器（基于车载已知布局的刚性 AprilTag 组）。
 
     在多张同步图像中检测 AprilTag，将所有已配置 tag 的角点观测合并，
-    联合估计车底盘中心的世界系 x/y/yaw。
+    联合估计车体三维位姿，输出车底盘中心的地面投影 x/y 和 yaw。
     """
 
     def __init__(
@@ -421,7 +422,7 @@ class CarLocalizer:
                 tag；至少一块 tag 需被 >=2 台相机看到（用于初值三角化），
                 其余 1 台相机的 tag 观测也会加入联合优化。
             t: 时间戳 (perf_counter)。
-            fixed_yaw: 给定时 yaw 冻结在该值上只解 x/y，返回的 CarLoc.yaw 为
+            fixed_yaw: 给定时仅固定 yaw，仍拟合 x/y/z/roll/pitch，返回的 CarLoc.yaw 为
                 None、yaw_valid 为 False（单 tag 退化路径，见 locate()）。
 
         Returns:
@@ -472,7 +473,7 @@ class CarLocalizer:
 
         corner_errors = np.linalg.norm(residual.reshape(-1, 2), axis=1)
         reprojection_error = float(np.mean(corner_errors))
-        yaw = self._normalize_angle(float(pose[2]))
+        yaw = self._normalize_angle(float(pose[5]))
 
         tag_camera_count: dict[int, int] = {}
         for _, tag_id, _ in units:
@@ -499,8 +500,7 @@ class CarLocalizer:
             cameras_used=cameras_used,
             pixels=pixels,
             reprojection_error=reprojection_error,
-            # yaw 冻结解出来的位姿不带 yaw 信息：本帧的 yaw 是历史值，原样发回去
-            # 会让消费端把陈旧值当新观测反复吸收，必须显式报 None。
+            # 固定 yaw 的拟合不提供新的 yaw 观测。
             yaw=None if fixed_yaw is not None else yaw,
             yaw_valid=(
                 fixed_yaw is None
@@ -542,10 +542,10 @@ class CarLocalizer:
         在所有图像中检测 AprilTag，收集所有已配置车载 tag 的观测，
         联合做车位姿刚体拟合。
 
-        **首选路径**是 min_tags 块 tag 联合拟合（默认 2），x/y/yaw 全解。
+        **首选路径**是 min_tags 块 tag 联合拟合（默认 2），三维位置和姿态全解。
 
         **退化路径**（single_tag_fallback，2026-08-11 加）：首选路径拿不到结果、
-        但仍有一块 tag 被 >=2 台相机看到时，按车 yaw=0 只解 x/y，返回 `yaw=None`
+        但仍有一块 tag 被 >=2 台相机看到时，约束 yaw=0，拟合 x/y/z/roll/pitch，返回 `yaw=None`
         的 CarLoc：yaw 一律不发，消费端（RK）只更新 x/y、yaw 继续用自己积分的。
         动机是 0811 053055 场实测：tag1 被臂座自遮挡，373/378 两台常年看不到它，
         而与门要求两块都在，于是击球瞬间成片丢定位（18 抛里 4 抛的真值因此为空，
@@ -649,24 +649,24 @@ class CarLocalizer:
     def _tag_world_corners(
         self, pose: np.ndarray, tag_id: int
     ) -> np.ndarray:
-        """车位姿 [x_mm, y_mm, yaw] 下某 tag 的 4 个世界角点 (4,3) mm。"""
-        c = math.cos(float(pose[2]))
-        s = math.sin(float(pose[2]))
-        Rz = np.array(
-            [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64
-        )
-        spec = self._tags[tag_id]
-        center_w = np.array(
+        """位姿 [x_mm, y_mm, z_mm, roll, pitch, yaw] 下的 tag 世界角点。"""
+        sr, cr = math.sin(pose[3]), math.cos(pose[3])
+        sp, cp = math.sin(pose[4]), math.cos(pose[4])
+        sy, cy = math.sin(pose[5]), math.cos(pose[5])
+        rotation = np.array(
             [
-                pose[0] + c * spec.center_car_mm[0] - s * spec.center_car_mm[1],
-                pose[1] + s * spec.center_car_mm[0] + c * spec.center_car_mm[1],
-                spec.center_car_mm[2],
+                [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+                [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+                [-sp, cp * sr, cp * cr],
             ],
             dtype=np.float64,
         )
-        R_w = Rz @ spec.R_tag_car
-        # (4,2) 印面坐标 × [e1_w, e2_w]^T → (4,3)
-        return center_w[None, :] + self._corners_printed_mm @ R_w[:, :2].T
+        spec = self._tags[tag_id]
+        corners_car = (
+            spec.center_car_mm[None, :]
+            + self._corners_printed_mm @ spec.R_tag_car[:, :2].T
+        )
+        return corners_car @ rotation.T + pose[:3]
 
     def _car_corner_residuals(
         self,
@@ -698,16 +698,14 @@ class CarLocalizer:
         units: list[tuple[str, int, CarDetection]],
         free_yaw: bool = True,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Huber Gauss-Newton 优化车位姿 [x_mm, y_mm, yaw_rad]。
+        """Huber Gauss-Newton 优化 [x_mm, y_mm, z_mm, roll, pitch, yaw]。
 
-        free_yaw=False 时 yaw 冻结在初值上，只解 x/y（单 tag 退化用）：印面
-        0.161m 短基线解出的 yaw 会经 0.42m 安装杠杆放大成位置误差，宁可用
-        最近一次双 tag 的 yaw 冻住，把这一帧的自由度降到 2。
+        高度、俯仰和侧倾始终自由；单 tag 退化时仅固定 yaw。
         """
         pose = initial_pose.copy()
-        eps = np.array([0.1, 0.1, 1e-4], dtype=np.float64)
-        max_step = np.array([200.0, 200.0, 0.35], dtype=np.float64)
-        columns = (0, 1, 2) if free_yaw else (0, 1)
+        eps = np.array([0.1, 0.1, 0.1, 1e-4, 1e-4, 1e-4], dtype=np.float64)
+        max_step = np.array([200.0, 200.0, 200.0, 0.35, 0.35, 0.35])
+        columns = (0, 1, 2, 3, 4, 5) if free_yaw else (0, 1, 2, 3, 4)
 
         for _ in range(10):
             residual = self._car_corner_residuals(pose, units)
@@ -732,14 +730,14 @@ class CarLocalizer:
                 jacobian * row_weights[:, None],
                 -residual * row_weights,
             )
-            step = np.zeros(3, dtype=np.float64)
+            step = np.zeros(6, dtype=np.float64)
             step[list(columns)] = free_step
             step = np.clip(step, -max_step, max_step)
             current_cost = self._huber_cost(corner_norms)
             accepted = False
             for _ in range(5):
                 candidate = pose + step
-                candidate[2] = self._normalize_angle(float(candidate[2]))
+                candidate[3:] = [self._normalize_angle(a) for a in candidate[3:]]
                 candidate_residual = self._car_corner_residuals(candidate, units)
                 if self._huber_cost(np.linalg.norm(
                     candidate_residual.reshape(-1, 2), axis=1
@@ -749,104 +747,63 @@ class CarLocalizer:
                     break
                 step *= 0.5
             if not accepted or (
-                np.hypot(step[0], step[1]) < 0.01 and abs(step[2]) < 1e-6
+                np.linalg.norm(step[:3]) < 0.01
+                and np.linalg.norm(step[3:]) < 1e-6
             ):
                 break
 
         return pose, self._car_corner_residuals(pose, units)
-
-    def _xy_from_centers(
-        self,
-        centers: dict[int, np.ndarray],
-        yaw: float,
-    ) -> np.ndarray:
-        """已知 yaw 时，由若干 tag 的三角化中心反解车心 xy（多块取平均）。"""
-        c = math.cos(yaw)
-        s = math.sin(yaw)
-        xy = np.zeros(2, dtype=np.float64)
-        for tag_id, center_w in centers.items():
-            a = self._tags[tag_id].center_car_mm[:2]
-            xy += center_w[:2] - np.array(
-                [c * a[0] - s * a[1], s * a[0] + c * a[1]]
-            )
-        return xy / len(centers)
 
     def _initial_pose(
         self,
         tag_detections: dict[int, dict[str, CarDetection]],
         fixed_yaw: Optional[float] = None,
     ) -> Optional[np.ndarray]:
-        """DLT 三角化生成车位姿初值 [x_mm, y_mm, yaw_rad]。
-
-        双 tag（各 >=2 相机）：由两中心基线解 yaw；单 tag：由印面角点边
-        方向 + 安装旋转解 yaw。fixed_yaw 给定时直接用它，不做任何 yaw 估计
-        （单 tag 退化路径：位置纯靠 tag 中心三角化 + 冻结 yaw 的安装杠杆）。
-        """
-        centers: dict[int, np.ndarray] = {}
+        """三角化 tag 四角，与车体系四角做刚体配准，得到三维位姿初值。"""
+        car_points = []
+        world_points = []
         for tag_id, cam_dets in tag_detections.items():
             if len(cam_dets) < 2:
                 continue
-            sns = list(cam_dets)
-            centers[tag_id] = self._triangulate_point(
-                sns,
-                {sn: (cam_dets[sn].cx, cam_dets[sn].cy) for sn in sns},
+            spec = self._tags[tag_id]
+            car_points.extend(
+                spec.center_car_mm[None, :]
+                + self._corners_printed_mm @ spec.R_tag_car[:, :2].T
             )
-        if not centers:
+            sns = list(cam_dets)
+            world_points.extend(
+                self._triangulate_point(sns, {
+                    sn: tuple(det.corners[k]) for sn, det in cam_dets.items()
+                })
+                for k in range(4)
+            )
+        if not car_points:
             return None
 
-        if fixed_yaw is not None:
-            yaw = float(fixed_yaw)
-            xy = self._xy_from_centers(centers, yaw)
-        elif len(centers) >= 2:
-            tag_a, tag_b = sorted(centers)[:2]
-            w_ab = centers[tag_b][:2] - centers[tag_a][:2]
-            a_ab = (
-                self._tags[tag_b].center_car_mm[:2]
-                - self._tags[tag_a].center_car_mm[:2]
-            )
-            yaw = (
-                math.atan2(w_ab[1], w_ab[0]) - math.atan2(a_ab[1], a_ab[0])
-            )
-            xy = self._xy_from_centers(
-                {tag_id: centers[tag_id] for tag_id in (tag_a, tag_b)}, yaw
-            )
-        else:
-            (tag_id, center_w), = centers.items()
-            cam_dets = tag_detections[tag_id]
-            sns = list(cam_dets)
-            spec = self._tags[tag_id]
-            # 选车体系水平分量更大的印面轴，避免近竖直边的方位角退化
-            e1_h = float(np.hypot(*spec.R_tag_car[:2, 0]))
-            e2_h = float(np.hypot(*spec.R_tag_car[:2, 1]))
-            if e1_h >= e2_h:
-                idx_a, idx_b = 0, 1                       # c0 -> c1 沿印面右
-                axis_car = spec.R_tag_car[:2, 0]
-            else:
-                idx_a, idx_b = 3, 0                       # c3 -> c0 沿印面上
-                axis_car = spec.R_tag_car[:2, 1]
-            p_a = self._triangulate_point(sns, {
-                sn: (
-                    float(cam_dets[sn].corners[idx_a, 0]),
-                    float(cam_dets[sn].corners[idx_a, 1]),
-                )
-                for sn in sns
-            })
-            p_b = self._triangulate_point(sns, {
-                sn: (
-                    float(cam_dets[sn].corners[idx_b, 0]),
-                    float(cam_dets[sn].corners[idx_b, 1]),
-                )
-                for sn in sns
-            })
-            yaw = (
-                math.atan2(p_b[1] - p_a[1], p_b[0] - p_a[0])
-                - math.atan2(axis_car[1], axis_car[0])
-            )
-            xy = self._xy_from_centers({tag_id: center_w}, yaw)
-
-        return np.array(
-            [xy[0], xy[1], self._normalize_angle(yaw)], dtype=np.float64
+        car_points = np.asarray(car_points)
+        world_points = np.asarray(world_points)
+        car_mean = car_points.mean(axis=0)
+        world_mean = world_points.mean(axis=0)
+        covariance = cv2.gemm(
+            (car_points - car_mean).T, world_points - world_mean, 1.0, None, 0.0
         )
+        _, u, vt = cv2.SVDecomp(covariance)
+        rotation = cv2.gemm(vt.T, u.T, 1.0, None, 0.0)
+        if cv2.determinant(rotation) < 0.0:
+            vt[-1] *= -1.0
+            rotation = cv2.gemm(vt.T, u.T, 1.0, None, 0.0)
+        roll = math.atan2(rotation[2, 1], rotation[2, 2])
+        pitch = math.atan2(-rotation[2, 0], math.hypot(rotation[0, 0], rotation[1, 0]))
+        yaw = math.atan2(rotation[1, 0], rotation[0, 0])
+        if fixed_yaw is not None:
+            c, s = math.cos(fixed_yaw - yaw), math.sin(fixed_yaw - yaw)
+            rotation = cv2.gemm(
+                np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]),
+                rotation, 1.0, None, 0.0,
+            )
+            yaw = float(fixed_yaw)
+        translation = world_mean - matvec(rotation, car_mean)
+        return np.array([*translation, roll, pitch, yaw], dtype=np.float64)
 
     @staticmethod
     def _huber_cost(norms: np.ndarray) -> float:

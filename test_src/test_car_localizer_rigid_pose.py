@@ -95,7 +95,8 @@ def _write_vehicle(path) -> None:
 
 
 def _tag_world_corners_mm(
-    tag_id: int, car_x: float, car_y: float, car_yaw: float
+    tag_id: int, car_x: float, car_y: float, car_yaw: float,
+    *, z_m: float = 0.0, roll: float = 0.0, pitch: float = 0.0,
 ) -> np.ndarray:
     """独立于被测代码的角点生成（印面顺序 左上/右上/右下/左下）。"""
     spec = LAYOUT[tag_id]
@@ -103,14 +104,14 @@ def _tag_world_corners_mm(
         math.radians(spec["az_deg"]), math.radians(spec["rho_deg"])
     )
     c, s = math.cos(car_yaw), math.sin(car_yaw)
-    rz = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    rotation = (
+        np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+        @ cv2.Rodrigues(np.array([0.0, pitch, 0.0]))[0]
+        @ cv2.Rodrigues(np.array([roll, 0.0, 0.0]))[0]
+    )
     center = spec["center"]
-    center_w = np.array([
-        car_x + c * center[0] - s * center[1],
-        car_y + s * center[0] + c * center[1],
-        center[2],
-    ])
-    r_w = rz @ r_tag
+    center_w = rotation @ center + [car_x, car_y, z_m]
+    r_w = rotation @ r_tag
     half = TAG_EDGE_M / 2.0
     printed = np.array([
         [-half, half], [half, half], [half, -half], [-half, -half],
@@ -141,6 +142,9 @@ def _make_case(
     y_m: float,
     yaw: float,
     tag_cameras: dict[int, list[str]],
+    z_m: float = 0.0,
+    roll: float = 0.0,
+    pitch: float = 0.0,
 ):
     calib_path = tmp_path / "calib.json"
     vehicle_path = tmp_path / "vehicle.json"
@@ -150,7 +154,9 @@ def _make_case(
 
     tag_detections: dict[int, dict[str, CarDetection]] = {}
     for tag_id, serials in tag_cameras.items():
-        corners_mm = _tag_world_corners_mm(tag_id, x_m, y_m, yaw)
+        corners_mm = _tag_world_corners_mm(
+            tag_id, x_m, y_m, yaw, z_m=z_m, roll=roll, pitch=pitch,
+        )
         for sn in serials:
             corners_px = _project(corners_mm, rotations[sn], positions_m[sn])
             tag_detections.setdefault(tag_id, {})[sn] = _detection(
@@ -184,6 +190,74 @@ def test_dual_tag_recovers_car_pose_and_reports_both_tags(tmp_path):
     assert result.y == pytest.approx(expected[1], abs=0.002)
     assert result.z == pytest.approx(0.0, abs=1e-9)
     assert abs(_yaw_error(result.yaw, expected[2])) < math.radians(0.2)
+
+
+@pytest.mark.parametrize("cameras", [ALL_CAMS, ALL_CAMS[:2]])
+@pytest.mark.parametrize(
+    ("z_m", "roll_deg", "pitch_deg"),
+    [(0.03, 0.0, 0.0), (-0.025, 0.0, 0.0), (0.02, 4.0, -6.0), (-0.02, -5.0, 7.0)],
+)
+def test_height_and_tilt_do_not_bias_ground_xy_or_yaw(
+    tmp_path, cameras, z_m, roll_deg, pitch_deg,
+):
+    expected = (0.35, 2.4, 0.43)
+    localizer, dets = _make_case(
+        tmp_path, x_m=expected[0], y_m=expected[1], yaw=expected[2],
+        z_m=z_m, roll=math.radians(roll_deg), pitch=math.radians(pitch_deg),
+        tag_cameras={0: cameras, 1: cameras},
+    )
+
+    result = localizer.locate(_fake_locate_images(localizer, dets), t=100.0)
+
+    assert result is not None
+    assert result.yaw_valid is True
+    assert result.x == pytest.approx(expected[0], abs=2e-5)
+    assert result.y == pytest.approx(expected[1], abs=2e-5)
+    assert result.z == 0.0  # 对外仍为地面投影，内部自由估计高度。
+    assert abs(_yaw_error(result.yaw, expected[2])) < 1e-5
+    assert result.reprojection_error < 1e-3
+
+
+@pytest.mark.parametrize("tag_id", [0, 1])
+def test_single_tag_zero_yaw_fallback_absorbs_height_and_tilt(tmp_path, tag_id):
+    localizer, dets = _make_case(
+        tmp_path, x_m=0.3, y_m=2.2, yaw=0.0,
+        z_m=0.03, roll=math.radians(-4.0), pitch=math.radians(6.0),
+        tag_cameras={tag_id: ALL_CAMS},
+    )
+
+    result = localizer.locate(_fake_locate_images(localizer, dets), t=100.0)
+
+    assert result is not None
+    assert result.yaw is None
+    assert result.yaw_valid is False
+    assert result.x == pytest.approx(0.3, abs=2e-5)
+    assert result.y == pytest.approx(2.2, abs=2e-5)
+    assert result.reprojection_error < 1e-3
+
+
+def test_noisy_tilted_car_recovers_ground_pose_with_bad_view(tmp_path):
+    expected = (0.35, 2.4, 0.43)
+    localizer, dets = _make_case(
+        tmp_path, x_m=expected[0], y_m=expected[1], yaw=expected[2],
+        z_m=0.025, roll=math.radians(4.0), pitch=math.radians(-6.0),
+        tag_cameras={0: ALL_CAMS, 1: ALL_CAMS},
+    )
+    rng = np.random.default_rng(42)
+    for views in dets.values():
+        for det in views.values():
+            det.corners += rng.normal(0.0, 0.3, size=(4, 2))
+    dets[1]["cam3"].corners += np.array(
+        [[90.0, -70.0], [130.0, 40.0], [-80.0, 100.0], [-120.0, -50.0]]
+    )
+
+    result = localizer.estimate_car_pose(dets)
+
+    assert result is not None
+    assert result.x == pytest.approx(expected[0], abs=0.003)
+    assert result.y == pytest.approx(expected[1], abs=0.003)
+    assert abs(_yaw_error(result.yaw, expected[2])) < math.radians(0.3)
+    assert 1 not in result.corners_px.get("cam3", {})
 
 
 @pytest.mark.parametrize("tag_id", [0, 1])
