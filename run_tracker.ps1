@@ -44,6 +44,10 @@ $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $OutputEncoding = $utf8NoBom
 $env:PYTHONUTF8 = '1'
 $env:PYTHONIOENCODING = 'utf-8'
+# 已打开的 PowerShell 不会自动继承后来配置的用户环境变量。
+if ([string]::IsNullOrWhiteSpace($env:ARM_ENDPOINT_CXX)) {
+    $env:ARM_ENDPOINT_CXX = [Environment]::GetEnvironmentVariable('ARM_ENDPOINT_CXX', 'User')
+}
 try {
     & chcp.com 65001 > $null
 } catch {

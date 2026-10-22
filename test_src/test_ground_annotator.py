@@ -1,7 +1,11 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 from PIL import Image, ImageTk
 
 from calibration.ground_annotator import AnnotatorApp
@@ -64,6 +68,27 @@ class GroundAnnotatorViewportTests(unittest.TestCase):
         circle = self.app.canvas.coords(self.app._marker_ids[0][0])
         self.assertAlmostEqual((circle[0] + circle[2]) / 2, cx)
         self.assertAlmostEqual((circle[1] + circle[3]) / 2, cy)
+
+    def test_zoomed_click_preserves_fractional_pixels_in_saved_annotations(self):
+        self.app.scale = 8.0
+        self.app.offset_x = 10.0
+        self.app.offset_y = 20.0
+        self.app.cv_img = np.asarray(self.app.pil_img).copy()
+        self.app.annotating = True
+        self.app._on_click(SimpleNamespace(x=131, y=198))
+        expected_pixel = [15.125, 22.25]
+        self.assertEqual(list(self.app.annotations[0]['pixel']), expected_pixel)
+        circle = self.app.canvas.coords(self.app._marker_ids[0][0])
+        self.assertAlmostEqual((circle[0] + circle[2]) / 2, 131)
+        self.assertAlmostEqual((circle[1] + circle[3]) / 2, 198)
+        with tempfile.TemporaryDirectory() as directory:
+            self.app.img_path = Path(directory) / '0004.png'
+            with patch('calibration.ground_annotator.messagebox.showinfo'):
+                self.app._save()
+            saved = json.loads(
+                (Path(directory) / '0004_annotations.json').read_text(encoding='utf-8')
+            )
+            self.assertEqual(saved['1'], [[1.0, 2.0, 0.0], expected_pixel])
 
 
 if __name__ == '__main__':

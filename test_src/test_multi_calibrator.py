@@ -21,6 +21,7 @@ from calibration.multi_calibrator import (
     _detect_checkerboard,
     _validate_epipolar_residual,
     _make_obj_points,
+    _project,
 )
 
 
@@ -279,6 +280,22 @@ class MultiCalibratorTests(unittest.TestCase):
 
         self.assertEqual(set(detections[4]), {"A", "B"})
         self.assertEqual(detections[8], {})
+
+    def test_projection_preserves_small_pose_changes_for_bundle_adjustment(self):
+        board = BoardConfig()
+        points = _make_obj_points(board)
+        K = np.array([[2400., 0., 1024.], [0., 2400., 768.], [0., 0., 1.]])
+        rvec = np.zeros(3)
+        tvec = np.array([100., 200., 5000.])
+        D = np.zeros(5)
+        before = _project(points, rvec, tvec, K, D)
+        step = 1e-5
+        after = _project(points, rvec, tvec + [step, 0., 0.], K, D)
+        np.testing.assert_allclose(
+            (after - before) / step,
+            np.tile([K[0, 0] / tvec[2], 0.], (len(points), 1)),
+            rtol=1e-4, atol=1e-6,
+        )
 
     def test_bundle_adjust_rejects_high_reprojection_rms(self):
         serials = ["A", "B"]

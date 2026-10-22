@@ -252,6 +252,8 @@ def _average_transforms(transforms: list[np.ndarray]) -> np.ndarray:
 
 
 def _project(pts_3d, rvec, tvec, K, D):
+    # BA 的数值求导需要保留亚像素变化，投影输出精度跟随物点精度。
+    pts_3d = np.asarray(pts_3d, dtype=np.float64)
     proj, _ = cv2.projectPoints(pts_3d, rvec, tvec, K, D)
     return proj.reshape(-1, 2)
 

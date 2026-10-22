@@ -31,7 +31,7 @@ class AnnotatorApp(tk.Tk):
         self.cv_img: np.ndarray | None = None
         self.pil_img: Image.Image | None = None
         self.annotations: list[
-            dict[str, tuple[float, float, float] | tuple[int, int]]
+            dict[str, tuple[float, float, float] | tuple[float, float]]
         ] = []
         self.annotating = False
 
@@ -136,7 +136,7 @@ class AnnotatorApp(tk.Tk):
             px, py = item["pixel"]
             tk.Label(
                 self.point_list,
-                text=f"#{i} W=({x:g}, {y:g}, {z:g}) P=({px}, {py})",
+                text=f"#{i} W=({x:g}, {y:g}, {z:g}) P=({px:.3f}, {py:.3f})",
                 anchor=tk.W,
                 font=("Consolas", 10),
                 fg="#00aa00",
@@ -328,16 +328,15 @@ class AnnotatorApp(tk.Tk):
         iw, ih = self.pil_img.size
         if px < 0 or py < 0 or px >= iw or py >= ih:
             return
-        px_int, py_int = int(round(px)), int(round(py))
         if self.world_points:
             world = self.world_points[len(self.annotations)]
         else:
-            world = self._ask_world_point(px_int, py_int)
+            world = self._ask_world_point(px, py)
         if world is None:
             return
-        self.annotations.append({"pixel": (px_int, py_int), "world": world})
+        self.annotations.append({"pixel": (px, py), "world": world})
         n = len(self.annotations)
-        self._draw_marker(n, px_int, py_int)
+        self._draw_marker(n, px, py)
 
         if self.world_points and n == len(self.world_points):
             self.annotating = False
@@ -351,15 +350,15 @@ class AnnotatorApp(tk.Tk):
             )
         else:
             self.status_label.config(
-                text=f"标注 #{n}: pixel=({px_int}, {py_int})  "
+                text=f"标注 #{n}: pixel=({px:.3f}, {py:.3f})  "
                      f"world=({world[0]:g}, {world[1]:g}, {world[2]:g})")
         self._update_panel()
 
-    def _ask_world_point(self, px: int, py: int) -> tuple[float, float, float] | None:
+    def _ask_world_point(self, px: float, py: float) -> tuple[float, float, float] | None:
         while True:
             raw = simpledialog.askstring(
                 "输入球场坐标",
-                f"像素点 ({px}, {py}) 对应的球场坐标，单位米：\n"
+                f"像素点 ({px:.3f}, {py:.3f}) 对应的球场坐标，单位米：\n"
                 "格式: x,y,z   例如: 0,6,0",
                 parent=self,
             )
@@ -409,7 +408,8 @@ class AnnotatorApp(tk.Tk):
         # --- 生成标注图片 ---
         annotated = self.cv_img.copy()
         for i, item in enumerate(self.annotations):
-            px, py = item["pixel"]
+            # 仅绘制标注图片时取整，JSON 保留选点的浮点坐标。
+            px, py = (int(round(value)) for value in item["pixel"])
             number = i + 1
             label = str(number)
             font = cv2.FONT_HERSHEY_SIMPLEX

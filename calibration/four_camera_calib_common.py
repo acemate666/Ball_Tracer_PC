@@ -72,9 +72,15 @@ def create_session_dir(root: Path, content: str, requested_name: str = "") -> Pa
         content_tag = sanitize_session_name(content) or "run"
         session_name = f"{next_num:03d}_{content_tag}"
 
-    session_dir = root / session_name
-    session_dir.mkdir()
-    return session_dir
+    suffix = 0
+    while True:
+        name = session_name if suffix == 0 else f"{session_name}_{suffix:03d}"
+        session_dir = root / name
+        try:
+            session_dir.mkdir()
+            return session_dir
+        except FileExistsError:
+            suffix += 1
 
 
 def resolve_session_dir(raw: str) -> Path:

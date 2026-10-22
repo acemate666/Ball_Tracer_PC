@@ -24,8 +24,10 @@ class FourCameraIntrinsicsCalibrationTests(unittest.TestCase):
             session_dir = create_session_dir(root, "checker board")
             self.assertEqual(session_dir.name, "004_checker_board")
             self.assertTrue(session_dir.is_dir())
-            with self.assertRaises(FileExistsError):
-                create_session_dir(root, "ignored", "003_third")
+            for suffix in range(1, 4):
+                session_dir = create_session_dir(root, "ignored", "003_third")
+                self.assertEqual(session_dir.name, f"003_third_{suffix:03d}")
+                self.assertTrue(session_dir.is_dir())
 
     def test_rejects_non_rigid_bad_frame(self):
         rng = np.random.default_rng(7)
