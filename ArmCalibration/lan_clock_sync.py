@@ -6,7 +6,7 @@
 他相对真值的 offset）。保存好这个值后，我们以后都可以用局域网通信来做对时了」。
 
 两边各跑一个，Jetson 端只是 UDP 应答，不碰臂栈 / bot / 视觉：
-  Jetson（RK 轴 = CLOCK_MONOTONIC，bot_center / arm_controller 的 steady_clock 就是它）：
+  Jetson（RK 轴 = perf_counter，与项目其它业务时间统一）：
       python3 lan_clock_sync.py responder [--port 47123]
   ASUS（PC 轴 = perf_counter，tracker 与专场录像的时间轴）：
       python lan_clock_sync.py initiator --peer 192.168.50.110 [--rate 20] [--out <csv>]
@@ -106,18 +106,18 @@ def robust_offset(rows: list[tuple[float, float, float, float]], *, keep_fractio
 
 
 def run_responder(port: int) -> int:
-    mono = time.monotonic            # Linux 上 = CLOCK_MONOTONIC = bot_center / 臂的 steady_clock
+    clock = time.perf_counter
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("0.0.0.0", port))
-    print(f"[lan_clock_sync] responder 监听 UDP {port}，时钟 = time.monotonic (CLOCK_MONOTONIC)", flush=True)
+    print(f"[lan_clock_sync] responder 监听 UDP {port}，时钟 = perf_counter", flush=True)
     n = 0
     while True:
         data, addr = sock.recvfrom(64)
-        t2 = mono()
+        t2 = clock()
         if len(data) != PING.size:
             continue
         seq, t1 = PING.unpack(data)
-        t3 = mono()
+        t3 = clock()
         sock.sendto(PONG.pack(seq, t1, t2, t3), addr)
         n += 1
         if n == 1 or n % 6000 == 0:
