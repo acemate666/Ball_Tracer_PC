@@ -92,6 +92,21 @@ def endpoint(car: str):
     return _ENDPOINTS[car]
 
 
+def arm_forward_offset_m(car: str) -> float:
+    """在线黑标/高速空挥用同级 bot 车型配置；须与实机同批，历史报告不调用此函数。"""
+    import yaml
+
+    path = ARM_CONTROLLER_ROOT.parent / "arm_bot_center" / "config" / "cars" / f"{car}.yaml"
+    try:
+        params = yaml.safe_load(path.read_text(encoding="utf-8"))["/**"]["ros__parameters"]
+        value = params["arm_forward_offset_m"]
+        if params["car_name"] != car or isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError("车型或 arm_forward_offset_m 无效")
+        return float(value)
+    except (OSError, KeyError, TypeError, ValueError, yaml.YAMLError) as exc:
+        raise Unavailable(f"在线黑标需要同批 bot 车型配置 {path} 的 arm_forward_offset_m：{exc}") from exc
+
+
 def slot_names(car: str) -> tuple:
     """控制器 6 槽的 ROS 关节名（None = 空槽）。"""
     return endpoint(car).slot_names

@@ -507,6 +507,7 @@ def main() -> int:
         geometry.marker_points_car(geometry.load_envelope(envelope_path, s, j1_ranges[s]), args.car) for s in sides
     ])
     z_offset = geometry.marker_z_offset_m(args.car)
+    arm_forward_offset_m = geometry.load_test_src("arm_production").arm_forward_offset_m(args.car)
     vehicle = geometry.load_vehicle_reference(vehicle_path)
     rbm = geometry.load_test_src("racket_ht_black_marker")
     cameras = rbm._load_cameras(calib_path, serials)
@@ -533,6 +534,7 @@ def main() -> int:
         "exposure_us": exposure_us, "car": args.car, "side": args.side, "j1_ranges_deg": j1_ranges,
         "calibration": str(calib_path), "vehicle_config": str(vehicle_path), "envelope": str(envelope_path),
         "marker_z_offset_m": z_offset, "frame_time_reference": "exposure_center", "video_fps": video_fps,
+        "arm_forward_offset_m": arm_forward_offset_m,
         "video_every_slots": video_every, "detect_workers": detect_workers, "events": [],
         "marker_model": marker_model_info(),
     }
@@ -604,6 +606,7 @@ def main() -> int:
                 "action_group_key": int(cam_cfg["action_group_key"]),
                 "action_group_mask": int(cam_cfg["action_group_mask"]),
                 "auto_gain_target": float(cfg["auto_gain_target"]), "car": args.car,
+                "arm_forward_offset_m": arm_forward_offset_m,
                 "calib_path": str(calib_path), "vehicle_path": str(vehicle_path),
                 "crop_radius_px": int(cfg["marker"]["crop_radius_px"]),
                 "tag_every_frames": int(cfg["car_loc"]["tag_every_frames"]),
@@ -647,7 +650,8 @@ def main() -> int:
             raise RuntimeError("开场全幅样张没认到双 tag（车 yaw 必须双 tag）：看 cam_*/full_*.png，或用 --car-pose 手给车位")
         car.plan = pose
         car.set(pose, t_snap)
-        plans = geometry.plan_rois(cameras, pose, marker_car, z_offset, vehicle, margins, fps=fps, fps_headroom=headroom)
+        plans = geometry.plan_rois(cameras, pose, marker_car, z_offset, vehicle, margins, fps=fps,
+                                   arm_forward_offset_m=arm_forward_offset_m, fps_headroom=headroom)
         meta["roi_plan"] = {sn: p.to_json() for sn, p in plans.items()}
         meta["roi_margins"] = vars(margins)
         print("  ROI 规划（黑标包络 ∪ 两块 tag；车位扰动 "

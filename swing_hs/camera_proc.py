@@ -320,6 +320,7 @@ class CameraWorker:
         rbm = geometry.load_test_src("racket_ht_black_marker")
         self.car = str(spec["car"])
         self.z_offset = geometry.marker_z_offset_m(self.car)
+        self.arm_forward_offset_m = spec["arm_forward_offset_m"]
         self.camera = rbm._load_cameras(Path(spec["calib_path"]), list(spec["all_serials"]))[self.serial]
         vehicle = geometry.load_vehicle_reference(Path(spec["vehicle_path"]))
         self.tag_corners = geometry.tag_corners_car(vehicle, 1.0)
@@ -732,7 +733,7 @@ class CameraWorker:
                 stats["no_joint_state"] += 1
             else:
                 marker = geometry.marker_points_car(q, self.car)[0]
-                anchor_m = geometry.car_to_world(marker, pose, self.z_offset)[0]
+                anchor_m = geometry.arm_to_world(marker, pose, self.z_offset, self.arm_forward_offset_m)[0]
                 anchor_mm = [round(float(v) * 1000.0, 1) for v in anchor_m]
                 anchor_uv = geometry.project_m(self.camera, anchor_m)[0]
                 patch = crop_marker_patch(raw, roi_origin, anchor_uv, radius=self.radius)

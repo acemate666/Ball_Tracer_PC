@@ -75,7 +75,8 @@ def test_fit_roi_aligns_and_clips():
 
 def test_plan_mid_court_fits_100fps_with_both_tags(cameras, vehicle, fore_marker):
     z_off = geometry.marker_z_offset_m("v05")
-    plans = geometry.plan_rois(cameras, POSE_MID, fore_marker, z_off, vehicle, geometry.RoiMargins(), fps=100.0)
+    plans = geometry.plan_rois(cameras, POSE_MID, fore_marker, z_off, vehicle, geometry.RoiMargins(), fps=100.0,
+                               arm_forward_offset_m=0.0)
     assert geometry.plan_problems(plans, 100.0) == []
     for p in plans.values():
         assert p.max_fps > 120.0
@@ -86,11 +87,22 @@ def test_plan_mid_court_fits_100fps_with_both_tags(cameras, vehicle, fore_marker
 
 def test_plan_near_cameras_flags_414_coverage(cameras, vehicle, fore_marker):
     z_off = geometry.marker_z_offset_m("v05")
-    plans = geometry.plan_rois(cameras, POSE_NEAR, fore_marker, z_off, vehicle, geometry.RoiMargins(), fps=100.0)
+    plans = geometry.plan_rois(cameras, POSE_NEAR, fore_marker, z_off, vehicle, geometry.RoiMargins(), fps=100.0,
+                               arm_forward_offset_m=0.0)
     assert plans["DB0260414"].marker_in_sensor < 0.8
     assert any("黑标包络" in n for n in plans["DB0260414"].notes)
     for sn in ("DB0260405", "DB0260373", "DB0260378"):
         assert plans[sn].marker_in_sensor == pytest.approx(1.0)
+
+
+def test_forward_registration_moves_marker_roi_without_moving_tags(cameras, vehicle, fore_marker):
+    args = (cameras, POSE_MID, fore_marker, geometry.marker_z_offset_m("v05"), vehicle, geometry.RoiMargins())
+    old = geometry.plan_rois(*args, fps=100.0, arm_forward_offset_m=0.0)
+    new = geometry.plan_rois(*args, fps=100.0, arm_forward_offset_m=0.006516706747101281)
+    for sn in cameras:
+        assert new[sn].marker_bbox != old[sn].marker_bbox
+        assert new[sn].tag_side_px == old[sn].tag_side_px
+        assert new[sn].tag_view_deg == old[sn].tag_view_deg
 
 
 # ── 截块认黑标（YOLO） ──

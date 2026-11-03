@@ -92,15 +92,23 @@ def in_sensor(uv: np.ndarray) -> np.ndarray:
 
 
 def car_to_world(points_car_m: np.ndarray, pose: tuple[float, float, float], z_offset_m: float = 0.0) -> np.ndarray:
-    """车体系（x 右、y 前、z 上，原点 = 车心地面 = J1 轴）→ 世界系（m）。
+    """车体系（x 右、y 前、z 上，原点 = 车心地面）→ 世界系（m）。
 
-    pose = (x, y, yaw)；z_offset_m = 臂 FK 的 z 零点偏移（黑标传 car_hit_pos_z_offset，tag 传 0）。
-    与收场 racket_ht_black_marker._expected_world_mm、在线 racket_marker_online 同一换算。
+    pose = (x, y, yaw)；tag 使用地面坐标，臂端点由 arm_to_world 先完成前向登记。
     """
     x, y, yaw = pose
     c, s = math.cos(yaw), math.sin(yaw)
     p = np.atleast_2d(np.asarray(points_car_m, dtype=np.float64))
     return np.column_stack([x + c * p[:, 0] - s * p[:, 1], y + s * p[:, 0] + c * p[:, 1], p[:, 2] - z_offset_m])
+
+
+def arm_to_world(points_arm_m: np.ndarray, pose: tuple[float, float, float],
+                 z_offset_m: float, arm_forward_offset_m: float) -> np.ndarray:
+    """臂端点先沿车前方移到车心参考，再转世界系；tag 仍直接用 car_to_world。"""
+    if isinstance(arm_forward_offset_m, bool) or not isinstance(arm_forward_offset_m, (int, float)) or not math.isfinite(arm_forward_offset_m):
+        raise ValueError("arm_forward_offset_m 必须是明确的有限数值，不能猜为 0")
+    points_car = np.asarray(points_arm_m, dtype=np.float64) + [0.0, arm_forward_offset_m, 0.0]
+    return car_to_world(points_car, pose, z_offset_m)
 
 
 def project_m(camera, world_m: np.ndarray) -> np.ndarray:
@@ -295,6 +303,7 @@ def plan_rois(
     margins: RoiMargins,
     *,
     fps: float,
+    arm_forward_offset_m: float,
     fps_headroom: float = 1.0,
 ) -> dict[str, CameraPlan]:
     """每台相机一个 ROI = 黑标包络 ∪ 两块 tag，外扩 + 车位扰动并集，按步进对齐。
@@ -311,7 +320,7 @@ def plan_rois(
         marker_uv = []
         for dx, dy, dr in perts:
             p = (pose[0] + dx, pose[1] + dy, pose[2] + dr)
-            world = car_to_world(hull, p, marker_z_offset)
+            world = arm_to_world(hull, p, marker_z_offset, arm_forward_offset_m)
             uv = project_m(camera, world)
             uv[depth_mm(camera, world) <= 0.0] = np.nan
             marker_uv.append(uv)
@@ -323,7 +332,7 @@ def plan_rois(
                 for dx, dy, dr in perts
             ])
             tag_box = _union(tag_box, _clip_bbox(_bbox(uv)))
-        nominal = project_m(camera, car_to_world(marker_car_m, pose, marker_z_offset))
+        nominal = project_m(camera, arm_to_world(marker_car_m, pose, marker_z_offset, arm_forward_offset_m))
         centre = camera_center_m(camera)
         tag_uv_true = {tid: project_m(camera, car_to_world(c, pose)) for tid, c in tags_true.items()}
         tag_side = {tid: float(np.mean(np.linalg.norm(uv - np.roll(uv, 1, axis=0), axis=1)))

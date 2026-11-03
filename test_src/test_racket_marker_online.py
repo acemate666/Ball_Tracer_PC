@@ -118,10 +118,11 @@ def test_frame_between_car_locs_uses_interpolated_car_pose_and_its_own_joints():
     module = ap.arm().endpoint
     marker = module.field(ap.endpoint("v05").pose(np.asarray([q_middle])), "marker", module.POSE)[0]
     z_off = ap.endpoint("v05").z_offset
+    forward = ap.arm_forward_offset_m("v05")
     c, s = np.cos(middle.yaw), np.sin(middle.yaw)
     expected_mm = 1000.0 * np.array([
-        middle.x + c * marker[0] - s * marker[1],
-        middle.y + s * marker[0] + c * marker[1],
+        middle.x + c * marker[0] - s * (marker[1] + forward),
+        middle.y + s * marker[0] + c * (marker[1] + forward),
         middle.z + marker[2] - z_off,
     ])
     assert rows[0]["anchor_mm"] == pytest.approx(expected_mm.tolist(), abs=0.2)
@@ -134,6 +135,8 @@ def test_post_run_solves_the_marker_from_online_candidates(tmp_path: Path):
     final_ht_elapsed = 12.525
     exposure_us = 1000.0
     marker_minus_model_car_mm = np.array([6.0, 4.0, -22.0])
+    # 此历史场用与当前 YAML 不同的前向偏移，测量必须只取本场公告。
+    recorded_forward = 0.023
     frame = ap.arm().endpoint.zero_frame("v05")[0]
     arm = {
         "car": "v05",
@@ -154,7 +157,7 @@ def test_post_run_solves_the_marker_from_online_candidates(tmp_path: Path):
     for k in range(-8, 3):  # ht−400 … +100 ms，车定位帧 20 Hz
         elapsed = final_ht_elapsed + 0.05 * k
         fk_mm = ht._expected_world_mm(
-            elapsed, states, car_locs, car_locs, rk_t0, rk_to_pc_bias
+            elapsed, states, car_locs, car_locs, rk_t0, rk_to_pc_bias, recorded_forward
         )
         model.append(fk_mm)
         true_mm = fk_mm + ht._car_to_world(CAR_POSE.yaw, marker_minus_model_car_mm)
@@ -187,7 +190,9 @@ def test_post_run_solves_the_marker_from_online_candidates(tmp_path: Path):
     }), encoding="utf-8")
     marker_path.write_text(json.dumps({"frames": frames}), encoding="utf-8")
     arm_path.write_text(json.dumps(arm), encoding="utf-8")
-    rk_path.write_text(json.dumps({"t0": rk_t0}), encoding="utf-8")
+    rk_path.write_text(json.dumps({"t0": rk_t0, "config_announce": {
+        "bot_center": {"params": {"arm_forward_offset_m": recorded_forward}},
+    }}), encoding="utf-8")
     tables_path.write_text(json.dumps({
         "align": {
             "auto": {"bias": 2.5, "err": 0.01, "n": 60, "flights": 4, "requiredFlights": 3,
@@ -212,6 +217,7 @@ def test_post_run_solves_the_marker_from_online_candidates(tmp_path: Path):
 
     result = ht.measure(tracker_path, marker_path, arm_path, rk_path, tables_path)
 
+    assert result["config"]["arm_forward_offset_m"] == recorded_forward
     assert "reanchor" not in result["config"]
     assert result["config"]["model_anchor"]["status"] == "ok"
     groups = result["config"]["model_residual"]["groups"]

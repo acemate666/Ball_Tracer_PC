@@ -52,7 +52,9 @@ def _write_inputs(tmp_path: Path, *, align_err: float = 0.01, tab_errors=None):
         encoding="utf-8",
     )
     arm.write_text(json.dumps({"car": "v04"}), encoding="utf-8")
-    rk.write_text(json.dumps({"t0": 100.0}), encoding="utf-8")
+    rk.write_text(json.dumps({"t0": 100.0, "config_announce": {
+        "bot_center": {"params": {"arm_forward_offset_m": 0.0}},
+    }}), encoding="utf-8")
     tables.write_text(
         json.dumps(
             {
@@ -117,6 +119,20 @@ def test_measurement_context_uses_report_final_ht(tmp_path: Path):
     }]
 
 
+@pytest.mark.parametrize("value", [None, True, "0.0065", float("nan"), float("inf")])
+def test_measurement_context_requires_recorded_arm_forward_offset(tmp_path: Path, value):
+    paths = _write_inputs(tmp_path)
+    rk = json.loads(paths[2].read_text(encoding="utf-8"))
+    params = rk["config_announce"]["bot_center"]["params"]
+    if value is None:
+        params.pop("arm_forward_offset_m")
+    else:
+        params["arm_forward_offset_m"] = value
+    paths[2].write_text(json.dumps(rk), encoding="utf-8")
+    with pytest.raises(ValueError, match="本场.*arm_forward_offset_m"):
+        _measurement_context(*paths)
+
+
 @pytest.mark.parametrize(("side", "expected"), [(1, 1), (-1, -1), (0, None), ("forehand", None), (None, None)])
 def test_measurement_context_carries_the_contract_side(tmp_path: Path, side, expected):
     # 击球侧由报告合同给（臂 node::final_plan_side 的生产判决或臂当时自己记的 rl_swing done），这里只认 ±1
@@ -167,6 +183,7 @@ def test_measurement_context_skips_a_session_without_throws(tmp_path: Path):
     payload = json.loads(paths[-1].read_text(encoding="utf-8"))
     payload["arm_contract"]["rows"] = []
     paths[-1].write_text(json.dumps(payload), encoding="utf-8")
+    paths[2].write_text(json.dumps({"t0": 100.0}), encoding="utf-8")
     with pytest.raises(NothingToMeasure):
         _measurement_context(*paths)
 

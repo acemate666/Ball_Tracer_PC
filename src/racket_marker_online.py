@@ -27,6 +27,7 @@ from pathlib import Path
 import numpy as np
 
 from swing_hs.marker_yolo import MarkerYolo, model_info
+from swing_hs.geometry import arm_to_world
 
 _TEST_SRC = Path(__file__).resolve().parent.parent / "test_src"
 
@@ -151,6 +152,7 @@ class RacketMarkerLocator:
         self._ht = _load_test_src("racket_ht_black_marker")
         production = _load_test_src("arm_production")
         self._endpoint = production.endpoint(car)
+        self._arm_forward_offset_m = production.arm_forward_offset_m(car)
         self._pose_field = lambda pose, name: production.arm().endpoint.field(pose, name, production.arm().endpoint.POSE)
         self._car = car
         self._cameras = self._ht._load_cameras(Path(calib_path), serials)
@@ -191,18 +193,12 @@ class RacketMarkerLocator:
             if q is None:
                 self.stats["no_joint_state"] += 1
                 continue
-            # 与收场 _expected_world_mm 同一换算：车位姿 + R(yaw)·车体系黑标，z = 车 z + 黑标离地高（臂模型 z − 车型 hit_pos_z_offset_m）
+            # 臂中心与车心不同：先加 bot 前向偏移，再按车 yaw 转世界；z 加车高。
             marker = self._pose_field(self._endpoint.pose(q), "marker")
             x, y, z = xyz
-            cosine, sine = math.cos(yaw[0]), math.sin(yaw[0])
-            anchor_mm = 1000.0 * np.asarray(
-                [
-                    x + cosine * marker[0] - sine * marker[1],
-                    y + sine * marker[0] + cosine * marker[1],
-                    z + marker[2] - self._endpoint.z_offset,
-                ],
-                dtype=np.float64,
-            )
+            anchor_mm = 1000.0 * (arm_to_world(
+                marker, (x, y, yaw[0]), self._endpoint.z_offset, self._arm_forward_offset_m,
+            )[0] + [0.0, 0.0, z])
             candidates: dict[str, list[list]] = {}
             for serial, camera in self._cameras.items():
                 image = images.get(serial)

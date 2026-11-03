@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,9 @@ from typing import Any
 import cv2
 import numpy as np
 from scipy.optimize import least_squares
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from swing_hs.geometry import arm_to_world
 
 
 # Scan the whole pre-HT approach (park + swing start at ~ht-270ms) plus the
@@ -575,8 +579,9 @@ def _expected_world_mm(
     car_yaw_rows: list[dict],
     rk_t0: float,
     rk_to_pc_bias: float,
+    arm_forward_offset_m: float,
 ) -> np.ndarray | None:
-    """模型黑标（端点动态模型）在世界系的位置（mm）：车位姿 + R(yaw)·黑标车体系 xy，z = 车 z + 黑标离地高。"""
+    """模型黑标世界坐标（mm）；前向偏移必须来自本场 bot 公告。"""
     rk_absolute = rk_t0 + pc_elapsed - rk_to_pc_bias
     state = _interpolate(
         arm_states, rk_absolute, "t", ("marker", "marker_h"), ARM_STATE_MAX_GAP_S
@@ -588,19 +593,10 @@ def _expected_world_mm(
     if state is None or car is None or yaw is None:
         return None
     local = np.asarray(state["marker"], dtype=np.float64)
-    cosine, sine = math.cos(yaw), math.sin(yaw)
-    relative_world = np.asarray(
-        [
-            cosine * local[0] - sine * local[1],
-            sine * local[0] + cosine * local[1],
-            float(state["marker_h"]),
-        ],
-        dtype=np.float64,
-    )
-    return 1000.0 * (
-        np.asarray([car["x"], car["y"], car["z"]], dtype=np.float64)
-        + relative_world
-    )
+    return 1000.0 * (arm_to_world(
+        [local[0], local[1], float(state["marker_h"])],
+        (car["x"], car["y"], yaw), 0.0, arm_forward_offset_m,
+    )[0] + [0.0, 0.0, car["z"]])
 
 
 def _car_to_world(yaw: float, vector_mm: np.ndarray) -> np.ndarray:
@@ -829,8 +825,7 @@ def _measurement_context(
     rk = _load_json(rk_path)
     tables = _load_json(tables_path)
     config = tracker.get("config") or {}
-    # 锚点 = 车位姿 + R(yaw)·模型黑标（臂端点动态模型的车体系黑标，z = 它给的离地高；arm_states_with_marker）。
-    # 车定位原点都是 z=0 地面点（v05 即 J1 轴）。
+    # 车定位原点是车心地面；臂中心前移用本场 bot 公告，模型给黑标相对臂中心的位置和离地高。
     car = str(arm.get("car", "")).lower()
     if car not in ("v04", "v05") or car not in Path(
         str(config.get("car_config_path", ""))
@@ -917,6 +912,10 @@ def _measurement_context(
     targets.sort(key=lambda row: row["final_ht_pc_elapsed_s"])
     if not targets:
         raise ValueError("report arm contract has no accepted final HT with usable zPhase")
+    params = (rk.get("config_announce") or {}).get("bot_center", {}).get("params", {})
+    forward = params.get("arm_forward_offset_m")
+    if isinstance(forward, bool) or not _finite(forward):
+        raise ValueError("黑标测量缺少本场 config_announce.bot_center.params.arm_forward_offset_m；不能使用当前配置或猜 0")
     return tracker, arm, rk, serials, targets
 
 
@@ -951,6 +950,7 @@ def measure(
         serials,
         targets,
     ) = _measurement_context(tracker_path, arm_path, rk_path, tables_path)
+    arm_forward_offset_m = rk["config_announce"]["bot_center"]["params"]["arm_forward_offset_m"]
     car = str(arm["car"]).lower()
     config = tracker["config"]
     calibration_path = _session_path(config["calib_config_path"], tracker_path)
@@ -1030,6 +1030,7 @@ def measure(
                         car_yaw_rows,
                         rk_t0,
                         target["rk_to_pc_bias_s"],
+                        arm_forward_offset_m,
                     ),
                     "car_yaw": _interpolate_yaw(
                         car_yaw_rows, center_elapsed, CAR_LOC_MAX_GAP_S
@@ -1188,6 +1189,7 @@ def measure(
             ),
             "car": car,
             "model_anchor": arm.get("endpoint"),
+            "arm_forward_offset_m": arm_forward_offset_m,
             "model_residual": residual,
             "coordinate": (
                 "multi-camera marker world position; report subtracts visual car "
