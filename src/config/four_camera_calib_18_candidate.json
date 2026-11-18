@@ -60,18 +60,18 @@
             ],
             "R_world": [
                 [
-                    0.9342624005486684,
-                    -0.3564000775918345,
+                    0.9346733148525214,
+                    -0.3553210420014914,
                     0.011521788644694986
                 ],
                 [
-                    -0.09339475698425781,
-                    -0.27575158369844777,
+                    -0.09307628283372756,
+                    -0.2758592433075364,
                     -0.9566809726631179
                 ],
                 [
-                    0.3441383243535801,
-                    0.8927149874289848,
+                    0.3431072719667341,
+                    0.8931117707167272,
                     -0.290910235177069
                 ]
             ],
@@ -88,10 +88,10 @@
             ],
             "pos_world": [
                 [
-                    -3727.749619213653
+                    -3723.5060947200127
                 ],
                 [
-                    -3672.831804701997
+                    -3677.133809335878
                 ],
                 [
                     3002.1986346163158
@@ -157,18 +157,18 @@
             ],
             "R_world": [
                 [
-                    0.9998691563991785,
-                    -0.011716632969268245,
+                    0.9998820190749521,
+                    -0.010562070684227948,
                     0.011153053100270647
                 ],
                 [
-                    0.006049441465002119,
-                    -0.368607750242769,
+                    0.006475070850563877,
+                    -0.36860051917835684,
                     -0.9295653450505381
                 ],
                 [
-                    0.015002477780537274,
-                    0.9295111871154795,
+                    0.013929156043216092,
+                    0.9295278908802614,
                     -0.36848864119212216
                 ]
             ],
@@ -185,10 +185,10 @@
             ],
             "pos_world": [
                 [
-                    1186.5998084018486
+                    1190.8270963526384
                 ],
                 [
-                    -3661.6079215191876
+                    -3660.2353070292784
                 ],
                 [
                     3390.693863865647
@@ -254,18 +254,18 @@
             ],
             "R_world": [
                 [
-                    0.9923699336586482,
-                    -0.12131606704484543,
+                    0.9925093564098173,
+                    -0.12017009108704794,
                     0.022007422545584333
                 ],
                 [
-                    -0.024601857822307834,
-                    -0.36973572899777796,
+                    -0.02417490551902237,
+                    -0.36976389040707275,
                     -0.9288111967962985
                 ],
                 [
-                    0.12081665184079658,
-                    0.9211828822656511,
+                    0.11975287629996874,
+                    0.9213217757977704,
                     -0.36989922148975585
                 ]
             ],
@@ -282,10 +282,10 @@
             ],
             "pos_world": [
                 [
-                    -1248.47316744264
+                    -1244.2516678060601
                 ],
                 [
-                    -3655.1892195465684
+                    -3656.62840163935
                 ],
                 [
                     3393.7066720718917
@@ -351,18 +351,18 @@
             ],
             "R_world": [
                 [
-                    0.9312234665828053,
-                    0.36174940752839313,
+                    0.9308051317094581,
+                    0.3628244552741433,
                     0.044274388063063344
                 ],
                 [
-                    0.136949006526292,
-                    -0.23475438930572287,
+                    0.1372199874246285,
+                    -0.2345960970221501,
                     -0.9623592605223681
                 ],
                 [
-                    -0.33773928539179987,
-                    0.902234860141501,
+                    -0.3387808758394165,
+                    0.9018442692155866,
                     -0.26815001817729295
                 ]
             ],
@@ -379,10 +379,10 @@
             ],
             "pos_world": [
                 [
-                    3633.870985906214
+                    3638.0980708378493
                 ],
                 [
-                    -3662.84504182652
+                    -3658.646548877063
                 ],
                 [
                     3002.086990010839
@@ -579,6 +579,30 @@
                     }
                 ]
             }
+        },
+        "court_axis_alignment": {
+            "method": "One common yaw about the existing world origin. Painted line centers are undistorted and intersected with the existing ground plane. Fit line directions with free offsets; no court dimensions, ball XY coordinates, camera relative poses, or intrinsics are adjusted.",
+            "source_calibration_sha256": "aacce46c74dd64647325e085f9d46a6559e83e6cc6c1e1264d4aead8aabe1b1c",
+            "world_yaw_correction_deg": 0.066159769854233,
+            "per_session_deg": {
+                "recalib_20261118_004": 0.06536647741331236,
+                "recalib_20261118_005": 0.0668988660403803
+            },
+            "per_camera_deg": {
+                "DB0260414": -0.1478102914032395,
+                "DB0260373": 0.22273603092393288,
+                "DB0260405": 0.013640253719310285,
+                "DB0260378": 0.25834216682821726
+            },
+            "per_axis_deg": {
+                "x": 0.022519773921819454,
+                "y": 0.10245856263274598
+            },
+            "holdout_0399_yaw_estimate_deg": 0.08693208385176822,
+            "group_direction_rms_deg_before": 0.2673158591040327,
+            "group_direction_rms_deg_after": 0.2548479027340262,
+            "limitation": "Residual line directions differ across cameras and sidelines; this is a global best fit, not exact pixel-parallel alignment in every view. Perspective makes parallel ground lines converge in images.",
+            "aligned_perf_counter_s": 522623.6263239
         }
     },
     "board": {
@@ -587,7 +611,7 @@
         "square_size": 45.0
     },
     "world_registration": {
-        "method": "triangulated_ball_center_ground_plane",
+        "method": "ball_ground_plane_and_court_line_heading",
         "source_sessions": [
             "recalib_20261118_004",
             "recalib_20261118_005"
@@ -595,7 +619,7 @@
         "input_calibration_sha256": "95e35fbb9aacd5975c39f4895e03f6da717322cf83ad71db80b22e9747ffec9c",
         "reference_serial": "DB0260414",
         "ground_registration_reestimated": true,
-        "horizontal_registration_reestimated": false,
+        "horizontal_registration_reestimated": true,
         "xy_control_positions_exact": false,
         "relative_translation_scale_applied": 1.0,
         "ball_radius_m": 0.033,
@@ -615,6 +639,32 @@
             11,
             12
         ],
-        "registered_perf_counter_s": 513699.2659212
+        "registered_perf_counter_s": 513699.2659212,
+        "horizontal_origin_reestimated": false,
+        "horizontal_orientation_reestimated": true,
+        "court_axis_alignment": {
+            "method": "One common yaw about the existing world origin. Painted line centers are undistorted and intersected with the existing ground plane. Fit line directions with free offsets; no court dimensions, ball XY coordinates, camera relative poses, or intrinsics are adjusted.",
+            "source_calibration_sha256": "aacce46c74dd64647325e085f9d46a6559e83e6cc6c1e1264d4aead8aabe1b1c",
+            "world_yaw_correction_deg": 0.066159769854233,
+            "per_session_deg": {
+                "recalib_20261118_004": 0.06536647741331236,
+                "recalib_20261118_005": 0.0668988660403803
+            },
+            "per_camera_deg": {
+                "DB0260414": -0.1478102914032395,
+                "DB0260373": 0.22273603092393288,
+                "DB0260405": 0.013640253719310285,
+                "DB0260378": 0.25834216682821726
+            },
+            "per_axis_deg": {
+                "x": 0.022519773921819454,
+                "y": 0.10245856263274598
+            },
+            "holdout_0399_yaw_estimate_deg": 0.08693208385176822,
+            "group_direction_rms_deg_before": 0.2673158591040327,
+            "group_direction_rms_deg_after": 0.2548479027340262,
+            "limitation": "Residual line directions differ across cameras and sidelines; this is a global best fit, not exact pixel-parallel alignment in every view. Perspective makes parallel ground lines converge in images.",
+            "aligned_perf_counter_s": 522623.6263239
+        }
     }
 }
