@@ -25,7 +25,6 @@ from calibration.four_camera_calib_common import (
     rel_or_abs,
 )
 from calibration.phone_preview import PhonePreviewServer
-from src import SyncCapture, frame_to_numpy
 
 
 def _build_manifest(session_dir: Path, args, interval_s: float, overrides: dict,
@@ -43,6 +42,7 @@ def _build_manifest(session_dir: Path, args, interval_s: float, overrides: dict,
             "duration_s": args.duration,
             "interval_s": interval_s,
             "dry_run": bool(args.dry_run),
+            "web_control": args.web_control,
         },
         "board": {
             "square_cols": board_cols,
@@ -88,6 +88,8 @@ def main() -> None:
     parser.add_argument("--camera-config", type=str, default=str(CAMERA_CONFIG_PATH),
                         help="Camera JSON path relative to the project root.")
     parser.add_argument("--dry-run", action="store_true", help="Create the directories without opening cameras.")
+    parser.add_argument("--web-control", action="store_true",
+                        help="Wait for the preview web page to start capture; its Stop button ends capture early.")
     args = parser.parse_args()
 
     if args.count <= 0:
@@ -153,6 +155,8 @@ def main() -> None:
         print("Dry run flag enabled; skipping camera capture.")
         return
 
+    from src import SyncCapture, frame_to_numpy
+
     print("Loading capture configuration...")
     with SyncCapture.from_config(str(camera_config_path), **overrides) as cap:
         sync_serials = cap.sync_serials
@@ -164,7 +168,10 @@ def main() -> None:
 
         import cv2
 
-        preview = PhonePreviewServer(sync_serials, args.count)
+        preview = PhonePreviewServer(sync_serials, args.count, web_control=args.web_control)
+        captured = 0
+        elapsed = 0.0
+        t_start = None
         preview.start()
         try:
             print("  Phone preview:")
@@ -174,22 +181,30 @@ def main() -> None:
             print("Warming up (2s)...")
             time.sleep(2.0)
 
-            captured = 0
-            t_start = time.perf_counter()
-            next_capture = t_start
-            print()
-            print(f"Beginning capture of {args.count} frames over {args.duration:.1f}s...")
+            next_capture = 0.0
+            if args.web_control:
+                print("Waiting for Start capture on the preview web page...")
 
             while captured < args.count:
                 frames = cap.get_frames(timeout_s=0.2)
                 now = time.perf_counter()
-                elapsed = now - t_start
+                state = preview.capture_state
+                if state == "stopped":
+                    elapsed = now - t_start if t_start is not None else 0.0
+                    print("Capture stopped from the web page.")
+                    break
+                if t_start is None and state == "capturing":
+                    t_start = now
+                    next_capture = now
+                    print(f"Beginning capture of {args.count} frames over {args.duration:.1f}s...")
+                elapsed = now - t_start if t_start is not None else 0.0
+                preview.update_status(captured, elapsed)
 
                 if elapsed > args.duration + 10:
                     print(f"Timeout after {elapsed:.1f}s ({captured}/{args.count} frames)")
                     break
 
-                save_frame = now >= next_capture
+                save_frame = t_start is not None and now >= next_capture
                 preview_frame = preview.should_publish(now)
                 if frames is None:
                     if save_frame:
@@ -204,26 +219,31 @@ def main() -> None:
                 if not save_frame:
                     continue
 
-                captured += 1
-                idx = f"{captured:04d}"
+                idx = f"{captured + 1:04d}"
                 for sn, image in images.items():
                     path = session_dir / sn / f"{idx}.png"
-                    cv2.imwrite(str(path), image)
+                    if not cv2.imwrite(str(path), image):
+                        raise RuntimeError(f"Failed to save camera image: {path}")
+                captured += 1
 
                 preview.update_status(captured, elapsed)
                 remaining = max(0.0, args.duration - elapsed)
                 print(f"  [{captured}/{args.count}] remaining {remaining:.1f}s  interval {interval:.2f}s")
                 next_capture += interval
+        except KeyboardInterrupt:
+            print("\nCapture interrupted; keeping saved images.")
         finally:
+            elapsed = time.perf_counter() - t_start if t_start is not None else 0.0
+            preview.update_status(captured, elapsed, finished=True)
             preview.close()
 
-        print(f"\nCapture complete: {captured} frames stored in {session_dir}")
-        manifest["results"]["captured_frames"] = captured
-        for sn in sync_serials:
-            count = len(list((session_dir / sn).glob("*.png")))
-            print(f"  {sn}: {count} images")
-            manifest["results"]["per_camera_counts"][sn] = count
-        _write_manifest(session_dir, manifest)
+            print(f"\nCapture saved: {captured} frames stored in {session_dir}")
+            manifest["results"]["captured_frames"] = captured
+            for sn in sync_serials:
+                count = len(list((session_dir / sn).glob("*.png")))
+                print(f"  {sn}: {count} images")
+                manifest["results"]["per_camera_counts"][sn] = count
+            _write_manifest(session_dir, manifest)
 
 
 if __name__ == "__main__":

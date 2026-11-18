@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Read-only LAN preview for calibration capture."""
+"""LAN preview with optional start/stop controls for calibration capture."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ _PREVIEW_WIDTH = 720
 _JPEG_QUALITY = 72
 
 
-def _page(serials: list[str]) -> bytes:
+def _page(serials: list[str], web_control: bool) -> bytes:
     panels = "".join(
         "<section class=\"camera\">"
         f"<div class=\"label\">{html.escape(serial)}</div>"
@@ -31,6 +31,12 @@ def _page(serials: list[str]) -> bytes:
         "</section>"
         for serial in serials
     )
+    controls = """
+<div class="controls">
+  <button id="start" type="button">开始采集</button>
+  <button id="stop" type="button">结束采集</button>
+  <span id="capture-state">等待开始</span>
+</div>""" if web_control else ""
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -44,33 +50,78 @@ header{{height:48px;padding:0 12px;display:flex;align-items:center;justify-conte
 h1{{margin:0;font-size:15px;font-weight:600}}
 .status{{display:flex;align-items:center;gap:8px;font-variant-numeric:tabular-nums;font-size:13px;color:#d7d7d7}}
 .signal{{width:4px;height:14px;background:#3ecf8e}}
+.controls{{height:56px;display:flex;align-items:center;gap:10px;padding:8px 12px}}
+button{{min-height:40px;padding:0 14px;border:0;border-radius:4px;font:inherit;cursor:pointer}}
+#start{{background:#3ecf8e;color:#111}}#stop{{background:#d9534f;color:#fff}}
+button:disabled{{opacity:.4;cursor:default}}
+#capture-state{{font-size:13px}}
 main{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;padding:6px;max-width:1440px;margin:0 auto}}
 .camera{{position:relative;min-width:0;aspect-ratio:4/3;background:#050505;border:1px solid #303030;border-radius:4px;overflow:hidden}}
 .camera img{{display:block;width:100%;height:100%;object-fit:contain}}
 .label{{position:absolute;z-index:1;top:6px;left:6px;max-width:calc(100% - 12px);padding:3px 5px;background:rgba(0,0,0,.72);font:600 11px ui-monospace,"Cascadia Mono",monospace;overflow-wrap:anywhere}}
 @media (orientation:landscape) and (max-height:600px){{header{{height:40px}}main{{height:calc(100vh - 40px);grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr))}}.camera{{aspect-ratio:auto}}}}
+@media (orientation:landscape) and (max-height:600px){{.web-control main{{height:calc(100vh - 96px)}}}}
 </style>
 </head>
-<body>
+<body class="{'web-control' if web_control else ''}">
 <header><h1>Calibration Capture</h1><div class="status"><span class="signal"></span><span id="count">0 / 0</span><span id="elapsed">0.0 s</span></div></header>
+{controls}
 <main>{panels}</main>
 <script>
 const count=document.getElementById('count');
 const elapsed=document.getElementById('elapsed');
 const images=document.querySelectorAll('img[data-frame]');
+const startButton=document.getElementById('start');
+const stopButton=document.getElementById('stop');
+const captureState=document.getElementById('capture-state');
+let finished=false;
+let frameVersion=0;
+for(const image of images){{
+  image.onload=image.onerror=()=>{{image.dataset.loading='';}};
+}}
 function refreshFrames(){{
-  const version=Date.now();
-  for(const image of images) image.src=`${{image.dataset.frame}}?v=${{version}}`;
+  if(finished) return;
+  const version=++frameVersion;
+  for(const image of images){{
+    if(image.dataset.loading) continue;
+    image.dataset.loading='1';
+    image.src=`${{image.dataset.frame}}?v=${{version}}`;
+  }}
+}}
+function showStatus(state){{
+  if(finished) return;
+  count.textContent=`${{state.captured}} / ${{state.target}}`;
+  elapsed.textContent=`${{state.elapsed_s.toFixed(1)}} s`;
+  finished=state.state==='stopped';
+  if(startButton){{
+    startButton.disabled=state.state!=='waiting';
+    stopButton.disabled=finished;
+    captureState.textContent={{waiting:'等待开始',capturing:'采集中',stopped:'已结束'}}[state.state];
+  }}
 }}
 async function refreshStatus(){{
+  if(finished) return;
   try{{
     const response=await fetch('/status.json',{{cache:'no-store'}});
-    const state=await response.json();
-    count.textContent=`${{state.captured}} / ${{state.target}}`;
-    elapsed.textContent=`${{state.elapsed_s.toFixed(1)}} s`;
+    showStatus(await response.json());
   }}catch(_error){{
     elapsed.textContent='offline';
   }}
+}}
+async function control(action){{
+  startButton.disabled=true;
+  stopButton.disabled=true;
+  try{{
+    const response=await fetch(`/capture/${{action}}`,{{method:'POST'}});
+    if(!response.ok) throw new Error('control failed');
+    showStatus(await response.json());
+  }}catch(_error){{
+    captureState.textContent='请求失败，请刷新重试';
+  }}
+}}
+if(startButton){{
+  startButton.onclick=()=>control('start');
+  stopButton.onclick=()=>control('stop');
 }}
 refreshFrames();
 refreshStatus();
@@ -120,6 +171,13 @@ class _PreviewHTTPServer(ThreadingHTTPServer):
 class _PreviewHandler(BaseHTTPRequestHandler):
     server: _PreviewHTTPServer
 
+    def handle(self) -> None:
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # Browsers can disconnect while reading a request or sending a response.
+            return
+
     def do_GET(self) -> None:
         path = unquote(urlparse(self.path).path)
         self.server.preview.note_client()
@@ -140,6 +198,17 @@ class _PreviewHandler(BaseHTTPRequestHandler):
             return
         self._send(HTTPStatus.NOT_FOUND, "text/plain; charset=utf-8", b"not found")
 
+    def do_POST(self) -> None:
+        path = urlparse(self.path).path
+        if path not in {"/capture/start", "/capture/stop"}:
+            self._send(HTTPStatus.NOT_FOUND, "text/plain; charset=utf-8", b"not found")
+            return
+        preview = self.server.preview
+        accepted = preview.control(path.rsplit("/", 1)[1])
+        body = json.dumps(preview.status()).encode("utf-8")
+        self._send(HTTPStatus.OK if accepted else HTTPStatus.CONFLICT,
+                   "application/json; charset=utf-8", body)
+
     def _send(self, status: HTTPStatus, content_type: str, body: bytes) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
@@ -154,9 +223,12 @@ class _PreviewHandler(BaseHTTPRequestHandler):
 
 
 class PhonePreviewServer:
-    def __init__(self, serials: list[str], target_frames: int, port: int = PREVIEW_PORT):
+    def __init__(self, serials: list[str], target_frames: int, port: int = PREVIEW_PORT,
+                 *, web_control: bool = False):
         self.serials = list(serials)
-        self.page = _page(self.serials)
+        self.page = _page(self.serials, web_control)
+        self._web_control = web_control
+        self._state = "waiting" if web_control else "capturing"
         self._target_frames = int(target_frames)
         self._port = int(port)
         self._lock = threading.Lock()
@@ -237,10 +309,29 @@ class PhonePreviewServer:
         with self._lock:
             return self._frames.get(serial)
 
-    def update_status(self, captured: int, elapsed_s: float) -> None:
+    @property
+    def capture_state(self) -> str:
+        with self._lock:
+            return self._state
+
+    def control(self, action: str) -> bool:
+        with self._lock:
+            if not self._web_control:
+                return False
+            if action == "start" and self._state == "waiting":
+                self._state = "capturing"
+                return True
+            if action == "stop" and self._state in {"waiting", "capturing"}:
+                self._state = "stopped"
+                return True
+            return False
+
+    def update_status(self, captured: int, elapsed_s: float, *, finished: bool = False) -> None:
         with self._lock:
             self._captured = int(captured)
             self._elapsed_s = float(elapsed_s)
+            if finished:
+                self._state = "stopped"
 
     def status(self) -> dict:
         with self._lock:
@@ -248,4 +339,5 @@ class PhonePreviewServer:
                 "captured": self._captured,
                 "target": self._target_frames,
                 "elapsed_s": self._elapsed_s,
+                "state": self._state,
             }
